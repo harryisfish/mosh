@@ -46,11 +46,15 @@ Core live decoded images are at most 64 MiB, with at most 4096 image objects,
 Kitty accumulated encoded chunks are at most 24 MiB; decoded compressed or direct
 payloads are at most 16 MiB. Image readers receive a 32 MiB logical
 decoder budget before constructing the decoder, including dimension probes.
-This is a best-effort dependency limit, not a strict allocation cap. PNG metadata
-inflation is length-bounded, but its Vec capacity and decoder bookkeeping can
-exceed that logical limit. The independent 40 MiB ICC fixture requested one
-33 MiB allocation while discarding the oversized profile. Neither this setting
-nor a process RSS measurement proves a 32 MiB total allocation bound.
+Before either PNG dimension probing or decoding, the shared input boundary
+retains all critical chunks and tRNS, and discards unused ancillary metadata.
+This prevents ICC and compressed text metadata from reaching the decoder.
+APNG is rejected before filtering; unknown critical chunks reach the decoder.
+The filter borrows metadata-free input and otherwise copies at most its encoded
+length. Pixel expansion, transparency and 16-bit conversion remain with image/png.
+ICC color management is outside this static profile. Discarded metadata and its
+CRC are ignored; retained chunks follow the decoder's existing tolerance rules.
+The decoder budget is still a dependency limit, not a total allocation or RSS cap.
 OSC/APC strings are at most 24 MiB; SIXEL/DCS parser input is at most 256 KiB.
 
 The adapter's exported image cache is a separate maximum of 64 MiB. Its immutable

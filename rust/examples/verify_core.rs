@@ -489,14 +489,19 @@ fn verify_png_metadata() -> Result<()> {
             .advance(command(&tail[..tail.len() - 13]).as_bytes())
             .is_err()
     );
-    let mut unknown = Vec::new();
-    {
-        let mut writer = png::Encoder::with_info(&mut unknown, info.clone())?.write_header()?;
-        writer.write_chunk(png::chunk::ChunkType(*b"ABCD"), &[])?;
-        writer.write_image_data(&[1, 2, 3, 255])?;
-        writer.finish()?;
+    for name in [*b"ABCD", *b"ab1d", *b"abcd"] {
+        let mut invalid = Vec::new();
+        {
+            let mut writer = png::Encoder::with_info(&mut invalid, info.clone())?.write_header()?;
+            writer.write_chunk(png::chunk::ChunkType(name), &[])?;
+            writer.write_image_data(&[1, 2, 3, 255])?;
+            writer.finish()?;
+        }
+        assert!(model().advance(command(&invalid).as_bytes()).is_err());
     }
-    assert!(model().advance(command(&unknown).as_bytes()).is_err());
+    let mut incomplete = plain.clone();
+    incomplete.extend_from_slice(b"\0\0\0\0t");
+    assert!(model().advance(command(&incomplete).as_bytes()).is_err());
     let mut animated = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut animated, 1, 1);

@@ -1,4 +1,5 @@
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
+use std::borrow::Cow;
 use std::convert::TryInto;
 use wezterm_escape_parser::osc::{ITermProprietary, OperatingSystemCommand};
 use wezterm_escape_parser::{Action, DeviceControlMode, Sixel, SixelData};
@@ -132,30 +133,50 @@ pub fn validate_action(action: &Action) -> Result<()> {
     Ok(())
 }
 
-/// Only static PNG and JPEG are admitted. Inspect PNG chunks before decoding so
-/// APNG never allocates frame state. GIF/WebP/AVIF cannot enter an animation path.
-fn static_reader(data: &[u8]) -> Result<image::ImageReader<std::io::Cursor<&[u8]>>> {
+/// Only static PNG/JPEG are admitted. Inspect chunks before decoding to reject
+/// APNG and prevent unused metadata from allocating decompressed buffers.
+fn static_reader(data: &[u8]) -> Result<image::ImageReader<std::io::Cursor<Cow<'_, [u8]>>>> {
     ensure!(data.len() <= MAX_IMAGE, "encoded image exceeds limit");
     let format = image::guess_format(data)?;
     ensure!(
         matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg),
         "only static PNG/JPEG inline images are supported"
     );
-    if format == image::ImageFormat::Png {
+    let data = if format == image::ImageFormat::Png {
         let mut offset = 8usize;
-        while offset + 12 <= data.len() {
+        let mut filtered: Option<Vec<u8>> = None;
+        while offset < data.len() {
+            ensure!(data.len() - offset >= 12, "truncated PNG chunk");
             let len = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            ensure!(
-                &data[offset + 4..offset + 8] != b"acTL",
-                "animated PNG is outside the terminal profile"
-            );
-            offset = offset
+            let end = offset
                 .checked_add(len)
                 .and_then(|n| n.checked_add(12))
                 .ok_or_else(|| anyhow::anyhow!("PNG chunk overflow"))?;
-            ensure!(offset <= data.len(), "truncated PNG chunk");
+            ensure!(end <= data.len(), "truncated PNG chunk");
+            let kind = &data[offset + 4..offset + 8];
+            ensure!(
+                kind.iter().all(u8::is_ascii_alphabetic) && kind[2].is_ascii_uppercase(),
+                "invalid PNG chunk type"
+            );
+            ensure!(
+                kind != b"acTL",
+                "animated PNG is outside the terminal profile"
+            );
+            if kind[0].is_ascii_uppercase() || kind == b"tRNS" {
+                if let Some(bytes) = &mut filtered {
+                    bytes.extend_from_slice(&data[offset..end]);
+                }
+            } else if filtered.is_none() {
+                let mut bytes = Vec::with_capacity(data.len());
+                bytes.extend_from_slice(&data[..offset]);
+                filtered = Some(bytes);
+            }
+            offset = end;
         }
-    }
+        filtered.map_or(Cow::Borrowed(data), Cow::Owned)
+    } else {
+        Cow::Borrowed(data)
+    };
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(data), format);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16384);

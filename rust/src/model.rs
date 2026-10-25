@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CELL_IMAGES: usize = 4096;
@@ -15,6 +17,42 @@ pub const MAX_PENDING_INPUT: usize = 256 * 1024;
 pub const MAX_EFFECT_BYTES: usize = 1024 * 1024;
 pub const MAX_EFFECTS: usize = 256;
 pub type Digest = [u8; 32];
+
+fn bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVec<T, const MAX: usize>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de> for BoundedVec<T, MAX> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {MAX} entries")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Vec<T>, A::Error> {
+            let capacity = sequence.size_hint().unwrap_or(0);
+            if capacity > MAX {
+                return Err(serde::de::Error::invalid_length(capacity, &self));
+            }
+            let mut values = Vec::with_capacity(capacity);
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVec::<T, MAX>(PhantomData))
+}
 
 pub fn resource_digest(width: u32, height: u32, rgba: &[u8]) -> Digest {
     let mut hash = blake3::Hasher::new();
@@ -337,6 +375,7 @@ pub enum ClientMessage {
     },
     MissingResources {
         epoch: u64,
+        #[serde(deserialize_with = "bounded_vec::<_, _, 128>")]
         digests: Vec<Digest>,
     },
     EffectsApplied {
@@ -374,6 +413,7 @@ pub enum ServerMessage {
     Effects {
         epoch: u64,
         floor: u64,
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_EFFECTS>")]
         items: Vec<Effect>,
     },
     Exit {

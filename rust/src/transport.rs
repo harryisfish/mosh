@@ -21,7 +21,7 @@ use crate::model::{
     MAX_RESOURCE, MAX_RESOURCES, PROTOCOL_VERSION, Resource, ResourceMeta,
 };
 
-const ALPN: &[u8] = b"mosh-rs/1";
+const ALPN: &[u8] = b"mosh-rs/2";
 const FRAME_STREAM: u8 = 1;
 const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;
@@ -523,7 +523,7 @@ fn validate_grant(grant: &Grant) -> Result<()> {
 }
 
 pub async fn send_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(message)?;
+    let bytes = postcard::to_allocvec(message)?;
     ensure!(bytes.len() <= MAX_CONTROL, "control message exceeds limit");
     send.set_priority(10)?;
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
@@ -542,7 +542,9 @@ pub async fn recv_message<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<
     ensure!(length <= MAX_CONTROL, "control message exceeds limit");
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes).await?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    let (message, remaining) = postcard::take_from_bytes(&bytes)?;
+    ensure!(remaining.is_empty(), "trailing bytes in control message");
+    Ok(Some(message))
 }
 
 pub enum Incoming {

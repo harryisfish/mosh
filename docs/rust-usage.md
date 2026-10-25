@@ -103,13 +103,16 @@ python3 scripts/verify-rust-cli.py --network
 
 These tools drive real core, QUIC, renderer, and PTY paths. The CLI tool creates
 only its own local sessions. Its network option places an actual UDP relay
-between the binaries and temporarily drops packets. It checks the original
-command survives and queued input is applied once.
+between the binaries, injects delay, jitter, loss, duplication, and reordering,
+and verifies 8192 raw keys byte-for-byte. It also temporarily drops all packets
+and checks the original command survives and queued input is applied once.
 
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
-No compatibility with the old Mosh wire protocol is provided. Worker crashes do
+Both Rust endpoints must use protocol version 2. Earlier Rust version 1 workers
+cannot resume with the new client. No compatibility with the old Mosh wire
+protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client
 process; external clipboard or notification side effects are not transactional
 across a client crash. Scrollback remains bounded on the server; the client shows

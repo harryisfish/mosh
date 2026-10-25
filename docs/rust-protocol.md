@@ -4,6 +4,9 @@ This is the implementation contract for the Rust client and server. It replaces
 the old wire protocol. The C++ implementation remains available while the new
 implementation is verified.
 
+The current Rust protocol is version 2, with ALPN `mosh-rs/2`. Both endpoints
+must use this version. Version 1 workers cannot resume with a version 2 client.
+
 ## Ownership and authentication
 
 The session actor owns one PTY and one terminal core. The network tasks never
@@ -32,10 +35,13 @@ roots, replaces unsent obsolete state, and cancels obsolete display streams.
 The client checks epoch, revision, and base before installation. Once local
 output starts, its sole writer completes and flushes the frame before confirming
 it. Images have immutable content hashes and separate low-priority streams.
-Control messages use bounded JSON framing. Frames use bounded postcard encoding
-and zstd compression. Image keys hash their dimensions followed by their RGBA
-bytes. A cache miss explicitly requests the missing resources. A base mismatch
-requests a checkpoint. Application exit has its own final acknowledgement.
+Control messages use a four-byte big-endian length followed by bounded postcard
+encoding. The receiver rejects trailing bytes and checks resource-request and
+effect collection limits during decoding. Enum variant order and struct field
+order are part of the versioned wire format. SSH bootstrap remains newline JSON.
+Frames use bounded postcard encoding and zstd compression. Image keys hash their
+dimensions followed by their RGBA bytes. A cache miss explicitly requests the
+missing resources. A base mismatch requests a checkpoint. Application exit has its own final acknowledgement.
 
 `echo_through` advances only after PTY output has been observed following input.
 It is a prediction lifetime bound, not proof that a particular glyph was echoed.
@@ -57,6 +63,11 @@ before display projection. Files and shared memory are never forwarded or read.
 Parser accumulation, decompression, decoding, unplaced uploads, live resources,
 and client caches all have bounds. Rejected image commands cannot bypass the
 bounds through a graphics query. Animated images are outside this profile.
+Static PNG input retains critical chunks and transparency data; unused color
+profiles, text, EXIF, and other ancillary metadata are discarded before decoding.
+The terminal uses the decoder's existing RGBA conversion without ICC color
+management. Discarded metadata is not validated, including its CRC; retained
+chunks follow the decoder's existing validation and tolerance rules.
 
 Effects have monotonic IDs and a display-revision barrier. Reconnection replays
 only unapplied effects for the same client process. An overflow advances an

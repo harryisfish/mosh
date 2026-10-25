@@ -4,16 +4,288 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use mosh_rs::model::{
-    Attach, BootstrapRequest, ClientMessage, Cursor as ScreenCursor, Frame, MAX_CONTROL, MAX_FRAME,
-    PROTOCOL_VERSION, PredictionContext, Resource, ResourceMeta, Row, RowPatch, ServerMessage,
-    Size, resource_digest,
+    Attach, BootstrapRequest, ClientMessage, Cursor as ScreenCursor, Effect, EffectKind, Frame,
+    InputEvent, InputRecord, Key, KeyCode, KeyPhase, MAX_CONTROL, MAX_EFFECTS, MAX_FRAME, Mouse,
+    MouseKind, PROTOCOL_VERSION, PredictionContext, Resource, ResourceMeta, Row, RowPatch,
+    ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
     ClientEndpoints, ClientIdentity, Incoming, bootstrap_local, connect, listen, read_request,
     receive_uni, recv_message, send_frame, send_message, send_resource, spawn_worker,
     validate_frame, write_grant,
 };
-use quinn::{Connection, Endpoint, VarInt};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+
+async fn rejected_control<T: serde::de::DeserializeOwned>(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    body: &[u8],
+) -> Result<()> {
+    send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    send.write_all(body).await?;
+    ensure!(
+        recv_message::<T>(recv).await.is_err(),
+        "invalid control message was accepted"
+    );
+    Ok(())
+}
+
+async fn verify_control_messages(
+    client: &mut (SendStream, RecvStream),
+    server: &mut (SendStream, RecvStream),
+    session: &str,
+) -> Result<()> {
+    let key = Key {
+        code: KeyCode::Char('x'),
+        modifiers: 0,
+        phase: KeyPhase::Press,
+        shifted: None,
+        base: None,
+        text: None,
+    };
+    send_message(
+        &mut client.0,
+        &ClientMessage::Input {
+            epoch: 1,
+            record: InputRecord {
+                seq: 1,
+                event: InputEvent::Key(key.clone()),
+            },
+        },
+    )
+    .await?;
+    let mut length = [0; 4];
+    server.1.read_exact(&mut length).await?;
+    ensure!(
+        u32::from_be_bytes(length) == 12,
+        "single-key control is not compact"
+    );
+    let mut body = [0; 12];
+    server.1.read_exact(&mut body).await?;
+    ensure!(
+        body == [1, 1, 1, 0, 0, 1, b'x', 0, 0, 0, 0, 0],
+        "single-key wire value changed"
+    );
+
+    let rich_key = Key {
+        code: KeyCode::Char('中'),
+        modifiers: 255,
+        shifted: Some('文'),
+        base: Some('a'),
+        text: Some("e\u{301}中文🙂\0".into()),
+        ..key
+    };
+    let mut events: Vec<_> = [KeyPhase::Press, KeyPhase::Repeat, KeyPhase::Release]
+        .into_iter()
+        .map(|phase| {
+            InputEvent::Key(Key {
+                phase,
+                ..rich_key.clone()
+            })
+        })
+        .collect();
+    events.extend([
+        InputEvent::Key(Key {
+            code: KeyCode::Named("Up".into()),
+            ..rich_key
+        }),
+        InputEvent::Paste("paste 中文🙂\0".into()),
+        InputEvent::Focus(true),
+        InputEvent::Focus(false),
+        InputEvent::QueryResult {
+            query: u64::MAX,
+            data: Some("clipboard 中文\0".into()),
+        },
+        InputEvent::QueryResult {
+            query: 1,
+            data: None,
+        },
+    ]);
+    for kind in [
+        MouseKind::Press(2),
+        MouseKind::Release(2),
+        MouseKind::Move,
+        MouseKind::Wheel(-3),
+        MouseKind::WheelHorizontal(4),
+    ] {
+        events.push(InputEvent::Mouse(Mouse {
+            x: 511,
+            y: 255,
+            pixel_x: u16::MAX,
+            pixel_y: u16::MAX,
+            modifiers: 255,
+            kind,
+        }));
+    }
+    let mut messages: Vec<_> = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| ClientMessage::Input {
+            epoch: u64::MAX,
+            record: InputRecord {
+                seq: index as u64 + 128,
+                event,
+            },
+        })
+        .collect();
+    messages.extend([
+        ClientMessage::Attach(Attach {
+            version: PROTOCOL_VERSION,
+            session: session.into(),
+            attempt: 2,
+            committed: 10,
+            rendered: 20,
+            effects: 3,
+        }),
+        ClientMessage::Rendered {
+            epoch: 1,
+            revision: u64::MAX,
+        },
+        ClientMessage::Resync { epoch: 1 },
+        ClientMessage::MissingResources {
+            epoch: 1,
+            digests: vec![[0xff; 32]; 128],
+        },
+        ClientMessage::EffectsApplied {
+            epoch: 1,
+            through: u64::MAX,
+        },
+        ClientMessage::Resize {
+            epoch: 1,
+            generation: 2,
+            after: 128,
+            size: Size::default(),
+        },
+        ClientMessage::Detach { epoch: 1 },
+        ClientMessage::Close { epoch: 1 },
+        ClientMessage::ExitAck { epoch: 1 },
+    ]);
+    for expected in messages {
+        send_message(&mut client.0, &expected).await?;
+        let actual: ClientMessage = recv_message(&mut server.1)
+            .await?
+            .context("missing client control")?;
+        ensure!(
+            serde_json::to_value(&actual)? == serde_json::to_value(&expected)?,
+            "client control changed in transit"
+        );
+    }
+
+    let bell = Effect {
+        id: 1,
+        after: 2,
+        kind: EffectKind::Bell,
+    };
+    let mut effects = vec![bell.clone(); MAX_EFFECTS];
+    effects[1].kind = EffectKind::ClipboardWrite {
+        selection: "c".into(),
+        data: "remote 中文🙂\0".into(),
+    };
+    effects[2].kind = EffectKind::ClipboardRead {
+        query: u64::MAX,
+        selection: "p".into(),
+    };
+    effects[3].kind = EffectKind::Notification {
+        title: "title 中".into(),
+        body: "body 🙂\0".into(),
+    };
+    for expected in [
+        ServerMessage::Attached {
+            epoch: 1,
+            committed: 128,
+            effect_floor: 2,
+        },
+        ServerMessage::Committed {
+            epoch: 1,
+            through: u64::MAX,
+        },
+        ServerMessage::Effects {
+            epoch: 1,
+            floor: 2,
+            items: effects,
+        },
+        ServerMessage::Exit {
+            epoch: 1,
+            code: -9,
+            revision: u64::MAX,
+            effects: 3,
+        },
+        ServerMessage::Error {
+            message: "error 中文🙂\0".into(),
+        },
+    ] {
+        send_message(&mut server.0, &expected).await?;
+        let actual: ServerMessage = recv_message(&mut client.1)
+            .await?
+            .context("missing server control")?;
+        ensure!(
+            serde_json::to_value(&actual)? == serde_json::to_value(&expected)?,
+            "server control changed in transit"
+        );
+    }
+
+    let oversized_digests = ClientMessage::MissingResources {
+        epoch: 1,
+        digests: vec![[0xff; 32]; 129],
+    };
+    rejected_control::<ClientMessage>(
+        &mut client.0,
+        &mut server.1,
+        &postcard::to_allocvec(&oversized_digests)?,
+    )
+    .await?;
+    ensure!(
+        serde_json::from_slice::<ClientMessage>(&serde_json::to_vec(&oversized_digests)?).is_err(),
+        "resource count without a size hint was accepted"
+    );
+    let oversized_effects = ServerMessage::Effects {
+        epoch: 1,
+        floor: 0,
+        items: vec![bell.clone(); MAX_EFFECTS + 1],
+    };
+    rejected_control::<ServerMessage>(
+        &mut server.0,
+        &mut client.1,
+        &postcard::to_allocvec(&oversized_effects)?,
+    )
+    .await?;
+    ensure!(
+        serde_json::from_slice::<ServerMessage>(&serde_json::to_vec(&oversized_effects)?).is_err(),
+        "effect count without a size hint was accepted"
+    );
+
+    let mut missing = postcard::to_allocvec(&ClientMessage::MissingResources {
+        epoch: 1,
+        digests: vec![],
+    })?;
+    ensure!(missing.pop() == Some(0), "empty resource count changed");
+    missing.extend(postcard::to_allocvec(&usize::MAX)?);
+    missing.extend(vec![0; 32 * 129]);
+    rejected_control::<ClientMessage>(&mut client.0, &mut server.1, &missing).await?;
+    let mut effects = postcard::to_allocvec(&ServerMessage::Effects {
+        epoch: 1,
+        floor: 0,
+        items: vec![],
+    })?;
+    ensure!(effects.pop() == Some(0), "empty effect count changed");
+    effects.extend(postcard::to_allocvec(&usize::MAX)?);
+    for _ in 0..=MAX_EFFECTS {
+        effects.extend(postcard::to_allocvec(&bell)?);
+    }
+    rejected_control::<ServerMessage>(&mut server.0, &mut client.1, &effects).await?;
+
+    let valid = postcard::to_allocvec(&ClientMessage::Close { epoch: u64::MAX })?;
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    rejected_control::<ClientMessage>(&mut client.0, &mut server.1, &trailing).await?;
+    rejected_control::<ClientMessage>(&mut client.0, &mut server.1, &valid[..valid.len() - 1])
+        .await?;
+    rejected_control::<ClientMessage>(&mut client.0, &mut server.1, &[0xff; 11]).await?;
+    println!(
+        "compact control preserves every message and rich input; bounded collections and malformed payloads are rejected"
+    );
+    Ok(())
+}
 
 fn request(identity: &ClientIdentity) -> BootstrapRequest {
     BootstrapRequest {
@@ -92,7 +364,7 @@ async fn main() -> Result<()> {
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, certificate rejection, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v2, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
     );
     Ok(())
 }
@@ -125,8 +397,30 @@ async fn worker() -> Result<()> {
 async fn verify() -> Result<()> {
     let identity = ClientIdentity::generate()?;
     let request = request(&identity);
+    let mut legacy_request = request.clone();
+    legacy_request.version = 1;
+    let mut legacy_json = serde_json::to_vec(&legacy_request)?;
+    legacy_json.push(b'\n');
+    ensure!(
+        read_request(Cursor::new(legacy_json)).is_err(),
+        "v1 bootstrap request was accepted"
+    );
+    ensure!(
+        listen(&legacy_request).is_err(),
+        "v1 listener request was accepted"
+    );
     let (server, grant) = listen(&request)?;
     let client = identity.endpoint(&grant)?;
+    let mut legacy_grant = grant.clone();
+    legacy_grant.version = 1;
+    ensure!(
+        identity.endpoint(&legacy_grant).is_err(),
+        "v1 server grant was accepted"
+    );
+    ensure!(
+        connect(&client, &legacy_grant).await.is_err(),
+        "v1 connection grant was accepted"
+    );
     let mut hostname_grant = grant.clone();
     hostname_grant.address = "localhost".into();
     let (server_connection, client_connection) = tokio::time::timeout(
@@ -138,6 +432,15 @@ async fn verify() -> Result<()> {
     ensure!(
         client_connection.remote_address().is_ipv4(),
         "IPv4 candidate did not use a native IPv4 socket"
+    );
+    let handshake = client_connection
+        .handshake_data()
+        .context("missing TLS handshake data")?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
+    ensure!(
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/2"[..]),
+        "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");
     let mut mapped_grant = grant.clone();
@@ -205,6 +508,7 @@ async fn verify() -> Result<()> {
         matches!(received, ServerMessage::Attached { epoch: 1, .. }),
         "server control frame changed"
     );
+    verify_control_messages(&mut client_streams, &mut server_streams, &grant.session).await?;
 
     let rgba: Arc<[u8]> = vec![123; 4 * 1024 * 1024].into();
     let large = Resource {
@@ -342,6 +646,15 @@ async fn verify() -> Result<()> {
             .await
             .is_err(),
         "oversized incoming control accepted"
+    );
+    client_streams.0.write_all(&4_u32.to_be_bytes()).await?;
+    client_streams.0.write_all(&[1]).await?;
+    client_streams.0.finish()?;
+    ensure!(
+        recv_message::<ClientMessage>(&mut server_streams.1)
+            .await
+            .is_err(),
+        "truncated control body was accepted"
     );
     let mut invalid = frame();
     invalid.rows[0].y = 65535;
