@@ -941,7 +941,9 @@ impl Screen {
         for line in &first[first_range] {
             lines.push(line);
         }
-        for line in &second[second_range] {
+        for line in &second[second_range.start.saturating_sub(first.len())
+            ..second_range.end.saturating_sub(first.len())]
+        {
             lines.push(line);
         }
         func(&lines)

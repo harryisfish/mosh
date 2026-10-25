@@ -28,6 +28,7 @@ fn model() -> TerminalModel {
 }
 fn main() -> Result<()> {
     verify_projection_regressions()?;
+    verify_scrollback_wrap()?;
     let maximum = Size {
         cols: 512,
         rows: 256,
@@ -586,6 +587,47 @@ fn verify_projection_regressions() -> Result<()> {
     checked(&mut resized)?;
     println!(
         "Unicode split/whole continuation, DSR, resize, semantic markers, scaled images, legacy symbols, metadata validation passed"
+    );
+    Ok(())
+}
+
+fn verify_scrollback_wrap() -> Result<()> {
+    let mut terminal = TerminalModel::new(
+        Size {
+            cols: 80,
+            rows: 12,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        false,
+    )?;
+    for index in 0..2048 {
+        terminal.advance(format!("{index:04}: cafe").as_bytes())?;
+        terminal.advance("\u{0301}\r\n".as_bytes())?;
+        if index % 64 == 63 {
+            let screen = terminal.snapshot()?;
+            assert_eq!(screen.rows.len(), 12);
+            assert_eq!((screen.cursor.x, screen.cursor.y), (0, 11));
+            let last_line: String = screen.rows[10]
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect();
+            assert_eq!(last_line.trim_end(), format!("{index:04}: cafe\u{0301}"));
+            assert_eq!(terminal.advance(b"\x1b[6n")?.replies, b"\x1b[12;1R");
+        }
+    }
+    let reply = terminal.advance(b"done\rD\x1b[6n")?.replies;
+    assert_eq!(reply, b"\x1b[12;2R");
+    let screen = terminal.snapshot()?;
+    let last_line: String = screen.rows[11]
+        .cells
+        .iter()
+        .map(|cell| cell.text.as_str())
+        .collect();
+    assert_eq!(last_line.trim_end(), "Done");
+    println!(
+        "2048 scrolling lines with split combining text, snapshots, continuation and DSR passed"
     );
     Ok(())
 }
