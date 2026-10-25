@@ -135,7 +135,14 @@ impl TerminalModel {
         let mut reply_writer = collector.clone();
         let result = self.terminal.advance_bytes_checked(
             bytes,
-            |action, terminal| observer.before(action, terminal, &mut effects, &mut reply_writer),
+            |action, terminal, before| {
+                if before {
+                    observer.before(action, terminal, &mut effects, &mut reply_writer)
+                } else {
+                    observer.after(action, terminal);
+                    Ok(true)
+                }
+            },
             || collector.check(),
         );
         if let Err(error) = result {
@@ -324,10 +331,12 @@ impl TerminalModel {
                     used.insert(key);
                     let top = image.top_left();
                     let bottom = image.bottom_right();
-                    let x = (top.x.into_inner() * width as f32).round() as u32;
-                    let y = (top.y.into_inner() * height as f32).round() as u32;
-                    let right = (bottom.x.into_inner() * width as f32).round() as u32;
-                    let bottom = (bottom.y.into_inner() * height as f32).round() as u32;
+                    let x = ((top.x.into_inner() * width as f32).floor() as u32).min(width - 1);
+                    let y = ((top.y.into_inner() * height as f32).floor() as u32).min(height - 1);
+                    let right =
+                        ((bottom.x.into_inner() * width as f32).ceil() as u32).clamp(x + 1, width);
+                    let bottom = ((bottom.y.into_inner() * height as f32).ceil() as u32)
+                        .clamp(y + 1, height);
                     let padding = image.padding();
                     images.push(ImageTile {
                         resource: resource.meta.digest,
@@ -361,12 +370,15 @@ impl TerminalModel {
                     let mut params: Vec<_> = link.params().iter().collect();
                     params.sort_by(|a, b| a.0.cmp(b.0));
                     Hyperlink {
-                        params: params
-                            .into_iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .collect::<Vec<_>>()
-                            .join(":"),
-                        url: link.uri().to_owned(),
+                        params: display_metadata(
+                            &params
+                                .into_iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(":"),
+                            4096,
+                        ),
+                        url: display_metadata(link.uri(), 8192),
                     }
                 });
                 let underline = match attrs.underline() {
@@ -427,15 +439,27 @@ impl TerminalModel {
             size: self.size,
             rows,
             cursor: Cursor {
-                x: cursor.x as u16,
-                y: cursor.y.max(0) as u16,
+                x: cursor.x.min(usize::from(self.size.cols - 1)) as u16,
+                y: cursor.y.clamp(0, i64::from(self.size.rows - 1)) as u16,
                 shape,
                 blink: cursor.shape.is_blinking(),
                 visible: cursor.visibility == core::CursorVisibility::Visible,
             },
-            title: self.terminal.get_title().to_owned(),
-            directory: self.terminal.get_current_dir().map(ToString::to_string),
-            markers: self.state.markers.iter().cloned().collect(),
+            title: display_metadata(self.terminal.get_title(), 4096),
+            directory: self
+                .terminal
+                .get_current_dir()
+                .map(|dir| display_metadata(&dir.to_string(), 8192)),
+            markers: self
+                .state
+                .markers
+                .iter()
+                .cloned()
+                .map(|mut marker| {
+                    marker.column = marker.column.min(self.size.cols - 1);
+                    marker
+                })
+                .collect(),
             reverse_video: self.terminal.get_reverse_video(),
             prediction,
             resources,
@@ -443,11 +467,51 @@ impl TerminalModel {
     }
 }
 
+fn display_metadata(text: &str, limit: usize) -> String {
+    let mut result = String::new();
+    for c in text.chars().filter(|c| !c.is_control()) {
+        if result.len() + c.len_utf8() > limit {
+            break;
+        }
+        result.push(c);
+    }
+    result
+}
+
 impl Observer {
+    fn after(&mut self, action: &Action, terminal: &core::TerminalState) {
+        let Action::OperatingSystemCommand(osc) = action else {
+            return;
+        };
+        let Osc::FinalTermSemanticPrompt(marker) = osc.as_ref() else {
+            return;
+        };
+        let (kind, status) = match marker {
+            Marker::FreshLine => return,
+            Marker::FreshLineAndStartPrompt { .. }
+            | Marker::StartPrompt(_)
+            | Marker::MarkEndOfCommandWithFreshLine { .. } => ("A", None),
+            Marker::MarkEndOfPromptAndStartOfInputUntilNextMarker
+            | Marker::MarkEndOfPromptAndStartOfInputUntilEndOfLine => ("B", None),
+            Marker::MarkEndOfInputAndStartOfOutput { .. } => ("C", None),
+            Marker::CommandStatus { status, .. } => ("D", Some(*status)),
+        };
+        let cursor = terminal.cursor_pos();
+        self.markers.push_back(ShellMarker {
+            row: terminal.screen().visible_row_to_stable_row(cursor.y) as i64,
+            column: cursor.x.min(terminal.get_size().cols - 1) as u16,
+            kind: kind.to_owned(),
+            status,
+        });
+        if self.markers.len() > 256 {
+            self.markers.pop_front();
+        }
+    }
+
     fn before(
         &mut self,
         action: &Action,
-        terminal: &core::TerminalState,
+        _terminal: &core::TerminalState,
         effects: &mut Vec<EffectKind>,
         replies: &mut Collector,
     ) -> Result<bool> {
@@ -478,6 +542,17 @@ impl Observer {
         let effect = match action {
             Action::Control(core::escape::ControlCode::Bell) => Some(EffectKind::Bell),
             Action::OperatingSystemCommand(osc) => match osc.as_ref() {
+                Osc::SetSelection(selection, _) | Osc::ClearSelection(selection)
+                    if selection.intersects(Selection::CUT8 | Selection::CUT9) =>
+                {
+                    return Ok(false);
+                }
+                Osc::QuerySelection(selection)
+                    if selection.intersects(Selection::CUT8 | Selection::CUT9) =>
+                {
+                    write!(replies, "\x1b]52;{};\x1b\\", selection_name(*selection))?;
+                    return Ok(false);
+                }
                 Osc::SetSelection(selection, data) => {
                     ensure!(
                         data.len() <= MAX_PENDING_INPUT / 2,
@@ -511,29 +586,6 @@ impl Observer {
                         selection,
                     })
                 }
-                Osc::FinalTermSemanticPrompt(marker) => {
-                    let (kind, status) = match marker {
-                        Marker::FreshLineAndStartPrompt { .. } | Marker::StartPrompt(_) => {
-                            ("A", None)
-                        }
-                        Marker::MarkEndOfPromptAndStartOfInputUntilNextMarker
-                        | Marker::MarkEndOfPromptAndStartOfInputUntilEndOfLine => ("B", None),
-                        Marker::MarkEndOfInputAndStartOfOutput { .. } => ("C", None),
-                        Marker::CommandStatus { status, .. } => ("D", Some(*status)),
-                        _ => ("L", None),
-                    };
-                    let cursor = terminal.cursor_pos();
-                    self.markers.push_back(ShellMarker {
-                        row: terminal.screen().visible_row_to_stable_row(cursor.y) as i64,
-                        column: cursor.x as u16,
-                        kind: kind.to_owned(),
-                        status,
-                    });
-                    if self.markers.len() > 256 {
-                        self.markers.pop_front();
-                    }
-                    None
-                }
                 Osc::SetHyperlink(Some(link)) => {
                     ensure!(
                         link.uri().len() <= 8192
@@ -551,7 +603,7 @@ impl Observer {
                     ensure!(body.len() <= 4096, "notification exceeds limit");
                     Some(EffectKind::Notification {
                         title: String::new(),
-                        body: body.clone(),
+                        body: display_metadata(body, 8192),
                     })
                 }
                 Osc::CurrentWorkingDirectory(directory) => {

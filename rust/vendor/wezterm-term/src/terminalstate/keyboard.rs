@@ -185,7 +185,12 @@ impl TerminalState {
             if matches!(key, KeyCode::Function(25..=35)) {
                 return Ok(());
             }
-            self.key_down(key.clone(), legacy_modifiers(event.modifiers))
+            let key = if event.modifiers & 1 != 0 && matches!(key, KeyCode::Char(_)) {
+                event.shifted.map(KeyCode::Char).unwrap_or_else(|| key.clone())
+            } else {
+                key.clone()
+            };
+            self.key_down(key, legacy_modifiers(event.modifiers))
         } else {
             // Media and modifier-only events have no legacy terminal bytes.
             Ok(())

@@ -176,10 +176,11 @@ impl Terminal {
     }
 
     /// Parse bounded actions and expose errors even when legacy handlers swallow writes.
+    /// Observe every action before execution (`true`), and semantic markers after (`false`).
     pub fn advance_bytes_checked(
         &mut self,
         bytes: &[u8],
-        mut before: impl FnMut(&wezterm_escape_parser::Action, &TerminalState) -> anyhow::Result<bool>,
+        mut observe: impl FnMut(&wezterm_escape_parser::Action, &TerminalState, bool) -> anyhow::Result<bool>,
         mut after: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         self.state.increment_seqno();
@@ -197,9 +198,17 @@ impl Terminal {
                 ) {
                     performer.flush_print();
                 }
-                if before(&action, &performer.state)? {
+                if observe(&action, &performer.state, true)? {
                     crate::bounded::validate_action(&action)?;
+                    let semantic = match &action {
+                        wezterm_escape_parser::Action::OperatingSystemCommand(osc)
+                            if matches!(osc.as_ref(), wezterm_escape_parser::OperatingSystemCommand::FinalTermSemanticPrompt(_)) => Some(action.clone()),
+                        _ => None,
+                    };
                     performer.perform(action);
+                    if let Some(action) = semantic {
+                        observe(&action, &performer.state, false)?;
+                    }
                 }
                 if let Some(error) = performer.state.action_error.take() {
                     anyhow::bail!("{}", error);

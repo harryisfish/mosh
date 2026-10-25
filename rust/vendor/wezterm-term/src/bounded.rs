@@ -134,7 +134,7 @@ pub fn validate_action(action: &Action) -> Result<()> {
 
 /// Only static PNG and JPEG are admitted. Inspect PNG chunks before decoding so
 /// APNG never allocates frame state. GIF/WebP/AVIF cannot enter an animation path.
-pub fn decode_static(data: &[u8]) -> Result<image::RgbaImage> {
+fn static_reader(data: &[u8]) -> Result<image::ImageReader<std::io::Cursor<&[u8]>>> {
     ensure!(data.len() <= MAX_IMAGE, "encoded image exceeds limit");
     let format = image::guess_format(data)?;
     ensure!(
@@ -156,14 +156,22 @@ pub fn decode_static(data: &[u8]) -> Result<image::RgbaImage> {
             ensure!(offset <= data.len(), "truncated PNG chunk");
         }
     }
-    let (width, height) =
-        image::ImageReader::with_format(std::io::Cursor::new(data), format).into_dimensions()?;
-    crate::terminalstate::check_image_dimensions(width, height)?;
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(data), format);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16384);
     limits.max_image_height = Some(16384);
     limits.max_alloc = Some(MAX_IMAGE as u64 * 2);
     reader.limits(limits);
-    Ok(reader.decode()?.into_rgba8())
+    Ok(reader)
+}
+
+pub fn static_dimensions(data: &[u8]) -> Result<(u32, u32)> {
+    let dimensions = static_reader(data)?.into_dimensions()?;
+    crate::terminalstate::check_image_dimensions(dimensions.0, dimensions.1)?;
+    Ok(dimensions)
+}
+
+pub fn decode_static(data: &[u8]) -> Result<image::RgbaImage> {
+    static_dimensions(data)?;
+    Ok(static_reader(data)?.decode()?.into_rgba8())
 }

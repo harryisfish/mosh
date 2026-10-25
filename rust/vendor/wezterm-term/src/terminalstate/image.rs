@@ -355,9 +355,7 @@ pub(crate) struct ImageInfo {
 }
 
 pub(crate) fn dimensions(data: &[u8]) -> anyhow::Result<ImageInfo> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
-    anyhow::ensure!(reader.format().is_some(), "unknown image format");
-    let (width, height) = reader.into_dimensions()?;
+    let (width, height) = crate::bounded::static_dimensions(data)?;
     Ok(ImageInfo { width, height })
 }
 

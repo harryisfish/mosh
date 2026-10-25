@@ -786,24 +786,32 @@ impl TerminalState {
     /// the cursor positions of both accordingly.
     pub fn resize(&mut self, size: TerminalSize) {
         self.increment_seqno();
+        // Reflow tracks the insertion point, including a pending wrap's extra column.
+        let insertion_cursor = |mut position: CursorPosition, wrap_next: bool| {
+            if wrap_next {
+                position.x += 1;
+            }
+            position
+        };
+        let active_cursor = insertion_cursor(self.cursor, self.wrap_next);
         let (cursor_main, cursor_alt) = if self.screen.alt_screen_is_active {
             (
                 self.screen
                     .screen
                     .saved_cursor
                     .as_ref()
-                    .map(|s| s.position)
+                    .map(|s| insertion_cursor(s.position, s.wrap_next))
                     .unwrap_or_else(CursorPosition::default),
-                self.cursor,
+                active_cursor,
             )
         } else {
             (
-                self.cursor,
+                active_cursor,
                 self.screen
                     .alt_screen
                     .saved_cursor
                     .as_ref()
-                    .map(|s| s.position)
+                    .map(|s| insertion_cursor(s.position, s.wrap_next))
                     .unwrap_or_else(CursorPosition::default),
             )
         };
@@ -829,10 +837,10 @@ impl TerminalState {
             );
 
             if let Some(saved) = self.screen.screen.saved_cursor.as_mut() {
-                saved.position.x = adjusted_cursor_main.x;
+                saved.position.x = adjusted_cursor_main.x.min(size.cols - 1);
                 saved.position.y = adjusted_cursor_main.y;
                 saved.position.seqno = self.seqno;
-                saved.wrap_next = false;
+                saved.wrap_next = adjusted_cursor_main.x >= size.cols && self.dec_auto_wrap;
             }
         } else {
             self.set_cursor_pos(
@@ -840,12 +848,18 @@ impl TerminalState {
                 &Position::Absolute(adjusted_cursor_main.y),
             );
             if let Some(saved) = self.screen.alt_screen.saved_cursor.as_mut() {
-                saved.position.x = adjusted_cursor_alt.x;
+                saved.position.x = adjusted_cursor_alt.x.min(size.cols - 1);
                 saved.position.y = adjusted_cursor_alt.y;
                 saved.position.seqno = self.seqno;
-                saved.wrap_next = false;
+                saved.wrap_next = adjusted_cursor_alt.x >= size.cols && self.dec_auto_wrap;
             }
         }
+        let adjusted = if self.screen.alt_screen_is_active {
+            adjusted_cursor_alt
+        } else {
+            adjusted_cursor_main
+        };
+        self.wrap_next = adjusted.x >= size.cols && self.dec_auto_wrap;
     }
 
     pub fn get_size(&self) -> TerminalSize {
@@ -941,11 +955,7 @@ impl TerminalState {
                     if self.dec_origin_mode {
                         self.left_and_right_margins.end
                     } else {
-                        // We allow 1 extra for the cursor x position
-                        // to account for some resize/rewrap scenarios
-                        // where we don't want to forget that the
-                        // cursor belongs to a wrapped line
-                        self.screen().physical_cols + 1
+                        self.screen().physical_cols
                     } as i64
                         - 1,
                 )

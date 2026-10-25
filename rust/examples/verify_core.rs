@@ -27,6 +27,7 @@ fn model() -> TerminalModel {
     .unwrap()
 }
 fn main() -> Result<()> {
+    verify_projection_regressions()?;
     let maximum = Size {
         cols: 512,
         rows: 256,
@@ -377,4 +378,214 @@ impl std::io::Write for CountBytes {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+fn verify_projection_regressions() -> Result<()> {
+    use mosh_rs::{
+        display::{Display, Graphics, PredictionPolicy},
+        state,
+    };
+    fn checked(model: &mut TerminalModel) -> Result<Screen> {
+        let screen = model.snapshot()?;
+        assert_eq!(screen.rows.len(), usize::from(screen.size.rows));
+        assert!(screen.cursor.x < screen.size.cols && screen.cursor.y < screen.size.rows);
+        let dsr = model.advance(b"\x1b[6n")?.replies;
+        assert_eq!(
+            dsr,
+            format!("\x1b[{};{}R", screen.cursor.y + 1, screen.cursor.x + 1).as_bytes()
+        );
+        let frame = state::frame(1, 1, 0, &screen, None)?;
+        let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
+        display.set_epoch(1);
+        display.install(frame, &screen.resources)?;
+        Ok(screen)
+    }
+    fn small() -> Result<TerminalModel> {
+        TerminalModel::new(
+            Size {
+                cols: 4,
+                rows: 3,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            false,
+        )
+    }
+    for chunks in [
+        vec!["12🇨", "🇳"],
+        vec!["123🇨", "🇳"],
+        vec!["123❤", "\u{fe0f}"],
+        vec!["12👩", "\u{200d}", "💻"],
+    ] {
+        for suffix in ["Z", "\rZ", "\x08Z", "界", "\r\n終"] {
+            let mut split = small()?;
+            let mut whole = small()?;
+            for chunk in &chunks {
+                split.advance(chunk.as_bytes())?;
+            }
+            whole.advance(chunks.concat().as_bytes())?;
+            let split_screen = checked(&mut split)?;
+            let whole_screen = checked(&mut whole)?;
+            assert_eq!(split_screen.cursor, whole_screen.cursor, "{chunks:?}");
+            assert_eq!(split_screen.rows, whole_screen.rows, "{chunks:?}");
+            split.advance(suffix.as_bytes())?;
+            whole.advance(suffix.as_bytes())?;
+            let split_screen = checked(&mut split)?;
+            let whole_screen = checked(&mut whole)?;
+            assert_eq!(
+                split_screen.cursor, whole_screen.cursor,
+                "{chunks:?} then {suffix:?}"
+            );
+            assert_eq!(
+                split_screen.rows, whole_screen.rows,
+                "{chunks:?} then {suffix:?}"
+            );
+        }
+    }
+    let mut flag = small()?;
+    flag.advance("12🇨".as_bytes())?;
+    flag.advance("🇳".as_bytes())?;
+    assert_eq!(
+        (checked(&mut flag)?.cursor.x, flag.snapshot()?.cursor.y),
+        (3, 0)
+    );
+    flag.advance(b"Z")?;
+    let screen = checked(&mut flag)?;
+    assert_eq!((screen.cursor.x, screen.cursor.y), (1, 1));
+    assert_eq!(screen.rows[1].cells[0].text, "Z");
+
+    let mut prompt = small()?;
+    prompt.advance(b"1234\x1b]133;A\x1b\\")?;
+    let screen = checked(&mut prompt)?;
+    assert_eq!(
+        (screen.markers[0].row, screen.markers[0].column),
+        (screen.rows[1].stable_id, 0)
+    );
+    prompt.advance(b"x\x1b]133;L\x1b\\")?;
+    assert_eq!(checked(&mut prompt)?.markers.len(), 1);
+    prompt.advance(b"x\x1b]133;N\x1b\\")?;
+    let screen = checked(&mut prompt)?;
+    let marker = screen.markers.last().unwrap();
+    assert_eq!(marker.kind, "A");
+    assert_eq!(
+        (marker.row, marker.column),
+        (screen.rows[screen.cursor.y as usize].stable_id, 0)
+    );
+
+    let mut image = small()?;
+    image.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=4,r=2,C=1;/wAA/w==\x1b\\")?;
+    let screen = checked(&mut image)?;
+    let tiles: Vec<_> = screen
+        .rows
+        .iter()
+        .flat_map(|row| &row.cells)
+        .flat_map(|cell| &cell.images)
+        .collect();
+    assert_eq!(tiles.len(), 8);
+    assert!(tiles.iter().all(|tile| tile.source == [0, 0, 1, 1]));
+    for graphics in [Graphics::Kitty, Graphics::Sixel] {
+        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+        display.set_epoch(1);
+        display.install(state::frame(1, 1, 0, &screen, None)?, &screen.resources)?;
+    }
+
+    let mut keyboard = small()?;
+    assert_eq!(
+        keyboard.encode_input(&InputEvent::Key(Key {
+            code: KeyCode::Char('6'),
+            modifiers: 3,
+            phase: KeyPhase::Press,
+            shifted: Some('^'),
+            base: Some('6'),
+            text: Some("^".into()),
+        }))?,
+        b"\x1b^"
+    );
+    for title in [
+        "\x1b]2;before\tafter\x1b\\",
+        "\x1b]2;before\rafter\x1b\\",
+        "\x1b]2;before\u{009b}after\x1b\\",
+        "\x1bkhello\x1b\\",
+    ] {
+        let mut model = small()?;
+        model.advance(title.as_bytes())?;
+        let screen = checked(&mut model)?;
+        assert!(screen.title.chars().all(|c| !c.is_control()));
+        assert!(screen.title.len() <= 4096);
+        model.advance(b"Z")?;
+        checked(&mut model)?;
+    }
+    let mut metadata = small()?;
+    metadata.advance(format!("\x1bk{}😃\x1b\\", "a".repeat(4095)).as_bytes())?;
+    assert_eq!(checked(&mut metadata)?.title, "a".repeat(4095));
+    metadata
+        .advance(format!("\x1b]8;id={};https://example.com\x1b\\Z", "a".repeat(6000)).as_bytes())?;
+    let screen = checked(&mut metadata)?;
+    assert_eq!(
+        screen.rows[0].cells[0]
+            .style
+            .hyperlink
+            .as_ref()
+            .unwrap()
+            .params
+            .len(),
+        4096
+    );
+    assert!(
+        metadata
+            .advance(b"\x1b]52;8;aGVsbG8=\x1b\\")?
+            .effects
+            .is_empty()
+    );
+    let refused = metadata.advance(b"\x1b]52;9;?\x1b\\")?;
+    assert!(refused.effects.is_empty());
+    assert_eq!(refused.replies, b"\x1b]52;9;\x1b\\");
+    for cols in [4, 8] {
+        let mut resized = small()?;
+        resized.advance(b"1234")?;
+        resized.resize(Size {
+            cols,
+            rows: 4,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        checked(&mut resized)?;
+        resized.advance(b"Z")?;
+        let screen = checked(&mut resized)?;
+        let (x, y) = if cols == 4 { (1, 1) } else { (5, 0) };
+        assert_eq!((screen.cursor.x, screen.cursor.y), (x, y));
+        assert_eq!(
+            screen.rows[y as usize]
+                .cells
+                .iter()
+                .find(|cell| cell.x == x - 1)
+                .unwrap()
+                .text,
+            "Z"
+        );
+    }
+    let mut resized = TerminalModel::new(
+        Size {
+            cols: 80,
+            rows: 12,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        false,
+    )?;
+    resized.advance(&vec![b'x'; 120000])?;
+    checked(&mut resized)?;
+    resized.resize(Size {
+        cols: 100,
+        rows: 20,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    checked(&mut resized)?;
+    resized.advance("界\rQ\x08Z".as_bytes())?;
+    checked(&mut resized)?;
+    println!(
+        "Unicode split/whole continuation, DSR, resize, semantic markers, scaled images, legacy symbols, metadata validation passed"
+    );
+    Ok(())
 }

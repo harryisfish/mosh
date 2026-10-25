@@ -76,3 +76,12 @@ mouse, paste, effects, query responses, synchronized-output expiry, static
 images, size-aware resource identity, Arc reuse, deletion, unplaced-image quota,
 chunk count, forbidden data sources, parser bounds and sticky collector errors.
 It does not verify the network protocol, a real PTY or a local terminal renderer.
+
+Integration fixes: shell markers are observed after core actions, fresh-line-only
+events are omitted, and `N` exports the resulting prompt boundary. Unicode
+width changes across reads update pending-wrap state; resize carries pending-wrap
+into the new viewport. Display metadata drops control characters and truncates at
+UTF-8 boundaries. Integer image tiles cover fractional sampling intervals using
+floor/ceil bounds; non-integral scales may overlap source pixels. Legacy shifted
+symbols use the supplied shifted identity. All image dimension probes apply the
+static format allowlist and decoder limits before constructing a decoder.

@@ -157,7 +157,6 @@ impl<'a> Performer<'a> {
                                 (
                                     cell.cell_index(),
                                     cell.str().to_owned(),
-                                    cell.width(),
                                     cell.attrs().clone(),
                                 )
                             });
@@ -167,7 +166,7 @@ impl<'a> Performer<'a> {
             } else {
                 None
             };
-            if let Some((x, previous, old_width, attrs)) = previous {
+            if let Some((mut x, previous, attrs)) = previous {
                 let joined = format!("{}{}", previous, g);
                 if Graphemes::new(&joined).count() == 1 {
                     if joined.len() > 64 {
@@ -175,16 +174,20 @@ impl<'a> Performer<'a> {
                         return;
                     }
                     let width = grapheme_column_width(&joined, Some(&self.unicode_version));
+                    if x + width > self.left_and_right_margins.end && self.dec_auto_wrap {
+                        let y = self.cursor.y;
+                        self.screen_mut().set_cell_grapheme(x, y, " ", 1, attrs.clone(), seqno);
+                        let row = self.screen().phys_row(y);
+                        self.screen_mut().line_mut(row).set_last_cell_was_wrapped(true, seqno);
+                        self.new_line(true);
+                        x = self.cursor.x;
+                    }
                     let y = self.cursor.y;
                     self.screen_mut()
                         .set_cell_grapheme(x, y, &joined, width, attrs, seqno);
-                    if !self.wrap_next {
-                        self.cursor.x = self
-                            .cursor
-                            .x
-                            .saturating_sub(old_width)
-                            .saturating_add(width);
-                    }
+                    let end = self.left_and_right_margins.end;
+                    self.cursor.x = (x + width).min(end - 1);
+                    self.wrap_next = x + width >= end && self.dec_auto_wrap;
                     continue;
                 }
             }
@@ -215,6 +218,13 @@ impl<'a> Performer<'a> {
                 }
             }
 
+            if !self.wrap_next && self.dec_auto_wrap && self.cursor.x + print_width > self.left_and_right_margins.end {
+                let x = self.cursor.x;
+                let y = self.cursor.y;
+                let pen = self.pen.clone();
+                self.screen_mut().set_cell_grapheme(x, y, " ", 1, pen, seqno);
+                self.wrap_next = true;
+            }
             if self.wrap_next {
                 // Since we're implicitly moving the cursor to the next
                 // line, we need to tag the current position as wrapped
@@ -281,6 +291,7 @@ impl<'a> Performer<'a> {
                 self.cursor.x += print_width;
                 self.wrap_next = false;
             } else {
+                self.cursor.x = width - 1;
                 self.wrap_next = self.dec_auto_wrap;
             }
         }
@@ -420,11 +431,9 @@ impl<'a> Performer<'a> {
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
         if let Some(title) = self.accumulating_title.as_mut() {
-            if title.len() >= 4096 {
-                self.state.action_error = Some("title limit exceeded".into());
-                return;
+            if title.len() + c.len_utf8() <= 4096 {
+                title.push(c);
             }
-            title.push(c);
         } else {
             self.print.push(c);
         }
