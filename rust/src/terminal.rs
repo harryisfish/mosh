@@ -391,7 +391,7 @@ impl TerminalModel {
                     },
                     images,
                 };
-                serde_json::to_writer(&mut encoded_budget, &projected)?;
+                postcard::to_io(&projected, &mut encoded_budget)?;
                 cells.push(projected);
             }
             rows.push(Row {
@@ -633,8 +633,16 @@ fn core_size(size: Size) -> core::TerminalSize {
     core::TerminalSize {
         rows: size.rows as usize,
         cols: size.cols as usize,
-        pixel_width: size.pixel_width.max(u32::from(size.cols)) as usize,
-        pixel_height: size.pixel_height.max(u32::from(size.rows)) as usize,
+        pixel_width: if size.pixel_width == 0 {
+            usize::from(size.cols) * 10
+        } else {
+            size.pixel_width.max(u32::from(size.cols)) as usize
+        },
+        pixel_height: if size.pixel_height == 0 {
+            usize::from(size.rows) * 20
+        } else {
+            size.pixel_height.max(u32::from(size.rows)) as usize
+        },
         dpi: 96,
     }
 }

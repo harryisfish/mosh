@@ -27,6 +27,84 @@ fn model() -> TerminalModel {
     .unwrap()
 }
 fn main() -> Result<()> {
+    let maximum = Size {
+        cols: 512,
+        rows: 256,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut large = TerminalModel::new(maximum, false)?;
+    let mut paint = String::from("\x1b[38;2;12;34;56m");
+    for row in 1..=256 {
+        paint.push_str(&format!("\x1b[{row};1H"));
+        paint.push_str(&"A".repeat(512));
+    }
+    large.advance(paint.as_bytes())?;
+    let screen = large.snapshot()?;
+    assert_eq!(screen.rows.len(), 256);
+    assert!(screen.rows.iter().all(|row| {
+        row.cells.len() == 512
+            && row
+                .cells
+                .iter()
+                .all(|cell| cell.text == "A" && cell.style.fg == Color::Rgb([12, 34, 56]))
+    }));
+    let frame = Frame {
+        epoch: 1,
+        revision: 1,
+        base: None,
+        echo_through: 0,
+        size: maximum,
+        rows: screen
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(y, row)| RowPatch { y: y as u16, row })
+            .collect(),
+        cursor: screen.cursor,
+        title: screen.title,
+        directory: screen.directory,
+        markers: screen.markers,
+        reverse_video: screen.reverse_video,
+        prediction: screen.prediction,
+        resources: Vec::new(),
+    };
+    let bytes = postcard::to_io(&frame, CountBytes::default())?.0;
+    assert!(bytes <= MAX_FRAME);
+    println!("maximum 512x256 full RGB text frame: {bytes} postcard bytes");
+    drop(frame);
+    drop(large);
+
+    let mut fallback = TerminalModel::new(
+        Size {
+            cols: 20,
+            rows: 4,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        false,
+    )?;
+    fallback.advance(b"\x1b_Ga=T,f=24,s=1,v=1,i=1;/wAA\x1b\\")?;
+    assert_eq!(
+        fallback.snapshot()?.rows[0].cells[0].images[0].padding,
+        [0, 0, 9, 19]
+    );
+    let mut explicit = TerminalModel::new(
+        Size {
+            cols: 20,
+            rows: 4,
+            pixel_width: 20,
+            pixel_height: 4,
+        },
+        false,
+    )?;
+    explicit.advance(b"\x1b_Ga=T,f=24,s=1,v=1,i=1;/wAA\x1b\\")?;
+    assert_eq!(
+        explicit.snapshot()?.rows[0].cells[0].images[0].padding,
+        [0, 0, 0, 0]
+    );
+    println!("zero-pixel fallback and explicit pixel dimensions passed");
+
     let mut term = model();
     term.advance(
         b"\x1b[38;2;12;34;56mR\x1b[0m \x1b]8;id=one;https://example.com\x1b\\L\x1b]8;;\x1b\\ e",
@@ -287,4 +365,16 @@ fn main() -> Result<()> {
         "query/file/shared-memory/animation/dimensions/repeat limits, unplaced upload, collector sticky error, parser limit passed"
     );
     Ok(())
+}
+
+#[derive(Default)]
+struct CountBytes(usize);
+impl std::io::Write for CountBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
