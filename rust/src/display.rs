@@ -1,0 +1,988 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Write;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, ensure};
+use base64::Engine;
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::model::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Graphics {
+    None,
+    Kitty,
+    Sixel,
+}
+
+impl Graphics {
+    pub fn detect() -> Self {
+        let term = std::env::var("TERM").unwrap_or_default();
+        let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+        if std::env::var_os("KITTY_WINDOW_ID").is_some()
+            || std::env::var_os("WEZTERM_PANE").is_some()
+            || term.contains("kitty")
+            || program == "WezTerm"
+        {
+            Self::Kitty
+        } else if ["foot", "mlterm", "contour"]
+            .iter()
+            .any(|name| term.contains(name))
+        {
+            Self::Sixel
+        } else {
+            Self::None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictionPolicy {
+    Never,
+    Conservative,
+    Adaptive,
+}
+
+#[derive(Clone, Debug)]
+struct Guess {
+    seq: u64,
+    generation: u64,
+    x: u16,
+    y: u16,
+    text: char,
+    shown: bool,
+    expires: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Placement {
+    x: u16,
+    y: u16,
+    digest: Digest,
+    z: i32,
+}
+
+struct PreparedGraphics {
+    images: BTreeMap<Digest, Resource>,
+    placements: Vec<Placement>,
+}
+
+pub struct Display<W: Write> {
+    writer: W,
+    epoch: u64,
+    revision: u64,
+    effects: u64,
+    screen: Option<Screen>,
+    graphics: Graphics,
+    policy: PredictionPolicy,
+    guesses: VecDeque<Guess>,
+    confidence: u8,
+    image_ids: BTreeMap<Digest, u32>,
+    placements: Vec<Placement>,
+    next_image_id: u32,
+    status: String,
+    emitted_markers: VecDeque<ShellMarker>,
+    checkpoint_required: bool,
+}
+
+impl<W: Write> Display<W> {
+    pub fn new(writer: W, graphics: Graphics, prediction: PredictionPolicy) -> Self {
+        Self {
+            writer,
+            epoch: 0,
+            revision: 0,
+            effects: 0,
+            screen: None,
+            graphics,
+            policy: prediction,
+            guesses: VecDeque::new(),
+            confidence: 0,
+            image_ids: BTreeMap::new(),
+            placements: Vec::new(),
+            next_image_id: 1,
+            status: String::new(),
+            emitted_markers: VecDeque::new(),
+            checkpoint_required: true,
+        }
+    }
+
+    pub fn set_epoch(&mut self, epoch: u64) {
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.checkpoint_required = true;
+            self.confidence = 0;
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn needs_checkpoint(&self) -> bool {
+        self.checkpoint_required
+    }
+    pub fn effects_applied(&self) -> u64 {
+        self.effects
+    }
+    pub fn screen(&self) -> Option<&Screen> {
+        self.screen.as_ref()
+    }
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+
+    pub fn set_effect_floor(&mut self, floor: u64) {
+        self.effects = self.effects.max(floor);
+    }
+
+    pub fn install(
+        &mut self,
+        frame: Frame,
+        resources: &BTreeMap<Digest, Resource>,
+    ) -> Result<bool> {
+        if frame.epoch != self.epoch || frame.revision <= self.revision {
+            return Ok(false);
+        }
+        if frame.base.is_some_and(|base| base != self.revision)
+            || (self.checkpoint_required && frame.base.is_some())
+        {
+            self.checkpoint_required = true;
+            return Ok(false);
+        }
+        let mut screen = self.assemble(&frame, resources)?;
+        let graphics = prepare_graphics(&screen, self.graphics)?;
+        let mode_changed = self.screen.as_ref().is_none_or(|old| {
+            old.prediction.generation != screen.prediction.generation
+                || old.prediction.echo_enabled != screen.prediction.echo_enabled
+        });
+        let mut repaint = BTreeSet::new();
+        for guess in &self.guesses {
+            if guess.shown {
+                repaint.insert(guess.y);
+            }
+        }
+        if mode_changed {
+            self.guesses.clear();
+            self.confidence = 0;
+        } else {
+            while self
+                .guesses
+                .front()
+                .is_some_and(|guess| guess.seq <= frame.echo_through)
+            {
+                let guess = self.guesses.pop_front().unwrap();
+                if char_at(&screen, guess.x, guess.y) == Some(guess.text) {
+                    self.confidence = self.confidence.saturating_add(1).min(8);
+                } else {
+                    self.confidence = 0;
+                    self.guesses.clear();
+                    break;
+                }
+            }
+            self.guesses.retain(|guess| guess.expires > Instant::now());
+        }
+        let checkpoint = frame.base.is_none()
+            || self
+                .screen
+                .as_ref()
+                .is_none_or(|old| old.size != screen.size);
+        if checkpoint || self.graphics == Graphics::Sixel {
+            repaint.extend(0..screen.size.rows);
+        } else {
+            repaint.extend(frame.rows.iter().map(|patch| patch.y));
+        }
+        if !self.status.is_empty() {
+            repaint.insert(0);
+        }
+        if self
+            .guesses
+            .iter()
+            .any(|guess| guess.generation != screen.prediction.generation)
+        {
+            self.guesses.clear();
+            self.confidence = 0;
+        }
+        self.writer.write_all(b"\x1b[?2026h\x1b[?25l")?;
+        if checkpoint || self.graphics == Graphics::Sixel {
+            self.writer.write_all(b"\x1b[0m\x1b[2J")?;
+        }
+        self.writer.write_all(if screen.reverse_video {
+            b"\x1b[?5h"
+        } else {
+            b"\x1b[?5l"
+        })?;
+        for y in repaint {
+            render_row(&mut self.writer, &screen, y)?;
+        }
+        self.render_graphics(&graphics)?;
+        self.render_metadata(&screen)?;
+        render_guesses(&mut self.writer, &self.guesses, &screen)?;
+        if !self.status.is_empty() {
+            render_status(&mut self.writer, &screen, &self.status)?;
+        }
+        let cursor = self.overlay_cursor(&screen);
+        render_cursor(&mut self.writer, &screen, cursor)?;
+        self.writer.write_all(b"\x1b[?2026l")?;
+        self.writer.flush().context("flush terminal frame")?;
+        screen
+            .resources
+            .retain(|digest, _| frame.resources.iter().any(|meta| &meta.digest == digest));
+        self.screen = Some(screen);
+        self.revision = frame.revision;
+        self.checkpoint_required = false;
+        Ok(true)
+    }
+
+    fn assemble(&self, frame: &Frame, resources: &BTreeMap<Digest, Resource>) -> Result<Screen> {
+        frame.size.validate()?;
+        ensure!(
+            frame.cursor.x < frame.size.cols
+                && frame.cursor.y < frame.size.rows
+                && frame.cursor.shape <= 3,
+            "invalid frame cursor"
+        );
+        ensure!(
+            frame.title.len() <= 4096 && safe_text(&frame.title),
+            "invalid terminal title"
+        );
+        ensure!(
+            frame
+                .directory
+                .as_ref()
+                .is_none_or(|s| s.len() <= 8192 && safe_text(s)),
+            "invalid terminal directory"
+        );
+        ensure!(frame.markers.len() <= 4096, "too many shell markers");
+        for marker in &frame.markers {
+            ensure!(
+                marker.column < frame.size.cols
+                    && ["A", "B", "C", "D", "Prompt", "Input", "Output", "End"]
+                        .contains(&marker.kind.as_str()),
+                "invalid shell marker"
+            );
+        }
+        ensure!(
+            frame.rows.len() <= usize::from(frame.size.rows),
+            "too many frame rows"
+        );
+        let mut rows = match frame.base {
+            Some(_) => {
+                let old = self.screen.as_ref().context("delta has no base screen")?;
+                ensure!(old.size == frame.size, "delta changes terminal size");
+                old.rows.clone()
+            }
+            None => vec![Row::default(); usize::from(frame.size.rows)],
+        };
+        let mut seen = BTreeSet::new();
+        for patch in &frame.rows {
+            ensure!(
+                patch.y < frame.size.rows && seen.insert(patch.y),
+                "invalid or duplicate frame row"
+            );
+            rows[usize::from(patch.y)] = patch.row.clone();
+        }
+        ensure!(
+            frame.base.is_some() || seen.len() == usize::from(frame.size.rows),
+            "checkpoint omits a row"
+        );
+        let mut pinned = BTreeMap::new();
+        let mut bytes = 0usize;
+        ensure!(frame.resources.len() <= 4096, "too many frame resources");
+        for meta in &frame.resources {
+            ensure!(
+                !pinned.contains_key(&meta.digest),
+                "duplicate frame resource"
+            );
+            let resource = resources
+                .get(&meta.digest)
+                .context("frame resource is not available")?;
+            ensure!(resource.meta == *meta, "frame resource metadata mismatch");
+            resource.validate()?;
+            bytes = bytes
+                .checked_add(resource.rgba.len())
+                .context("resource byte overflow")?;
+            ensure!(bytes <= MAX_RESOURCES, "frame resources exceed limit");
+            pinned.insert(meta.digest, resource.clone());
+        }
+        let mut tiles = 0usize;
+        for row in &rows {
+            ensure!(
+                row.cells.len() <= usize::from(frame.size.cols),
+                "too many cells in row"
+            );
+            let mut end = 0u16;
+            for cell in &row.cells {
+                ensure!(
+                    (1..=2).contains(&cell.width) && cell.x >= end,
+                    "overlapping or invalid cell width"
+                );
+                end = cell
+                    .x
+                    .checked_add(u16::from(cell.width))
+                    .context("cell column overflow")?;
+                ensure!(
+                    end <= frame.size.cols
+                        && !cell.text.is_empty()
+                        && cell.text.len() <= 1024
+                        && safe_text(&cell.text)
+                        && cell.text.graphemes(true).count() == 1,
+                    "invalid cell text or column"
+                );
+                ensure!(
+                    cell.style.flags < 256 && cell.style.underline <= 5,
+                    "invalid cell attributes"
+                );
+                if let Some(link) = &cell.style.hyperlink {
+                    ensure!(
+                        link.params.len() <= 4096
+                            && link.url.len() <= 8192
+                            && safe_text(&link.params)
+                            && safe_text(&link.url),
+                        "invalid hyperlink"
+                    );
+                }
+                ensure!(cell.images.len() <= 32, "too many image tiles in a cell");
+                tiles += cell.images.len();
+                ensure!(tiles <= 131072, "too many image placements");
+                for tile in &cell.images {
+                    let resource = pinned
+                        .get(&tile.resource)
+                        .context("image tile refers to missing resource")?;
+                    let [x, y, width, height] = tile.source;
+                    ensure!(
+                        width > 0
+                            && height > 0
+                            && u64::from(x) + u64::from(width) <= u64::from(resource.meta.width)
+                            && u64::from(y) + u64::from(height) <= u64::from(resource.meta.height),
+                        "image crop is out of bounds"
+                    );
+                }
+            }
+        }
+        Ok(Screen {
+            size: frame.size,
+            rows,
+            cursor: frame.cursor,
+            title: frame.title.clone(),
+            directory: frame.directory.clone(),
+            markers: frame.markers.clone(),
+            reverse_video: frame.reverse_video,
+            prediction: frame.prediction,
+            resources: pinned,
+        })
+    }
+
+    pub fn predict(&mut self, seq: u64, event: &InputEvent) -> Result<()> {
+        if self.policy == PredictionPolicy::Never {
+            return Ok(());
+        }
+        let Some(screen) = &self.screen else {
+            return Ok(());
+        };
+        if !screen.prediction.eligible {
+            return Ok(());
+        }
+        let InputEvent::Key(key) = event else {
+            return self.clear_guesses();
+        };
+        if key.phase == KeyPhase::Release {
+            return Ok(());
+        }
+        let KeyCode::Char(text) = key.code else {
+            return self.clear_guesses();
+        };
+        if !text.is_ascii()
+            || text.is_ascii_control()
+            || key.modifiers & !1 != 0
+            || key.text.as_ref().is_some_and(|s| s != &text.to_string())
+        {
+            return self.clear_guesses();
+        }
+        if self.guesses.len() >= 256 {
+            return self.clear_guesses();
+        }
+        let (x, y) = self
+            .guesses
+            .back()
+            .map(|guess| (guess.x + 1, guess.y))
+            .unwrap_or((screen.cursor.x, screen.cursor.y));
+        if x >= screen.size.cols.saturating_sub(1) {
+            return Ok(());
+        }
+        if screen.rows.get(usize::from(y)).is_none_or(|row| {
+            row.cells
+                .iter()
+                .any(|cell| cell.x == x && (!cell.images.is_empty() || cell.width != 1))
+        }) {
+            return Ok(());
+        }
+        let shown = screen.prediction.echo_enabled
+            || (self.policy == PredictionPolicy::Adaptive && self.confidence >= 3);
+        let guess = Guess {
+            seq,
+            generation: screen.prediction.generation,
+            x,
+            y,
+            text,
+            shown,
+            expires: Instant::now() + Duration::from_millis(750),
+        };
+        self.guesses.push_back(guess);
+        if shown {
+            self.writer.write_all(b"\x1b[?2026h")?;
+            render_guesses(&mut self.writer, &self.guesses, screen)?;
+            let cursor = self.overlay_cursor(screen);
+            render_cursor(&mut self.writer, screen, cursor)?;
+            self.writer.write_all(b"\x1b[?2026l")?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn tick(&mut self) -> Result<()> {
+        if self
+            .guesses
+            .iter()
+            .any(|guess| guess.expires <= Instant::now())
+        {
+            self.clear_guesses()?;
+        }
+        Ok(())
+    }
+
+    fn clear_guesses(&mut self) -> Result<()> {
+        let rows: BTreeSet<_> = self
+            .guesses
+            .iter()
+            .filter(|guess| guess.shown)
+            .map(|guess| guess.y)
+            .collect();
+        self.guesses.clear();
+        if !rows.is_empty() {
+            if let Some(screen) = self.screen.clone() {
+                let graphics = prepare_graphics(&screen, self.graphics)?;
+                self.writer.write_all(b"\x1b[?2026h")?;
+                for y in rows {
+                    render_row(&mut self.writer, &screen, y)?;
+                }
+                self.render_graphics(&graphics)?;
+                if !self.status.is_empty() {
+                    render_status(&mut self.writer, &screen, &self.status)?;
+                }
+                render_cursor(
+                    &mut self.writer,
+                    &screen,
+                    (screen.cursor.x, screen.cursor.y),
+                )?;
+                self.writer.write_all(b"\x1b[?2026l")?;
+                self.writer.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn overlay_cursor(&self, screen: &Screen) -> (u16, u16) {
+        self.guesses
+            .iter()
+            .rev()
+            .find(|guess| guess.shown)
+            .map(|guess| (guess.x + 1, guess.y))
+            .unwrap_or((screen.cursor.x, screen.cursor.y))
+    }
+
+    pub fn write_status(&mut self, text: &str) -> Result<()> {
+        ensure!(
+            text.len() <= 4096 && safe_text(text),
+            "invalid connection status"
+        );
+        self.clear_guesses()?;
+        self.confidence = 0;
+        self.status = text.into();
+        if let Some(screen) = self.screen.clone() {
+            let graphics = prepare_graphics(&screen, self.graphics)?;
+            self.writer.write_all(b"\x1b[?2026h")?;
+            render_row(&mut self.writer, &screen, 0)?;
+            self.render_graphics(&graphics)?;
+            if !self.status.is_empty() {
+                render_status(&mut self.writer, &screen, &self.status)?;
+            }
+            render_cursor(
+                &mut self.writer,
+                &screen,
+                (screen.cursor.x, screen.cursor.y),
+            )?;
+            self.writer.write_all(b"\x1b[?2026l")?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_effect(
+        &mut self,
+        effect: &Effect,
+        allow_clipboard_read: bool,
+    ) -> Result<Option<InputEvent>> {
+        if effect.id <= self.effects {
+            return Ok(None);
+        }
+        ensure!(effect.id == self.effects + 1, "effect sequence has a gap");
+        ensure!(
+            effect.after <= self.revision,
+            "effect display barrier has not been installed"
+        );
+        let mut response = None;
+        match &effect.kind {
+            EffectKind::Bell => self.writer.write_all(b"\x07")?,
+            EffectKind::ClipboardWrite { selection, data } => {
+                validate_selection(selection)?;
+                ensure!(
+                    data.len() <= MAX_PENDING_INPUT / 2,
+                    "clipboard write exceeds limit"
+                );
+                write!(
+                    self.writer,
+                    "\x1b]52;{};{}\x1b\\",
+                    selection,
+                    base64::engine::general_purpose::STANDARD.encode(data.as_bytes())
+                )?;
+            }
+            EffectKind::ClipboardRead { query, selection } => {
+                validate_selection(selection)?;
+                if allow_clipboard_read {
+                    write!(self.writer, "\x1b]52;{selection};?\x1b\\")?;
+                } else {
+                    response = Some(InputEvent::QueryResult {
+                        query: *query,
+                        data: None,
+                    });
+                }
+            }
+            EffectKind::Notification { title, body } => {
+                ensure!(
+                    title.len() <= 4096
+                        && body.len() <= 8192
+                        && safe_text(title)
+                        && safe_text(body)
+                        && !title.contains(';'),
+                    "invalid terminal notification"
+                );
+                write!(self.writer, "\x1b]777;notify;{title};{body}\x1b\\")?;
+            }
+        }
+        self.writer.flush()?;
+        self.effects = effect.id;
+        Ok(response)
+    }
+
+    fn render_metadata(&mut self, screen: &Screen) -> Result<()> {
+        if self
+            .screen
+            .as_ref()
+            .is_none_or(|old| old.title != screen.title)
+        {
+            write!(self.writer, "\x1b]2;{}\x1b\\", screen.title)?;
+        }
+        if self.screen.as_ref().and_then(|old| old.directory.as_ref()) != screen.directory.as_ref()
+        {
+            write!(
+                self.writer,
+                "\x1b]7;{}\x1b\\",
+                screen.directory.as_deref().unwrap_or("")
+            )?;
+        }
+        for marker in &screen.markers {
+            if self.emitted_markers.contains(marker) {
+                continue;
+            }
+            if let Some(y) = screen
+                .rows
+                .iter()
+                .position(|row| row.stable_id == marker.row)
+            {
+                cup(&mut self.writer, marker.column, y as u16)?;
+                let kind = match marker.kind.as_str() {
+                    "Prompt" => "A",
+                    "Input" => "B",
+                    "Output" => "C",
+                    "End" => "D",
+                    kind => kind,
+                };
+                if let Some(status) = marker.status {
+                    write!(self.writer, "\x1b]133;{kind};{status}\x1b\\")?;
+                } else {
+                    write!(self.writer, "\x1b]133;{kind}\x1b\\")?;
+                }
+                self.emitted_markers.push_back(marker.clone());
+                while self.emitted_markers.len() > 4096 {
+                    self.emitted_markers.pop_front();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn render_graphics(&mut self, graphics: &PreparedGraphics) -> Result<()> {
+        match self.graphics {
+            Graphics::None => (),
+            Graphics::Kitty => {
+                let dead: Vec<_> = self
+                    .image_ids
+                    .keys()
+                    .filter(|digest| !graphics.images.contains_key(*digest))
+                    .copied()
+                    .collect();
+                for digest in dead {
+                    let id = self.image_ids.remove(&digest).unwrap();
+                    write!(self.writer, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+                }
+                for (digest, resource) in &graphics.images {
+                    if self.image_ids.contains_key(digest) {
+                        continue;
+                    }
+                    let id = self.next_image_id;
+                    self.next_image_id = self
+                        .next_image_id
+                        .checked_add(1)
+                        .context("local image identifiers exhausted")?;
+                    upload_kitty(&mut self.writer, id, resource)?;
+                    self.image_ids.insert(*digest, id);
+                }
+                self.writer.write_all(b"\x1b_Ga=d,d=a,q=2\x1b\\")?;
+                for (index, placement) in graphics.placements.iter().enumerate() {
+                    cup(&mut self.writer, placement.x, placement.y)?;
+                    let id = self.image_ids[&placement.digest];
+                    let p = index + 1;
+                    write!(
+                        self.writer,
+                        "\x1b_Ga=p,i={id},p={p},c=1,r=1,z={},C=1,q=2\x1b\\",
+                        placement.z
+                    )?;
+                }
+                self.placements = graphics.placements.clone();
+            }
+            Graphics::Sixel => {
+                for placement in &graphics.placements {
+                    cup(&mut self.writer, placement.x, placement.y)?;
+                    self.writer.write_all(b"\x1b7")?;
+                    write_sixel(&mut self.writer, &graphics.images[&placement.digest])?;
+                    self.writer.write_all(b"\x1b8")?;
+                }
+                self.placements = graphics.placements.clone();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn safe_text(text: &str) -> bool {
+    text.chars().all(|ch| !ch.is_control())
+}
+
+fn validate_selection(selection: &str) -> Result<()> {
+    ensure!(
+        selection.len() <= 16 && selection.bytes().all(|b| b"cpsq01234567".contains(&b)),
+        "invalid clipboard selection"
+    );
+    Ok(())
+}
+
+fn char_at(screen: &Screen, x: u16, y: u16) -> Option<char> {
+    let cell = screen
+        .rows
+        .get(usize::from(y))?
+        .cells
+        .iter()
+        .find(|cell| cell.x == x && cell.width == 1)?;
+    let mut chars = cell.text.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+fn cup(writer: &mut impl Write, x: u16, y: u16) -> Result<()> {
+    write!(writer, "\x1b[{};{}H", y + 1, x + 1)?;
+    Ok(())
+}
+
+fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
+    let row = screen
+        .rows
+        .get(usize::from(y))
+        .context("render row out of range")?;
+    cup(writer, 0, y)?;
+    writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2K")?;
+    for cell in &row.cells {
+        cup(writer, cell.x, y)?;
+        render_style(writer, &cell.style)?;
+        writer.write_all(cell.text.as_bytes())?;
+    }
+    writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m")?;
+    Ok(())
+}
+
+fn render_style(writer: &mut impl Write, style: &Style) -> Result<()> {
+    writer.write_all(b"\x1b]8;;\x1b\\\x1b[0")?;
+    for (bit, sgr) in [
+        (1, 1),
+        (2, 2),
+        (4, 3),
+        (8, 5),
+        (16, 7),
+        (32, 8),
+        (64, 9),
+        (128, 53),
+    ] {
+        if style.flags & bit != 0 {
+            write!(writer, ";{sgr}")?;
+        }
+    }
+    if style.underline != 0 {
+        write!(writer, ";4:{}", style.underline)?;
+    }
+    for (color, code) in [(style.fg, 38), (style.bg, 48), (style.underline_color, 58)] {
+        if let Color::Rgb([red, green, blue]) = color {
+            write!(writer, ";{code};2;{red};{green};{blue}")?;
+        }
+    }
+    writer.write_all(b"m")?;
+    if let Some(link) = &style.hyperlink {
+        write!(writer, "\x1b]8;{};{}\x1b\\", link.params, link.url)?;
+    }
+    Ok(())
+}
+
+fn render_cursor(writer: &mut impl Write, screen: &Screen, position: (u16, u16)) -> Result<()> {
+    cup(
+        writer,
+        position.0.min(screen.size.cols - 1),
+        position.1.min(screen.size.rows - 1),
+    )?;
+    let base = match screen.cursor.shape {
+        2 => 3,
+        3 => 5,
+        _ => 1,
+    };
+    let style = base + u8::from(!screen.cursor.blink);
+    write!(writer, "\x1b[{style} q")?;
+    writer.write_all(if screen.cursor.visible {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    })?;
+    Ok(())
+}
+
+fn render_status(writer: &mut impl Write, screen: &Screen, text: &str) -> Result<()> {
+    let text: String = text
+        .chars()
+        .map(|ch| if ch.is_ascii() { ch } else { '?' })
+        .take(usize::from(screen.size.cols))
+        .collect();
+    let x = screen.size.cols - text.len() as u16;
+    cup(writer, x, 0)?;
+    write!(writer, "\x1b]8;;\x1b\\\x1b[0;7m{text}\x1b[0m")?;
+    Ok(())
+}
+
+fn prepare_graphics(screen: &Screen, graphics: Graphics) -> Result<PreparedGraphics> {
+    let mut prepared = PreparedGraphics {
+        images: BTreeMap::new(),
+        placements: Vec::new(),
+    };
+    if graphics == Graphics::None {
+        return Ok(prepared);
+    }
+    let cell_width = (screen.size.pixel_width / u32::from(screen.size.cols)).max(1);
+    let cell_height = (screen.size.pixel_height / u32::from(screen.size.rows)).max(1);
+    let cell_width = if screen.size.pixel_width == 0 {
+        10
+    } else {
+        cell_width
+    };
+    let cell_height = if screen.size.pixel_height == 0 {
+        20
+    } else {
+        cell_height
+    };
+    let tile_bytes = u64::from(cell_width) * u64::from(cell_height) * 4;
+    ensure!(
+        tile_bytes <= MAX_RESOURCE as u64,
+        "local graphics cell exceeds image limit"
+    );
+    let mut total_bytes = 0usize;
+    for (y, row) in screen.rows.iter().enumerate() {
+        for cell in &row.cells {
+            for tile in &cell.images {
+                let image = &screen.resources[&tile.resource];
+                let mut rgba = vec![0; tile_bytes as usize];
+                let [left, top, right, bottom] = tile.padding.map(u32::from);
+                let width = cell_width.saturating_sub(left.saturating_add(right));
+                let height = cell_height.saturating_sub(top.saturating_add(bottom));
+                let [source_x, source_y, source_width, source_height] = tile.source;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                for target_y in 0..height {
+                    let sy = source_y
+                        + (u64::from(target_y) * u64::from(source_height) / u64::from(height))
+                            as u32;
+                    for target_x in 0..width {
+                        let sx = source_x
+                            + (u64::from(target_x) * u64::from(source_width) / u64::from(width))
+                                as u32;
+                        let src = ((u64::from(sy) * u64::from(image.meta.width) + u64::from(sx))
+                            * 4) as usize;
+                        let dst = ((u64::from(target_y + top) * u64::from(cell_width)
+                            + u64::from(target_x + left))
+                            * 4) as usize;
+                        rgba[dst..dst + 4].copy_from_slice(&image.rgba[src..src + 4]);
+                    }
+                }
+                let digest = resource_digest(cell_width, cell_height, &rgba);
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    prepared.images.entry(digest)
+                {
+                    total_bytes += rgba.len();
+                    ensure!(
+                        total_bytes <= MAX_RESOURCES,
+                        "local graphics cache exceeds limit"
+                    );
+                    entry.insert(Resource {
+                        meta: ResourceMeta {
+                            digest,
+                            width: cell_width,
+                            height: cell_height,
+                            bytes: rgba.len() as u32,
+                        },
+                        rgba: Arc::from(rgba),
+                    });
+                }
+                prepared.placements.push(Placement {
+                    x: cell.x,
+                    y: y as u16,
+                    digest,
+                    z: tile.z,
+                });
+            }
+        }
+    }
+    prepared.placements.sort_by_key(|placement| placement.z);
+    Ok(prepared)
+}
+
+fn upload_kitty(writer: &mut impl Write, id: u32, image: &Resource) -> Result<()> {
+    let mut chunks = image.rgba.chunks(3072).peekable();
+    let mut first = true;
+    while let Some(chunk) = chunks.next() {
+        let more = u8::from(chunks.peek().is_some());
+        if first {
+            write!(
+                writer,
+                "\x1b_Ga=t,f=32,s={},v={},i={id},q=2,m={more};",
+                image.meta.width, image.meta.height
+            )?;
+            first = false;
+        } else {
+            write!(writer, "\x1b_Gm={more};")?;
+        }
+        writer.write_all(
+            base64::engine::general_purpose::STANDARD
+                .encode(chunk)
+                .as_bytes(),
+        )?;
+        writer.write_all(b"\x1b\\")?;
+    }
+    Ok(())
+}
+
+fn write_sixel(writer: &mut impl Write, image: &Resource) -> Result<()> {
+    let width = image.meta.width as usize;
+    let height = image.meta.height as usize;
+    write!(writer, "\x1bP0;1q\"1;1;{width};{height}")?;
+    let mut palette = BTreeSet::new();
+    let mut pixels = Vec::with_capacity(width * height);
+    for rgba in image.rgba.chunks_exact(4) {
+        if rgba[3] < 128 {
+            pixels.push(None);
+            continue;
+        }
+        let red = (u16::from(rgba[0]) * 5 + 127) / 255;
+        let green = (u16::from(rgba[1]) * 5 + 127) / 255;
+        let blue = (u16::from(rgba[2]) * 5 + 127) / 255;
+        let index = red * 36 + green * 6 + blue;
+        palette.insert(index);
+        pixels.push(Some(index));
+    }
+    for index in &palette {
+        write!(
+            writer,
+            "#{index};2;{};{};{}",
+            (index / 36) * 20,
+            ((index / 6) % 6) * 20,
+            (index % 6) * 20
+        )?;
+    }
+    for y in (0..height).step_by(6) {
+        let mut first = true;
+        for index in &palette {
+            let mut bytes = Vec::with_capacity(width);
+            for x in 0..width {
+                let mut bits = 0u8;
+                for row in 0..6 {
+                    if y + row < height && pixels[(y + row) * width + x] == Some(*index) {
+                        bits |= 1 << row;
+                    }
+                }
+                bytes.push(bits + 63);
+            }
+            if bytes.iter().all(|byte| *byte == 63) {
+                continue;
+            }
+            if !first {
+                writer.write_all(b"$")?;
+            }
+            first = false;
+            write!(writer, "#{index}")?;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let byte = bytes[offset];
+                let run = bytes[offset..]
+                    .iter()
+                    .take_while(|&&next| next == byte)
+                    .count();
+                if run > 3 {
+                    write!(writer, "!{run}{}", char::from(byte))?;
+                } else {
+                    for _ in 0..run {
+                        writer.write_all(&[byte])?;
+                    }
+                }
+                offset += run;
+            }
+        }
+        if y + 6 < height {
+            writer.write_all(b"-")?;
+        }
+    }
+    writer.write_all(b"\x1b\\")?;
+    Ok(())
+}
+
+fn render_guesses(
+    writer: &mut impl Write,
+    guesses: &VecDeque<Guess>,
+    screen: &Screen,
+) -> Result<()> {
+    for guess in guesses {
+        if !guess.shown || guess.generation != screen.prediction.generation {
+            continue;
+        }
+        cup(writer, guess.x, guess.y)?;
+        writer.write_all(b"\x1b]8;;\x1b\\\x1b[0;4m")?;
+        write!(writer, "{}", guess.text)?;
+    }
+    writer.write_all(b"\x1b[0m")?;
+    Ok(())
+}
