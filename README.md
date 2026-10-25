@@ -3,6 +3,11 @@
 Mosh: the mobile shell
 ======================
 
+The Rust client and server are built with `cargo build --release --locked`.
+They use a new authenticated protocol and must be installed together.
+See [the Rust usage guide](docs/rust-usage.md) for commands, terminal capabilities,
+reconnection behavior, and verification. The existing C++ commands remain available.
+
 Mosh is a remote terminal application that supports intermittent
 connectivity, allows roaming, and provides speculative local echo
 and line editing of user keystrokes.

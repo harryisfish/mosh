@@ -767,7 +767,6 @@ pub struct LocalTerminal {
 
 impl LocalTerminal {
     pub fn enter() -> Result<Self> {
-        // These descriptors are process-owned and remain valid throughout the call.
         ensure!(
             unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 },
             "mosh-rs requires a terminal on stdin and stdout"

@@ -139,8 +139,7 @@ impl<'a> Performer<'a> {
             }
 
             let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
-            // Grapheme boundaries may cross PTY reads. Extend the preceding cell
-            // when Unicode segmentation says both pieces form one grapheme.
+            // PTY reads can split a grapheme.
             let previous = if !g.is_ascii() {
                 let screen = self.screen();
                 let row = screen.phys_row(self.cursor.y);

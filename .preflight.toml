@@ -1,0 +1,18 @@
+base_branch = "master"
+
+[[scope]]
+prefix = ""
+name = "rust terminal"
+check = "cargo fmt -p mosh-rs -- --check && cargo clippy -p mosh-rs --all-targets --locked -- -D warnings"
+build = "cargo build -p mosh-rs --bins --examples --locked"
+
+[[domain_check]]
+name = "terminal and transport behavior"
+trigger_paths = ["rust/**", "Cargo.toml", "Cargo.lock", "scripts/verify-rust-cli.py"]
+command = "cargo run -p mosh-rs --example verify_core --locked && cargo run -p mosh-rs --example verify_transport --locked && cargo run -p mosh-rs --example verify_display --locked && cargo run -p mosh-rs --example verify_session --locked && cargo build -p mosh-rs --bins --locked && python3 scripts/verify-rust-cli.py --network"
+
+[review]
+extra_checklist = "Check authentication, actor fencing, partial PTY commits, input retries, display cancellation, frame bases, prediction rollback, image decode quotas, effects and query lifetimes. Preserve upstream license attribution."
+
+[report]
+language = "zh"

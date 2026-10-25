@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,14 @@ pub const MAX_EFFECT_BYTES: usize = 1024 * 1024;
 pub const MAX_EFFECTS: usize = 256;
 pub type Digest = [u8; 32];
 
+pub fn resource_digest(width: u32, height: u32, rgba: &[u8]) -> Digest {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&width.to_le_bytes());
+    hash.update(&height.to_le_bytes());
+    hash.update(rgba);
+    *hash.finalize().as_bytes()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Size {
     pub cols: u16,
@@ -23,16 +32,30 @@ pub struct Size {
 
 impl Size {
     pub fn validate(&self) -> Result<()> {
-        ensure!((1..=512).contains(&self.cols), "terminal columns must be 1..=512");
-        ensure!((1..=256).contains(&self.rows), "terminal rows must be 1..=256");
-        ensure!(self.pixel_width <= 16384 && self.pixel_height <= 16384, "terminal pixel dimensions exceed limit");
+        ensure!(
+            (1..=512).contains(&self.cols),
+            "terminal columns must be 1..=512"
+        );
+        ensure!(
+            (1..=256).contains(&self.rows),
+            "terminal rows must be 1..=256"
+        );
+        ensure!(
+            self.pixel_width <= 16384 && self.pixel_height <= 16384,
+            "terminal pixel dimensions exceed limit"
+        );
         Ok(())
     }
 }
 
 impl Default for Size {
     fn default() -> Self {
-        Self { cols: 80, rows: 24, pixel_width: 800, pixel_height: 480 }
+        Self {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+        }
     }
 }
 
@@ -43,7 +66,11 @@ pub enum KeyCode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KeyPhase { Press, Repeat, Release }
+pub enum KeyPhase {
+    Press,
+    Repeat,
+    Release,
+}
 
 // Modifier bits follow kitty's order: shift, alt, ctrl, super, hyper, meta, caps, num.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +84,13 @@ pub struct Key {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MouseKind { Press(u8), Release(u8), Move, Wheel(i16) }
+pub enum MouseKind {
+    Press(u8),
+    Release(u8),
+    Move,
+    Wheel(i16),
+    WheelHorizontal(i16),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mouse {
@@ -83,12 +116,27 @@ impl InputEvent {
         match self {
             Self::Key(k) => {
                 ensure!(k.modifiers < 256, "unknown keyboard modifier");
-                if let KeyCode::Named(name) = &k.code { ensure!(name.len() <= 32, "key name too long"); }
-                ensure!(k.text.as_ref().is_none_or(|s| s.len() <= 4096), "key text too long");
+                if let KeyCode::Named(name) = &k.code {
+                    ensure!(name.len() <= 32, "key name too long");
+                }
+                ensure!(
+                    k.text.as_ref().is_none_or(|s| s.len() <= 4096),
+                    "key text too long"
+                );
             }
-            Self::Paste(text) => ensure!(text.len() <= MAX_PENDING_INPUT / 2, "paste exceeds input limit"),
-            Self::Mouse(mouse) => ensure!(mouse.modifiers < 256 && mouse.x < 512 && mouse.y < 256, "invalid mouse event"),
-            Self::QueryResult { data, .. } => ensure!(data.as_ref().is_none_or(|s| s.len() <= MAX_PENDING_INPUT / 2), "clipboard reply too large"),
+            Self::Paste(text) => ensure!(
+                text.len() <= MAX_PENDING_INPUT / 2,
+                "paste exceeds input limit"
+            ),
+            Self::Mouse(mouse) => ensure!(
+                mouse.modifiers < 256 && mouse.x < 512 && mouse.y < 256,
+                "invalid mouse event"
+            ),
+            Self::QueryResult { data, .. } => ensure!(
+                data.as_ref()
+                    .is_none_or(|s| s.len() <= MAX_PENDING_INPUT / 2),
+                "clipboard reply too large"
+            ),
             Self::Focus(_) => (),
         }
         Ok(())
@@ -96,13 +144,23 @@ impl InputEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InputRecord { pub seq: u64, pub event: InputEvent }
+pub struct InputRecord {
+    pub seq: u64,
+    pub event: InputEvent,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Color { #[default] Default, Rgb([u8; 3]) }
+pub enum Color {
+    #[default]
+    Default,
+    Rgb([u8; 3]),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hyperlink { pub params: String, pub url: String }
+pub struct Hyperlink {
+    pub params: String,
+    pub url: String,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Style {
@@ -133,7 +191,10 @@ pub struct Cell {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Row { pub cells: Vec<Cell>, pub stable_id: i64 }
+pub struct Row {
+    pub cells: Vec<Cell>,
+    pub stable_id: i64,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
@@ -145,7 +206,12 @@ pub struct Cursor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShellMarker { pub row: i64, pub column: u16, pub kind: String, pub status: Option<i32> }
+pub struct ShellMarker {
+    pub row: i64,
+    pub column: u16,
+    pub kind: String,
+    pub status: Option<i32>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionContext {
@@ -156,17 +222,38 @@ pub struct PredictionContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceMeta { pub digest: Digest, pub width: u32, pub height: u32, pub bytes: u32 }
+pub struct ResourceMeta {
+    pub digest: Digest,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u32,
+}
 
 #[derive(Clone, Debug)]
-pub struct Resource { pub meta: ResourceMeta, pub rgba: Vec<u8> }
+pub struct Resource {
+    pub meta: ResourceMeta,
+    pub rgba: Arc<[u8]>,
+}
 
 impl Resource {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=16384).contains(&self.meta.width) && (1..=16384).contains(&self.meta.height),
+            "image dimensions exceed limit"
+        );
         let len = u64::from(self.meta.width) * u64::from(self.meta.height) * 4;
-        ensure!(self.meta.width > 0 && self.meta.height > 0 && len <= MAX_RESOURCE as u64, "image dimensions exceed limit");
-        ensure!(len == self.rgba.len() as u64 && self.meta.bytes as u64 == len, "image length mismatch");
-        ensure!(*blake3::hash(&self.rgba).as_bytes() == self.meta.digest, "image digest mismatch");
+        ensure!(
+            self.meta.width > 0 && self.meta.height > 0 && len <= MAX_RESOURCE as u64,
+            "image dimensions exceed limit"
+        );
+        ensure!(
+            len == self.rgba.len() as u64 && self.meta.bytes as u64 == len,
+            "image length mismatch"
+        );
+        ensure!(
+            resource_digest(self.meta.width, self.meta.height, &self.rgba) == self.meta.digest,
+            "image digest mismatch"
+        );
         Ok(())
     }
 }
@@ -185,7 +272,10 @@ pub struct Screen {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RowPatch { pub y: u16, pub row: Row }
+pub struct RowPatch {
+    pub y: u16,
+    pub row: Row,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Frame {
@@ -213,7 +303,11 @@ pub enum EffectKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Effect { pub id: u64, pub after: u64, pub kind: EffectKind }
+pub struct Effect {
+    pub id: u64,
+    pub after: u64,
+    pub kind: EffectKind,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attach {
@@ -228,21 +322,67 @@ pub struct Attach {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     Attach(Attach),
-    Input { epoch: u64, record: InputRecord },
-    Rendered { epoch: u64, revision: u64 },
-    EffectsApplied { epoch: u64, through: u64 },
-    Resize { epoch: u64, generation: u64, after: u64, size: Size },
-    Detach { epoch: u64 },
-    Close { epoch: u64 },
+    Input {
+        epoch: u64,
+        record: InputRecord,
+    },
+    Rendered {
+        epoch: u64,
+        revision: u64,
+    },
+    Resync {
+        epoch: u64,
+    },
+    MissingResources {
+        epoch: u64,
+        digests: Vec<Digest>,
+    },
+    EffectsApplied {
+        epoch: u64,
+        through: u64,
+    },
+    Resize {
+        epoch: u64,
+        generation: u64,
+        after: u64,
+        size: Size,
+    },
+    Detach {
+        epoch: u64,
+    },
+    Close {
+        epoch: u64,
+    },
+    ExitAck {
+        epoch: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
-    Attached { epoch: u64, committed: u64, effect_floor: u64 },
-    Committed { epoch: u64, through: u64 },
-    Effects { epoch: u64, floor: u64, items: Vec<Effect> },
-    Exit { epoch: u64, code: i32, revision: u64, effects: u64 },
-    Error { message: String },
+    Attached {
+        epoch: u64,
+        committed: u64,
+        effect_floor: u64,
+    },
+    Committed {
+        epoch: u64,
+        through: u64,
+    },
+    Effects {
+        epoch: u64,
+        floor: u64,
+        items: Vec<Effect>,
+    },
+    Exit {
+        epoch: u64,
+        code: i32,
+        revision: u64,
+        effects: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

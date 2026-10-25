@@ -32,6 +32,10 @@ roots, replaces unsent obsolete state, and cancels obsolete display streams.
 The client checks epoch, revision, and base before installation. Once local
 output starts, its sole writer completes and flushes the frame before confirming
 it. Images have immutable content hashes and separate low-priority streams.
+Control messages use bounded JSON framing. Frames use bounded postcard encoding
+and zstd compression. Image keys hash their dimensions followed by their RGBA
+bytes. A cache miss explicitly requests the missing resources. A base mismatch
+requests a checkpoint. Application exit has its own final acknowledgement.
 
 `echo_through` advances only after PTY output has been observed following input.
 It is a prediction lifetime bound, not proof that a particular glyph was echoed.
@@ -62,12 +66,24 @@ PTY writer. External effects are not transactional across a client crash.
 
 ## Resource limits
 
-Windows are at most 512 columns by 256 rows. Control messages and frames have
-separate length limits. An image is at most 16 MiB RGBA, live image bytes at most
-64 MiB, pending client input at most 256 KiB, and the effect log at most 1 MiB
-and 256 entries. Saturation never silently drops keyboard input. Control traffic
+Windows are at most 512 columns by 256 rows. A control message is at most 512 KiB;
+a decoded or compressed frame is at most 16 MiB. An image is at most 16 MiB RGBA.
+Each current screen, the core's decoded image store, and the adapter's exported
+cache have separate 64 MiB limits. The actor retains at most 128 MiB of unique
+resources across display roots plus two independent resource transfers. A client
+cache holds at most 64 MiB, in addition to the installed screen and three bounded
+stream readers. Its network queue has four entries. These limits do not describe
+total process RSS. Parser and decoder budgets are in the core maintenance notes.
+Pending client input is at most 256 KiB, with a bounded input decoder and captured
+input batch. The effect log is at most 1 MiB and 256 entries. Saturation never
+silently drops keyboard input. Control traffic
 has a bounded queue and connection flow-control capacity reserved from large
 display and image transfers. Current and in-flight image references stay pinned.
+There is one display sender and at most two image senders. The connection has a
+4 MiB receive window with at most three 1 MiB display/image stream windows, leaving
+capacity for the single control stream. Stable newer state or a substantially
+smaller replacement can cancel an obsolete display stream. Repeated stable-frame
+cancellation is bounded so large checkpoints can still finish.
 
 QUIC migration and application reattachment are separate mechanisms. Neither
 Rust nor this protocol repairs an unavailable UDP path or OS network denial.

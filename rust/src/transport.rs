@@ -111,6 +111,9 @@ pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.max_early_data_size = 0;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
+    config
+        .max_incoming(32)
+        .incoming_buffer_size_total(4 * 1024 * 1024);
     config.transport_config(Arc::new(transport_config()));
     config.migration(true);
     let bind = request
@@ -510,7 +513,7 @@ impl Drop for CancellableStream {
 
 pub async fn send_frame(connection: &Connection, frame: &Frame) -> Result<()> {
     validate_frame(frame)?;
-    let bytes = serde_json::to_vec(frame)?;
+    let bytes = postcard::to_allocvec(frame)?;
     ensure!(bytes.len() <= MAX_FRAME, "display frame exceeds limit");
     let compressed = zstd::bulk::compress(&bytes, 1)?;
     ensure!(
@@ -580,7 +583,7 @@ async fn receive_one_uni(connection: &Connection) -> Result<Incoming> {
                 decoded.len() <= MAX_FRAME,
                 "decoded display frame exceeds limit"
             );
-            let frame = serde_json::from_slice(&decoded)?;
+            let frame = postcard::from_bytes(&decoded)?;
             validate_frame(&frame)?;
             Ok(Incoming::Frame(frame))
         }

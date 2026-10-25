@@ -33,9 +33,9 @@ compatibility and is not the application's entry point.
 
 The adapter retains 128 scrollback rows. At the maximum 512×256 viewport,
 primary/alternate/scrollback cell counts and each grapheme are bounded. Exported
-text plus hyperlink strings are limited to 4 MiB per snapshot. A counting JSON
+text plus hyperlink strings are limited to 4 MiB per snapshot. A counting postcard
 writer checks projected cell encoding against the frame budget before cells are
-retained in the snapshot; it never allocates a giant intermediate JSON buffer.
+retained in the snapshot; it never allocates a giant intermediate frame buffer.
 These content limits apply even when the requested window size itself is valid.
 
 A decoded image is at most 16 MiB RGBA and 16384 pixels in either dimension.

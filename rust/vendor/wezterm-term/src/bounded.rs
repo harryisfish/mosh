@@ -1,4 +1,3 @@
-//! Limits for the headless, static-image remote-terminal profile.
 use anyhow::{ensure, Result};
 use std::convert::TryInto;
 use wezterm_escape_parser::osc::{ITermProprietary, OperatingSystemCommand};

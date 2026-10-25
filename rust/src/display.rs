@@ -713,10 +713,25 @@ fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
         .context("render row out of range")?;
     cup(writer, 0, y)?;
     writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2K")?;
-    for cell in &row.cells {
-        cup(writer, cell.x, y)?;
-        render_style(writer, &cell.style)?;
+    let mut x = 0;
+    let mut style = None;
+    let end = row
+        .cells
+        .iter()
+        .rposition(|cell| {
+            cell.text != " " || cell.style != Style::default() || !cell.images.is_empty()
+        })
+        .map_or(0, |index| index + 1);
+    for cell in &row.cells[..end] {
+        if cell.x != x {
+            cup(writer, cell.x, y)?;
+        }
+        if style != Some(&cell.style) {
+            render_style(writer, &cell.style)?;
+            style = Some(&cell.style);
+        }
         writer.write_all(cell.text.as_bytes())?;
+        x = cell.x + u16::from(cell.width);
     }
     writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m")?;
     Ok(())
