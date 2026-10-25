@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
-use mosh_rs::input::{InputDecoder, LocalEvent};
+use mosh_rs::input::{EscapeAction, EscapeSequence, InputDecoder, LocalEvent};
 use mosh_rs::model::*;
 use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
@@ -554,6 +554,99 @@ fn verify_lifecycle() -> Result<()> {
     Ok(())
 }
 
+fn escape_actions(bytes: &[u8]) -> Result<(Vec<InputEvent>, Vec<EscapeAction>)> {
+    let mut decoder = InputDecoder::new();
+    let events: Vec<_> = decoder
+        .feed(bytes)?
+        .into_iter()
+        .map(|event| {
+            let LocalEvent::Input(event) = event else {
+                panic!("expected semantic input")
+            };
+            event
+        })
+        .collect();
+    let mut escape = EscapeSequence::new();
+    let actions = events
+        .iter()
+        .cloned()
+        .map(|event| escape.feed(event))
+        .collect();
+    Ok((events, actions))
+}
+
+fn sent_events(actions: Vec<EscapeAction>) -> Vec<InputEvent> {
+    actions
+        .into_iter()
+        .flat_map(|action| match action {
+            EscapeAction::Send(events) => events,
+            other => panic!("unexpected management action {other:?}"),
+        })
+        .collect()
+}
+
+fn verify_escape_sequences() -> Result<()> {
+    let (_, actions) = escape_actions(b"\x1e.")?;
+    assert_eq!(
+        actions,
+        vec![EscapeAction::Send(Vec::new()), EscapeAction::Detach]
+    );
+    let (_, actions) = escape_actions(b"\x1eq")?;
+    assert_eq!(actions[1], EscapeAction::Close);
+    let (_, actions) = escape_actions(b"\x1e?")?;
+    assert_eq!(actions[1], EscapeAction::Help);
+    let (events, actions) = escape_actions(b"\x1ex")?;
+    assert_eq!(
+        sent_events(actions),
+        events,
+        "unknown legacy suffix must retain the prefix"
+    );
+    let (events, actions) = escape_actions(b"\x1e^")?;
+    assert_eq!(sent_events(actions), vec![events[0].clone()]);
+    let (_, actions) = escape_actions(
+        b"\x1b[54;6:1u\x1b[54;6:2u\x1b[54;6:3u\x1b[57442;1:3u\x1b[46;1:1u\x1b[46;1:3u",
+    )?;
+    assert_eq!(actions[0], EscapeAction::Send(Vec::new()));
+    assert_eq!(actions[1], EscapeAction::Send(Vec::new()));
+    assert_eq!(actions[2], EscapeAction::Send(Vec::new()));
+    assert!(
+        matches!(&actions[3], EscapeAction::Send(events) if matches!(&events[0], InputEvent::Key(Key { code: KeyCode::Named(name), phase: KeyPhase::Release, .. }) if name == "LeftControl"))
+    );
+    assert_eq!(
+        actions[4],
+        EscapeAction::Detach,
+        "prefix release must not cancel the escape"
+    );
+    assert_eq!(
+        actions[5],
+        EscapeAction::Send(Vec::new()),
+        "consumed suffix release must remain local"
+    );
+    let (events, actions) =
+        escape_actions(b"\x1b[54;6:1u\x1b[54;6:2u\x1b[54;6:3u\x1b[120;1:1u\x1b[120;1:3u")?;
+    assert_eq!(
+        sent_events(actions),
+        events,
+        "unknown kitty suffix must replay all prefix phases in order"
+    );
+    let (events, actions) = escape_actions(b"\x1b[54;6:1u\x1b[54;6:3u\x1b[54;2:1;94u\x1b[54;2:3u")?;
+    assert_eq!(
+        sent_events(actions),
+        events[..2],
+        "literal prefix consumes only the second key stroke"
+    );
+    let (events, actions) = escape_actions(b"\x1b[54;6:1u\x1b[54;6:3u\x1b[113;5:1u")?;
+    assert_eq!(
+        sent_events(actions),
+        events,
+        "modified q must remain remote input"
+    );
+    println!(
+        "escape: legacy and kitty commands, prefix phases, modifier releases, literal prefix and unknown-suffix replay verified"
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     verify_input()?;
     verify_render(Graphics::None)?;
@@ -561,5 +654,6 @@ fn main() -> Result<()> {
     verify_render(Graphics::Sixel)?;
     verify_prediction_modes()?;
     verify_lifecycle()?;
+    verify_escape_sequences()?;
     Ok(())
 }

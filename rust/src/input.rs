@@ -20,6 +20,157 @@ pub enum LocalEvent {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EscapeAction {
+    Send(Vec<InputEvent>),
+    Detach,
+    Close,
+    Help,
+}
+
+struct PendingEscape {
+    key: KeyCode,
+    events: Vec<InputEvent>,
+}
+
+#[derive(Default)]
+pub struct EscapeSequence {
+    pending: Option<PendingEscape>,
+    suppressed: Vec<KeyCode>,
+}
+
+impl EscapeSequence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, event: InputEvent) -> EscapeAction {
+        let InputEvent::Key(key) = &event else {
+            return EscapeAction::Send(vec![event]);
+        };
+        let identity = key_identity(key);
+        match key.phase {
+            KeyPhase::Release => {
+                if let Some(index) = self.suppressed.iter().position(|item| item == &identity) {
+                    self.suppressed.remove(index);
+                    return EscapeAction::Send(Vec::new());
+                }
+            }
+            KeyPhase::Repeat if self.suppressed.contains(&identity) => {
+                return EscapeAction::Send(Vec::new());
+            }
+            KeyPhase::Press => self.suppressed.retain(|item| item != &identity),
+            KeyPhase::Repeat => (),
+        }
+        let Some(mut pending) = self.pending.take() else {
+            if key.phase == KeyPhase::Press && is_escape_prefix(key) {
+                self.pending = Some(PendingEscape {
+                    key: identity,
+                    events: vec![event],
+                });
+                return EscapeAction::Send(Vec::new());
+            }
+            return EscapeAction::Send(vec![event]);
+        };
+        if identity == pending.key && key.phase != KeyPhase::Press {
+            pending.events.push(event);
+            if pending.events.len() >= 32 {
+                return EscapeAction::Send(pending.events);
+            }
+            self.pending = Some(pending);
+            return EscapeAction::Send(Vec::new());
+        }
+        if key.phase != KeyPhase::Press || is_modifier_key(&key.code) {
+            // A modifier press may already be remote, so its release cannot be held.
+            self.pending = Some(pending);
+            return EscapeAction::Send(vec![event]);
+        }
+        let suffix = escape_suffix(key);
+        let action = match suffix {
+            Some('.') => EscapeAction::Detach,
+            Some('q') => EscapeAction::Close,
+            Some('?') => EscapeAction::Help,
+            Some('^') => {
+                let prefix_released = pending.events.iter().any(
+                    |event| matches!(event, InputEvent::Key(key) if key.phase == KeyPhase::Release),
+                );
+                if identity != pending.key || prefix_released {
+                    self.suppress(identity);
+                }
+                return EscapeAction::Send(pending.events);
+            }
+            _ => {
+                pending.events.push(event);
+                return EscapeAction::Send(pending.events);
+            }
+        };
+        self.suppress(pending.key);
+        self.suppress(identity);
+        action
+    }
+
+    fn suppress(&mut self, key: KeyCode) {
+        if self.suppressed.contains(&key) {
+            return;
+        }
+        if self.suppressed.len() == 32 {
+            self.suppressed.remove(0);
+        }
+        self.suppressed.push(key);
+    }
+}
+
+fn key_identity(key: &Key) -> KeyCode {
+    key.base
+        .map(KeyCode::Char)
+        .unwrap_or_else(|| key.code.clone())
+}
+
+fn is_escape_prefix(key: &Key) -> bool {
+    if key.modifiers & 4 == 0 || key.modifiers & !(1 | 4 | 64 | 128) != 0 {
+        return false;
+    }
+    matches!(key.code, KeyCode::Char('^'))
+        || (matches!(key.code, KeyCode::Char('6')) && key.modifiers & 1 != 0)
+}
+
+fn escape_suffix(key: &Key) -> Option<char> {
+    if is_escape_prefix(key) {
+        return Some('^');
+    }
+    if key.modifiers & !(1 | 64 | 128) != 0 {
+        return None;
+    }
+    if let Some(text) = &key.text {
+        let mut chars = text.chars();
+        let first = chars.next()?;
+        return chars.next().is_none().then_some(first);
+    }
+    if key.modifiers & 1 != 0 {
+        if let Some(shifted) = key.shifted {
+            return Some(shifted);
+        }
+    }
+    let KeyCode::Char(ch) = key.code else {
+        return None;
+    };
+    if key.modifiers & 1 != 0 {
+        match ch {
+            '/' => Some('?'),
+            '6' => Some('^'),
+            '.' => Some('>'),
+            'a'..='z' => Some(ch.to_ascii_uppercase()),
+            _ => Some(ch),
+        }
+    } else {
+        Some(ch)
+    }
+}
+
+fn is_modifier_key(code: &KeyCode) -> bool {
+    matches!(code, KeyCode::Named(name) if ["LeftShift", "RightShift", "LeftControl", "RightControl", "LeftAlt", "RightAlt", "LeftSuper", "RightSuper", "LeftHyper", "RightHyper", "LeftMeta", "RightMeta", "Level3Shift", "Level5Shift", "CapsLock", "NumLock", "ScrollLock"].contains(&name.as_str()))
+}
+
 #[derive(Default)]
 pub struct InputDecoder {
     pending: Vec<u8>,
