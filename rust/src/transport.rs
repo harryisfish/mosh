@@ -227,19 +227,18 @@ pub async fn bootstrap_ssh(
     let mut grant = run_bootstrap(command, &request).await?;
     let mut query = ssh_command(ssh_port);
     query.arg("-G").arg("--").arg(target);
-    if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), query.output()).await {
-        if output.status.success() && output.stdout.len() <= MAX_CONTROL {
-            if let Some(hostname) = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix("hostname "))
-            {
-                ensure!(
-                    hostname.len() <= 1024 && !hostname.chars().any(char::is_control),
-                    "invalid SSH hostname"
-                );
-                grant.address = hostname.trim_matches(['[', ']']).to_owned();
-            }
-        }
+    if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), query.output()).await
+        && output.status.success()
+        && output.stdout.len() <= MAX_CONTROL
+        && let Some(hostname) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("hostname "))
+    {
+        ensure!(
+            hostname.len() <= 1024 && !hostname.chars().any(char::is_control),
+            "invalid SSH hostname"
+        );
+        grant.address = hostname.trim_matches(['[', ']']).to_owned();
     }
     validate_grant(&grant)?;
     Ok(grant)
@@ -427,8 +426,8 @@ fn validate_request(request: &BootstrapRequest) -> Result<()> {
         "command contains NUL"
     );
     ensure!(
-        (1..=604800).contains(&request.idle_seconds),
-        "idle timeout must be between 1 and 604800 seconds"
+        (60..=604800).contains(&request.idle_seconds),
+        "idle timeout must be between 60 and 604800 seconds"
     );
     ensure!(request.port != Some(0), "server port must be nonzero");
     Ok(())

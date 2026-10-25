@@ -147,14 +147,14 @@ impl Pty {
     }
 
     pub fn poll_exit(&mut self) -> Result<Option<i32>> {
-        if self.exited.is_none() {
-            if let Some(status) = self.child.try_wait()? {
-                self.exited = Some(
-                    status
-                        .code()
-                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
-                );
-            }
+        if self.exited.is_none()
+            && let Some(status) = self.child.try_wait()?
+        {
+            self.exited = Some(
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+            );
         }
         Ok(self.exited)
     }

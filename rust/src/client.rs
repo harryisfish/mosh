@@ -265,7 +265,6 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
     let mut buffer = [0u8; 256];
     'session: loop {
         tokio::select! {
-            biased;
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
             _ = hangup.recv() => break,
@@ -366,7 +365,7 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
                 let mut ready = ready?;
                 let result = ready.try_io(|fd| {
                     use std::io::Read;
-                    (&*fd.get_ref()).read(&mut buffer)
+                    fd.get_ref().read(&mut buffer)
                 });
                 match result {
                     Ok(Ok(0)) => break,
@@ -457,19 +456,19 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
                 }
             }
         }
-        if let Some(frame) = pending_frame.as_ref() {
-            if frame.resources.iter().all(|meta| {
+        if let Some(frame) = pending_frame.as_ref()
+            && frame.resources.iter().all(|meta| {
                 resources
                     .get(&meta.digest)
                     .is_some_and(|resource| resource.meta == *meta)
-            }) {
-                let frame = pending_frame.take().expect("ready display frame");
-                let desired: BTreeSet<_> = frame.resources.iter().map(|meta| meta.digest).collect();
-                if !display.install(frame, &resources)? && display.needs_checkpoint() {
-                    resync_pending = true;
-                }
-                resources.retain(|digest, _| desired.contains(digest));
+            })
+        {
+            let frame = pending_frame.take().expect("ready display frame");
+            let desired: BTreeSet<_> = frame.resources.iter().map(|meta| meta.digest).collect();
+            if !display.install(frame, &resources)? && display.needs_checkpoint() {
+                resync_pending = true;
             }
+            resources.retain(|digest, _| desired.contains(digest));
         }
         let ready_effects: Vec<_> = effects
             .values()
@@ -497,43 +496,43 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
                 data: None,
             }));
         }
-        if let Some((code, revision, effects)) = remote_exit {
-            if display.revision() >= revision && display.effects_applied() >= effects {
-                if let Some(active) = &link {
-                    active
-                        .output
-                        .send(ClientMessage::ExitAck {
-                            epoch: active.epoch,
-                        })
-                        .await?;
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(1), active.connection.closed())
-                            .await;
-                }
-                return Ok(code);
+        if let Some((code, revision, effects)) = remote_exit
+            && display.revision() >= revision
+            && display.effects_applied() >= effects
+        {
+            if let Some(active) = &link {
+                active
+                    .output
+                    .send(ClientMessage::ExitAck {
+                        epoch: active.epoch,
+                    })
+                    .await?;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(1), active.connection.closed()).await;
             }
+            return Ok(code);
         }
         if let Some(active) = link.as_mut() {
-            if requested_resources.elapsed() >= Duration::from_millis(500) {
-                if let Some(frame) = &pending_frame {
-                    let missing: Vec<_> = frame
-                        .resources
-                        .iter()
-                        .filter(|meta| !resources.contains_key(&meta.digest))
-                        .take(128)
-                        .map(|meta| meta.digest)
-                        .collect();
-                    if !missing.is_empty()
-                        && active
-                            .output
-                            .try_send(ClientMessage::MissingResources {
-                                epoch: active.epoch,
-                                digests: missing,
-                            })
-                            .is_ok()
-                    {
-                        requested_resources = Instant::now();
-                    }
+            if requested_resources.elapsed() >= Duration::from_millis(500)
+                && let Some(frame) = &pending_frame
+            {
+                let missing: Vec<_> = frame
+                    .resources
+                    .iter()
+                    .filter(|meta| !resources.contains_key(&meta.digest))
+                    .take(128)
+                    .map(|meta| meta.digest)
+                    .collect();
+                if !missing.is_empty()
+                    && active
+                        .output
+                        .try_send(ClientMessage::MissingResources {
+                            epoch: active.epoch,
+                            digests: missing,
+                        })
+                        .is_ok()
+                {
+                    requested_resources = Instant::now();
                 }
             }
             if resync_pending
@@ -546,29 +545,27 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
             {
                 resync_pending = false;
             }
-            if active.rendered_ack < display.revision() {
-                if active
+            if active.rendered_ack < display.revision()
+                && active
                     .output
                     .try_send(ClientMessage::Rendered {
                         epoch: active.epoch,
                         revision: display.revision(),
                     })
                     .is_ok()
-                {
-                    active.rendered_ack = display.revision();
-                }
+            {
+                active.rendered_ack = display.revision();
             }
-            if active.effects_ack < display.effects_applied() {
-                if active
+            if active.effects_ack < display.effects_applied()
+                && active
                     .output
                     .try_send(ClientMessage::EffectsApplied {
                         epoch: active.epoch,
                         through: display.effects_applied(),
                     })
                     .is_ok()
-                {
-                    active.effects_ack = display.effects_applied();
-                }
+            {
+                active.effects_ack = display.effects_applied();
             }
             for (_, (record, _)) in pending.range((active.sent_through + 1)..).take(8) {
                 if active
@@ -583,8 +580,9 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
                 }
                 active.sent_through = record.seq;
             }
-            if active.resize_sent < resize_generation && active.sent_through >= sequence {
-                if active
+            if active.resize_sent < resize_generation
+                && active.sent_through >= sequence
+                && active
                     .output
                     .try_send(ClientMessage::Resize {
                         epoch: active.epoch,
@@ -593,9 +591,8 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
                         size,
                     })
                     .is_ok()
-                {
-                    active.resize_sent = resize_generation;
-                }
+            {
+                active.resize_sent = resize_generation;
             }
         } else if connecting.is_none() && Instant::now() >= retry_at {
             attempt = attempt

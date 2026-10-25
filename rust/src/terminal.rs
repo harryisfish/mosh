@@ -449,7 +449,7 @@ impl TerminalModel {
             directory: self
                 .terminal
                 .get_current_dir()
-                .map(|dir| display_metadata(&dir.to_string(), 8192)),
+                .map(|dir| display_metadata(dir.as_ref(), 8192)),
             markers: self
                 .state
                 .markers

@@ -146,10 +146,10 @@ fn escape_suffix(key: &Key) -> Option<char> {
         let first = chars.next()?;
         return chars.next().is_none().then_some(first);
     }
-    if key.modifiers & 1 != 0 {
-        if let Some(shifted) = key.shifted {
-            return Some(shifted);
-        }
+    if key.modifiers & 1 != 0
+        && let Some(shifted) = key.shifted
+    {
+        return Some(shifted);
     }
     let KeyCode::Char(ch) = key.code else {
         return None;
@@ -327,10 +327,10 @@ impl InputDecoder {
                         break;
                     };
                     ensure!(end <= limit, "terminal reply exceeds limit");
-                    if self.pending[1] == b']' {
-                        if let Some(reply) = decode_osc(&self.pending[2..2 + end])? {
-                            events.push(reply);
-                        }
+                    if self.pending[1] == b']'
+                        && let Some(reply) = decode_osc(&self.pending[2..2 + end])?
+                    {
+                        events.push(reply);
                     }
                     self.pending.drain(..2 + end + terminator);
                 }

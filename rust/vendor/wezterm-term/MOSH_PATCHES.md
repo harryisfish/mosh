@@ -42,7 +42,13 @@ A decoded image is at most 16 MiB RGBA and 16384 pixels in either dimension.
 Core live decoded images are at most 64 MiB, with at most 4096 image objects,
 4096 Kitty chunks and 4096 placements. Image-cell associations are capped at
 262144. Kitty accumulated encoded chunks are at most 24 MiB; decoded compressed
-or direct payloads are at most 16 MiB. The decoder allocation limit is 32 MiB.
+or direct payloads are at most 16 MiB. Image readers receive a 32 MiB logical
+decoder budget before constructing the decoder, including dimension probes.
+This is a best-effort dependency limit, not a strict allocation cap. PNG metadata
+inflation is length-bounded, but its Vec capacity and decoder bookkeeping can
+exceed that logical limit. The independent 40 MiB ICC fixture requested one
+33 MiB allocation while discarding the oversized profile. Neither this setting
+nor a process RSS measurement proves a 32 MiB total allocation bound.
 OSC/APC strings are at most 24 MiB; SIXEL/DCS parser input is at most 256 KiB.
 
 The adapter's exported image cache is a separate maximum of 64 MiB. Its immutable

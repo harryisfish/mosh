@@ -69,6 +69,7 @@ struct Attachment {
     display: Option<JoinHandle<()>>,
     display_started: Instant,
     display_bytes: usize,
+    checked_revision: u64,
     cancellations: u8,
     resources: BTreeMap<Digest, ResourceTask>,
     known_resources: BTreeSet<Digest>,
@@ -260,6 +261,7 @@ impl SessionActor {
                     }
                 }
             }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -372,6 +374,7 @@ impl SessionActor {
             display: None,
             display_started: Instant::now(),
             display_bytes: 0,
+            checked_revision: 0,
             cancellations: 0,
             resources: BTreeMap::new(),
             known_resources: BTreeSet::new(),
@@ -411,20 +414,19 @@ impl SessionActor {
                     .confirmed
                     .as_ref()
                     .is_none_or(|(old, _)| revision > *old)
+                    && let Some(screen) = attachment.sent.get(&revision).cloned()
                 {
-                    if let Some(screen) = attachment.sent.get(&revision).cloned() {
-                        attachment.confirmed = Some((revision, screen));
-                        attachment.known_resources = attachment
-                            .confirmed
-                            .as_ref()
-                            .expect("confirmed screen")
-                            .1
-                            .resources
-                            .keys()
-                            .copied()
-                            .collect();
-                        attachment.sent.retain(|sent, _| *sent > revision);
-                    }
+                    attachment.confirmed = Some((revision, screen));
+                    attachment.known_resources = attachment
+                        .confirmed
+                        .as_ref()
+                        .expect("confirmed screen")
+                        .1
+                        .resources
+                        .keys()
+                        .copied()
+                        .collect();
+                    attachment.sent.retain(|sent, _| *sent > revision);
                 }
             }
             ClientMessage::Resync {
@@ -585,12 +587,12 @@ impl SessionActor {
     }
 
     fn finish_write(&mut self) {
-        if let Some(write) = self.writes.pop_front() {
-            if let Some(seq) = write.input {
-                self.committed = seq;
-                let floor = self.committed.saturating_sub(4096);
-                self.digests.retain(|seq, _| *seq >= floor);
-            }
+        if let Some(write) = self.writes.pop_front()
+            && let Some(seq) = write.input
+        {
+            self.committed = seq;
+            let floor = self.committed.saturating_sub(4096);
+            self.digests.retain(|seq, _| *seq >= floor);
         }
         while self
             .writes
@@ -669,21 +671,21 @@ impl SessionActor {
 
     fn tick(&mut self) -> Result<bool> {
         self.publish_allowed = self.terminal.publish_allowed();
-        if let Some((epoch, generation, after, size)) = self.resize {
-            if after <= self.committed {
-                ensure!(self.active(epoch), "obsolete pending resize");
-                self.pty.resize(size)?;
-                self.terminal.resize(size)?;
-                self.resize_generation = generation;
-                self.resize = None;
-                self.dirty = true;
-            }
+        if let Some((epoch, generation, after, size)) = self.resize
+            && after <= self.committed
+        {
+            ensure!(self.active(epoch), "obsolete pending resize");
+            self.pty.resize(size)?;
+            self.terminal.resize(size)?;
+            self.resize_generation = generation;
+            self.resize = None;
+            self.dirty = true;
         }
-        if self.exit.is_none() {
-            if let Some(code) = self.pty.poll_exit()? {
-                self.exit = Some((code, Instant::now()));
-                self.dirty = true;
-            }
+        if self.exit.is_none()
+            && let Some(code) = self.pty.poll_exit()?
+        {
+            self.exit = Some((code, Instant::now()));
+            self.dirty = true;
         }
         let expired: Vec<_> = self
             .queries
@@ -786,10 +788,15 @@ impl SessionActor {
             }
         }
         let mut candidate = None;
+        let stable = self.last_output.elapsed() >= Duration::from_millis(75)
+            && attachment.display_started.elapsed() >= Duration::from_millis(250)
+            && attachment.cancellations == 0;
         if attachment.last_sent < self.revision
+            && (attachment.checked_revision < self.revision || stable)
             && attachment.display.is_some()
             && attachment.display_started.elapsed() >= Duration::from_millis(75)
         {
+            attachment.checked_revision = self.revision;
             let replacement = state::frame(
                 attachment.epoch,
                 self.revision,
@@ -803,9 +810,6 @@ impl SessionActor {
             let encoded = postcard::to_allocvec(&replacement)?;
             let bytes = zstd::bulk::compress(&encoded, 1)?.len();
             let smaller = attachment.display_bytes > 8192 && bytes < attachment.display_bytes / 2;
-            let stable = self.last_output.elapsed() >= Duration::from_millis(75)
-                && attachment.display_started.elapsed() >= Duration::from_millis(250)
-                && attachment.cancellations == 0;
             if smaller || stable {
                 if let Some(task) = attachment.display.take() {
                     task.abort();

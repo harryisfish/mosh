@@ -28,7 +28,7 @@ fn request(identity: &ClientIdentity) -> BootstrapRequest {
         command: vec!["/bin/sh".into()],
         bind: Some("127.0.0.1".into()),
         port: None,
-        idle_seconds: 30,
+        idle_seconds: 60,
         clipboard_read: false,
     }
 }

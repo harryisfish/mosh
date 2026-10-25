@@ -461,25 +461,25 @@ impl<W: Write> Display<W> {
             .map(|guess| guess.y)
             .collect();
         self.guesses.clear();
-        if !rows.is_empty() {
-            if let Some(screen) = self.screen.clone() {
-                let graphics = prepare_graphics(&screen, self.graphics)?;
-                self.writer.write_all(b"\x1b[?2026h")?;
-                for y in rows {
-                    render_row(&mut self.writer, &screen, y)?;
-                }
-                self.render_graphics(&graphics)?;
-                if !self.status.is_empty() {
-                    render_status(&mut self.writer, &screen, &self.status)?;
-                }
-                render_cursor(
-                    &mut self.writer,
-                    &screen,
-                    (screen.cursor.x, screen.cursor.y),
-                )?;
-                self.writer.write_all(b"\x1b[?2026l")?;
-                self.writer.flush()?;
+        if !rows.is_empty()
+            && let Some(screen) = self.screen.clone()
+        {
+            let graphics = prepare_graphics(&screen, self.graphics)?;
+            self.writer.write_all(b"\x1b[?2026h")?;
+            for y in rows {
+                render_row(&mut self.writer, &screen, y)?;
             }
+            self.render_graphics(&graphics)?;
+            if !self.status.is_empty() {
+                render_status(&mut self.writer, &screen, &self.status)?;
+            }
+            render_cursor(
+                &mut self.writer,
+                &screen,
+                (screen.cursor.x, screen.cursor.y),
+            )?;
+            self.writer.write_all(b"\x1b[?2026l")?;
+            self.writer.flush()?;
         }
         Ok(())
     }

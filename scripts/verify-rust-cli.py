@@ -234,6 +234,7 @@ def verify(bin_dir, network):
                                        sys.executable, script, "--remote", "network", state])
             try:
                 process.until(b"NETWORK_READY")
+                original_processes = json.loads(Path(state).read_text())
                 Path(state + ".drop").touch()
                 process.send(b"resume-once\r")
                 deadline = time.monotonic() + 22
@@ -243,7 +244,7 @@ def verify(bin_dir, network):
                 Path(state + ".drop").unlink()
                 process.until(b"NETWORK_ONCE_OK", timeout=30)
                 process.finish(9)
-                assert bytes(process.output).count(b"NETWORK_ONCE_OK") == 1
+                assert json.loads(Path(state).read_text()) == original_processes, "reconnect started a replacement command"
             finally:
                 process.close()
                 cleanup(state)
