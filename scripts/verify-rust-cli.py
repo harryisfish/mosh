@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Exercise the Rust binaries through real local PTYs and an optional UDP outage."""
+"""Exercise the Rust binaries through real local PTYs and optional impaired UDP."""
 
 import argparse
 import fcntl
+import heapq
 import json
 import os
 from pathlib import Path
 import pty
+import random
 import select
 import signal
 import socket
@@ -17,6 +19,9 @@ import tempfile
 import termios
 import time
 import tty
+
+
+RAW_NETWORK_INPUT = b"impaired-" + b"x" * 8192 + b"\r"
 
 
 def exact(data, timeout=5):
@@ -40,6 +45,10 @@ def remote_fixture(mode, state):
         return 0
     if mode == "network":
         os.write(1, b"\x1b[2J\x1b[HNETWORK_READY\r\n")
+        exact(b"baseline\r")
+        os.write(1, b"NETWORK_BASELINE_OK\r\n")
+        exact(RAW_NETWORK_INPUT, timeout=60)
+        os.write(1, b"NETWORK_BURST_OK\r\n")
         exact(b"resume-once\r", timeout=60)
         os.write(1, b"\r\nNETWORK_ONCE_OK\r\n")
         return 9
@@ -90,17 +99,62 @@ def proxy_bootstrap(server, state):
         for fd in (0, 1, 2):
             os.dup2(null, fd)
         peer = None
+        rng = random.Random(12345)
+        queue = []
+        queued_bytes = 0
+        serial = 0
+        last_forwarded = [0, 0]
+        profile = {}
+        refresh = 0
+        stats = {"received": 0, "dropped": 0, "duplicated": 0, "forwarded": 0,
+                 "reordered": 0, "overflow": 0}
         while True:
-            for source in select.select([front, back], [], [], 0.1)[0]:
+            now = time.monotonic()
+            if now >= refresh:
+                try:
+                    profile = json.loads(Path(state + ".profile").read_text())
+                except FileNotFoundError:
+                    profile = {}
+                stats["profile"] = profile
+                stats["queued"] = len(queue)
+                updated = Path(state + ".stats.new")
+                updated.write_text(json.dumps(stats))
+                updated.replace(state + ".stats")
+                refresh = now + 0.05
+            if Path(state + ".drop").exists():
+                queue.clear()
+                queued_bytes = 0
+            while queue and queue[0][0] <= now:
+                _, order, to_front, packet, target = heapq.heappop(queue)
+                queued_bytes -= len(packet)
+                (front if to_front else back).sendto(packet, target)
+                stats["forwarded"] += 1
+                direction = int(to_front)
+                stats["reordered"] += int(order < last_forwarded[direction])
+                last_forwarded[direction] = max(order, last_forwarded[direction])
+            for source in select.select([front, back], [], [], 0.01)[0]:
                 packet, address = source.recvfrom(65536)
+                stats["received"] += 1
                 if source is front:
                     peer = address
-                if Path(state + ".drop").exists():
+                target = peer if source is back else destination
+                if target is None:
                     continue
-                if source is front:
-                    back.sendto(packet, destination)
-                elif peer is not None:
-                    front.sendto(packet, peer)
+                if Path(state + ".drop").exists() or rng.random() < profile.get("loss", 0):
+                    stats["dropped"] += 1
+                    continue
+                delay = max(0, profile.get("delay_ms", 0)
+                            + rng.uniform(-profile.get("jitter_ms", 0), profile.get("jitter_ms", 0))) / 1000
+                duplicate = rng.random() < profile.get("duplicate", 0)
+                for copy in range(1 + int(duplicate)):
+                    if len(queue) >= 4096 or queued_bytes + len(packet) > 8 * 1024 * 1024:
+                        stats["overflow"] += 1
+                        continue
+                    serial += 1
+                    heapq.heappush(queue, (now + delay + copy * 0.007, serial,
+                                           source is back, packet, target))
+                    queued_bytes += len(packet)
+                    stats["duplicated"] += copy
     Path(state + ".proxy").write_text(str(pid))
     print(json.dumps(grant), flush=True)
 
@@ -269,8 +323,31 @@ def verify(bin_dir, network):
             process = TerminalProcess([client, "--local", "--server", str(wrapper), "--predict", "never", "--",
                                        sys.executable, script, "--remote", "network", state])
             try:
+                def set_profile(profile):
+                    updated = Path(state + ".profile.new")
+                    updated.write_text(json.dumps(profile))
+                    updated.replace(state + ".profile")
+                    deadline = time.monotonic() + 5
+                    while True:
+                        process.pump(0.01)
+                        if Path(state + ".stats").exists():
+                            stats = json.loads(Path(state + ".stats").read_text())
+                            if stats["profile"] == profile:
+                                return stats
+                        assert process.process.poll() is None, bytes(process.output[-4000:])
+                        assert time.monotonic() < deadline, "UDP relay did not install profile"
+
                 process.until(b"NETWORK_READY")
                 original_processes = json.loads(Path(state).read_text())
+                process.send(b"baseline\r")
+                process.until(b"NETWORK_BASELINE_OK")
+                set_profile({"delay_ms": 65, "jitter_ms": 55, "loss": 0.12, "duplicate": 0.10})
+                process.send(RAW_NETWORK_INPUT)
+                process.until(b"NETWORK_BURST_OK", timeout=45)
+                stats = set_profile({})
+                assert stats["dropped"] > 0 and stats["duplicated"] > 0 and stats["reordered"] > 0, stats
+                assert stats["overflow"] == 0, stats
+                print("CLI raw 8192-key input arrived byte-for-byte through UDP delay, jitter, loss, duplication, and reordering", flush=True)
                 Path(state + ".drop").touch()
                 process.send(b"resume-once\r")
                 deadline = time.monotonic() + 22
@@ -295,6 +372,6 @@ if __name__ == "__main__":
         sys.exit(0)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
-    parser.add_argument("--network", action="store_true", help="also exercise automatic reconnect through a UDP outage")
+    parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     arguments = parser.parse_args()
     verify(arguments.bin_dir.resolve(), arguments.network)
