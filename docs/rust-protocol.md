@@ -1,0 +1,73 @@
+# Rust terminal protocol
+
+This is the implementation contract for the Rust client and server. It replaces
+the old wire protocol. The C++ implementation remains available while the new
+implementation is verified.
+
+## Ownership and authentication
+
+The session actor owns one PTY and one terminal core. The network tasks never
+write the PTY. A disconnected connection cannot cancel accepted PTY input.
+Each connection has a strictly increasing attach attempt. The actor accepts
+only a larger attempt, assigns a new epoch, and checks that epoch when executing
+every input, resize, acknowledgement, detach, and close message.
+
+System OpenSSH authenticates a structured bootstrap request. Commands travel as
+JSON argv, never shell interpolation. The client generates a session client
+certificate. The server trusts only that certificate. The client trusts only
+the server certificate returned over SSH. Both use normal rustls certificate
+validation, the `mosh.local` server name, and QUIC without early application data.
+
+## Independent confirmation domains
+
+`InputRecord.seq` is an ordered input event number. An event is encoded once.
+The actor retains the exact encoding and short-write position until all its
+bytes enter the PTY. Only then does it report `Committed`. Duplicate pending
+events must have the same content. Retries never restart a command or a PTY.
+A dead worker ends the session. No crash-recovery transaction is claimed.
+
+Display revisions are separate. A frame is a checkpoint or a set of row
+replacements relative to a confirmed revision. The sender retains bounded
+roots, replaces unsent obsolete state, and cancels obsolete display streams.
+The client checks epoch, revision, and base before installation. Once local
+output starts, its sole writer completes and flushes the frame before confirming
+it. Images have immutable content hashes and separate low-priority streams.
+
+`echo_through` advances only after PTY output has been observed following input.
+It is a prediction lifetime bound, not proof that a particular glyph was echoed.
+`PredictionContext` carries mode generation and PTY echo eligibility separately
+from input commits. Prediction is a reversible local overlay. It never sends
+corrective input to the remote process. Mode changes and mismatches remove it.
+
+## Modern terminal state
+
+Rows contain graphemes and widths, RGB colors, underline kind and color, style
+flags, hyperlink parameters and URL, and image placements. Cursor, title,
+directory, shell markers, reverse video, and prediction context accompany every
+frame. Server input encoding uses its current keyboard, mouse, focus, and paste
+modes. Key press, repeat, release, alternate key codes, and associated text remain
+distinct semantic fields. Paste is UTF-8 text, with nested paste markers removed.
+
+Static Kitty direct-data, SIXEL, and inline image data are decoded under limits
+before display projection. Files and shared memory are never forwarded or read.
+Parser accumulation, decompression, decoding, unplaced uploads, live resources,
+and client caches all have bounds. Rejected image commands cannot bypass the
+bounds through a graphics query. Animated images are outside this profile.
+
+Effects have monotonic IDs and a display-revision barrier. Reconnection replays
+only unapplied effects for the same client process. An overflow advances an
+explicit floor; expired clipboard queries receive a refusal. Clipboard reads
+require local opt-in. Results, refusals, and timeouts enter the actor's ordered
+PTY writer. External effects are not transactional across a client crash.
+
+## Resource limits
+
+Windows are at most 512 columns by 256 rows. Control messages and frames have
+separate length limits. An image is at most 16 MiB RGBA, live image bytes at most
+64 MiB, pending client input at most 256 KiB, and the effect log at most 1 MiB
+and 256 entries. Saturation never silently drops keyboard input. Control traffic
+has a bounded queue and connection flow-control capacity reserved from large
+display and image transfers. Current and in-flight image references stay pinned.
+
+QUIC migration and application reattachment are separate mechanisms. Neither
+Rust nor this protocol repairs an unavailable UDP path or OS network denial.
