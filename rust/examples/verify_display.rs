@@ -201,7 +201,62 @@ fn verify_input() -> Result<()> {
             data: Some("hello".into())
         }
     );
-    assert!(decoder.feed(b"\x1b[97;0u").is_err());
+    let i = Key {
+        code: KeyCode::Char('i'),
+        modifiers: 0,
+        phase: KeyPhase::Press,
+        shifted: None,
+        base: None,
+        text: Some("i".into()),
+    };
+    let escape = Key {
+        code: KeyCode::Named("Escape".into()),
+        text: None,
+        ..i.clone()
+    };
+    let expected = vec![
+        LocalEvent::Input(InputEvent::Key(i.clone())),
+        LocalEvent::Input(InputEvent::Key(Key {
+            phase: KeyPhase::Release,
+            text: None,
+            ..i
+        })),
+        LocalEvent::Input(InputEvent::Key(escape.clone())),
+        LocalEvent::Input(InputEvent::Key(Key {
+            phase: KeyPhase::Release,
+            ..escape
+        })),
+    ];
+    let mut ghostty = InputDecoder::new();
+    assert!(ghostty.feed(b"\x1b[105;")?.is_empty());
+    let mut events = ghostty.feed(b";105u\x1b[105;1:")?;
+    events.extend(ghostty.feed(b"3u\x1b[27u\x1b[27;1:3u")?);
+    assert_eq!(events, expected);
+    let mut legacy = TerminalModel::new(Size::default(), false)?;
+    let mut kitty = TerminalModel::new(Size::default(), false)?;
+    kitty.advance(b"\x1b[>31u")?;
+    let mut legacy_bytes = Vec::new();
+    let mut kitty_bytes = Vec::new();
+    for event in &events {
+        let LocalEvent::Input(event) = event else {
+            unreachable!();
+        };
+        legacy_bytes.extend(legacy.encode_input(event)?);
+        kitty_bytes.extend(kitty.encode_input(event)?);
+    }
+    assert_eq!(legacy_bytes, b"i\x1b");
+    assert_eq!(
+        kitty_bytes,
+        b"\x1b[105;1:1;105u\x1b[105;1:3u\x1b[27;1:1u\x1b[27;1:3u"
+    );
+    assert_eq!(InputDecoder::new().feed(&kitty_bytes)?, expected);
+    for invalid in [
+        b"\x1b[97;0u".as_slice(),
+        b"\x1b[97;257u".as_slice(),
+        b"\x1b[97;1:4u".as_slice(),
+    ] {
+        assert!(InputDecoder::new().feed(invalid).is_err());
+    }
     let mut functional = InputDecoder::new();
     let events = functional.feed(b"\x1b[57399;1u\x1b[57428;1u\x1b[1;5R")?;
     assert!(
@@ -654,6 +709,16 @@ fn verify_escape_sequences() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
+    display.write_status("Connect failed")?;
+    let mut term = terminal();
+    term.advance_bytes(display.into_inner());
+    let status: String = visible(&term)[0]
+        .visible_cells()
+        .map(|cell| cell.str().to_owned())
+        .collect();
+    assert!(status.starts_with("Connect failed"), "{status:?}");
+    println!("connection errors render before the first remote screen");
     verify_input()?;
     verify_legacy_roundtrip()?;
     verify_image_layers()?;

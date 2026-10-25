@@ -123,7 +123,22 @@ class TerminalProcess:
                                         stderr=self.slave, env=environment, preexec_fn=session)
 
     def send(self, data):
-        os.write(self.master, data)
+        pending = memoryview(data)
+        deadline = time.monotonic() + 30
+        os.set_blocking(self.master, False)
+        try:
+            while pending:
+                try:
+                    written = os.write(self.master, pending[:4096])
+                    pending = pending[written:]
+                except BlockingIOError:
+                    pass
+                self.pump(0.01)
+                if pending:
+                    assert self.process.poll() is None, (self.process.returncode, bytes(self.output[-4000:]))
+                    assert time.monotonic() < deadline, "terminal input remained blocked"
+        finally:
+            os.set_blocking(self.master, True)
 
     def pump(self, duration=0.05):
         if select.select([self.master], [], [], duration)[0]:

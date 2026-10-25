@@ -9,9 +9,9 @@ use mosh_rs::model::{
     Size, resource_digest,
 };
 use mosh_rs::transport::{
-    ClientIdentity, Incoming, bootstrap_local, connect, listen, read_request, receive_uni,
-    recv_message, send_frame, send_message, send_resource, spawn_worker, validate_frame,
-    write_grant,
+    ClientEndpoints, ClientIdentity, Incoming, bootstrap_local, connect, listen, read_request,
+    receive_uni, recv_message, send_frame, send_message, send_resource, spawn_worker,
+    validate_frame, write_grant,
 };
 use quinn::{Connection, Endpoint, VarInt};
 
@@ -66,7 +66,7 @@ fn frame() -> Frame {
 
 async fn pair(
     server: &Endpoint,
-    client: &Endpoint,
+    client: &ClientEndpoints,
     grant: &mosh_rs::model::Grant,
 ) -> Result<(Connection, Connection)> {
     let (server, client) = tokio::join!(
@@ -127,7 +127,50 @@ async fn verify() -> Result<()> {
     let request = request(&identity);
     let (server, grant) = listen(&request)?;
     let client = identity.endpoint(&grant)?;
-    let (server_connection, client_connection) = pair(&server, &client, &grant).await?;
+    let mut hostname_grant = grant.clone();
+    hostname_grant.address = "localhost".into();
+    let (server_connection, client_connection) = tokio::time::timeout(
+        Duration::from_secs(2),
+        pair(&server, &client, &hostname_grant),
+    )
+    .await
+    .context("hostname fallback waited for an unreachable address")??;
+    ensure!(
+        client_connection.remote_address().is_ipv4(),
+        "IPv4 candidate did not use a native IPv4 socket"
+    );
+    println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");
+    let mut mapped_grant = grant.clone();
+    mapped_grant.address = "::ffff:127.0.0.1".into();
+    let (mapped_server, mapped_client) = pair(&server, &client, &mapped_grant).await?;
+    ensure!(
+        mapped_client.remote_address().is_ipv4(),
+        "IPv4-mapped candidate did not use a native IPv4 socket"
+    );
+    mapped_client.close(0_u32.into(), b"mapped IPv4 fixture complete");
+    mapped_server.closed().await;
+    println!("IPv4-mapped candidates use the native IPv4 socket");
+    let mut ipv6_request = request.clone();
+    ipv6_request.bind = Some("::1".into());
+    let (ipv6_server, mut ipv6_grant) = listen(&ipv6_request)?;
+    ipv6_grant.address = "localhost".into();
+    let ipv6_client = identity.endpoint(&ipv6_grant)?;
+    let (ipv6_server_connection, ipv6_client_connection) = tokio::time::timeout(
+        Duration::from_secs(2),
+        pair(&ipv6_server, &ipv6_client, &ipv6_grant),
+    )
+    .await
+    .context("hostname fallback did not reach an IPv6-only server")??;
+    ensure!(
+        ipv6_client_connection.remote_address().ip().is_ipv6(),
+        "IPv6 candidate did not use a native IPv6 socket"
+    );
+    ipv6_client_connection.close(0_u32.into(), b"IPv6 fixture complete");
+    ipv6_server_connection.closed().await;
+    ipv6_server.close(0_u32.into(), b"IPv6 fixture complete");
+    ipv6_client.close(0_u32.into(), b"IPv6 fixture complete");
+    ipv6_client.wait_idle().await;
+    println!("hostname candidates also reach an IPv6-only server through a native IPv6 socket");
     let mut client_streams = client_connection.open_bi().await?;
     let attach = ClientMessage::Attach(Attach {
         version: PROTOCOL_VERSION,

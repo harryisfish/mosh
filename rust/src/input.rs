@@ -543,7 +543,8 @@ fn decode_kitty(body: &str) -> Result<InputEvent> {
         .transpose()?;
     let mods: Vec<_> = fields.get(1).copied().unwrap_or("1").split(':').collect();
     ensure!(mods.len() <= 2, "invalid kitty event modifiers");
-    let modifiers: u16 = mods[0]
+    let modifiers = if mods[0].is_empty() { "1" } else { mods[0] };
+    let modifiers: u16 = modifiers
         .parse::<u16>()
         .context("invalid kitty modifiers")?
         .checked_sub(1)

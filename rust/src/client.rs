@@ -7,7 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use quinn::{Connection, Endpoint};
+use quinn::Connection;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::signal::unix::{SignalKind, signal};
@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use crate::display::{Display, Graphics, PredictionPolicy};
 use crate::input::{EscapeAction, EscapeSequence, InputDecoder, LocalEvent, LocalTerminal};
 use crate::model::*;
-use crate::transport::{self, Incoming};
+use crate::transport::{self, ClientEndpoints, Incoming};
 
 enum NetworkEvent {
     Opened {
@@ -71,7 +71,7 @@ impl Drop for Link {
 }
 
 async fn open_link(
-    endpoint: Endpoint,
+    endpoint: ClientEndpoints,
     grant: Grant,
     attach: Attach,
     events: mpsc::Sender<NetworkEvent>,
@@ -223,7 +223,7 @@ fn input_terminal() -> Result<AsyncFd<File>> {
         .context("watch local terminal input")
 }
 
-pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Result<i32> {
+pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions) -> Result<i32> {
     let _terminal = LocalTerminal::enter()?;
     let tty = input_terminal()?;
     let mut display = Display::new(
@@ -231,6 +231,7 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
         options.graphics,
         options.prediction,
     );
+    display.write_status("Connecting.")?;
     let mut decoder = InputDecoder::new();
     let (send, mut receive) = mpsc::channel(4);
     let mut resize_signal = signal(SignalKind::window_change())?;
@@ -296,7 +297,7 @@ pub async fn run(endpoint: Endpoint, grant: Grant, options: ClientOptions) -> Re
                                 failures = failures.saturating_add(1);
                                 let delay = Duration::from_millis((250u64 << failures.min(4)).min(5000));
                                 retry_at = Instant::now() + delay;
-                                display.write_status(&format!("Connection unavailable, retrying. {error}"))?;
+                                display.write_status(&format!("Connection unavailable, retrying. {error:#}"))?;
                             }
                         }
                     }

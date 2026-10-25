@@ -23,7 +23,7 @@ impl Graphics {
         if std::env::var_os("KITTY_WINDOW_ID").is_some()
             || std::env::var_os("WEZTERM_PANE").is_some()
             || term.contains("kitty")
-            || program == "WezTerm"
+            || matches!(program.as_str(), "WezTerm" | "ghostty")
         {
             Self::Kitty
         } else if ["foot", "mlterm", "contour"]
@@ -518,6 +518,12 @@ impl<W: Write> Display<W> {
                 (screen.cursor.x, screen.cursor.y),
             )?;
             self.writer.write_all(b"\x1b[?2026l")?;
+            self.writer.flush()?;
+        } else {
+            write!(
+                self.writer,
+                "\x1b[?2026h\x1b[H\x1b[2K\x1b[0;7m{text}\x1b[0m\x1b[?2026l"
+            )?;
             self.writer.flush()?;
         }
         Ok(())

@@ -34,6 +34,35 @@ pub struct ClientIdentity {
     key: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct ClientEndpoints {
+    ipv4: Option<Endpoint>,
+    ipv6: Option<Endpoint>,
+}
+
+impl ClientEndpoints {
+    pub fn close(&self, error_code: VarInt, reason: &[u8]) {
+        for endpoint in self.ipv4.iter().chain(self.ipv6.iter()) {
+            endpoint.close(error_code, reason);
+        }
+    }
+
+    pub async fn wait_idle(&self) {
+        tokio::join!(
+            async {
+                if let Some(endpoint) = &self.ipv4 {
+                    endpoint.wait_idle().await;
+                }
+            },
+            async {
+                if let Some(endpoint) = &self.ipv6 {
+                    endpoint.wait_idle().await;
+                }
+            }
+        );
+    }
+}
+
 impl ClientIdentity {
     pub fn generate() -> Result<Self> {
         let certified = rcgen::generate_simple_self_signed(vec!["mosh-client.local".into()])?;
@@ -47,7 +76,7 @@ impl ClientIdentity {
         self.certificate.clone()
     }
 
-    pub fn endpoint(&self, grant: &Grant) -> Result<Endpoint> {
+    pub fn endpoint(&self, grant: &Grant) -> Result<ClientEndpoints> {
         validate_grant(grant)?;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from(grant.server_cert.clone()))?;
@@ -63,10 +92,19 @@ impl ClientIdentity {
         tls.enable_early_data = false;
         let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
         config.transport_config(Arc::new(transport_config()));
-        let mut endpoint = Endpoint::client((Ipv6Addr::UNSPECIFIED, 0).into())
-            .or_else(|_| Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into()))?;
-        endpoint.set_default_client_config(config);
-        Ok(endpoint)
+        let ipv4 = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into());
+        let ipv6 = Endpoint::client((Ipv6Addr::UNSPECIFIED, 0).into());
+        if let (Err(ipv4), Err(ipv6)) = (&ipv4, &ipv6) {
+            bail!("cannot bind client UDP sockets: IPv4: {ipv4}; IPv6: {ipv6}");
+        }
+        let mut endpoints = ClientEndpoints {
+            ipv4: ipv4.ok(),
+            ipv6: ipv6.ok(),
+        };
+        for endpoint in endpoints.ipv4.iter_mut().chain(endpoints.ipv6.iter_mut()) {
+            endpoint.set_default_client_config(config.clone());
+        }
+        Ok(endpoints)
     }
 }
 
@@ -166,7 +204,7 @@ pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
     ))
 }
 
-pub async fn connect(endpoint: &Endpoint, grant: &Grant) -> Result<Connection> {
+pub async fn connect(endpoints: &ClientEndpoints, grant: &Grant) -> Result<Connection> {
     validate_grant(grant)?;
     let addresses: Vec<_> = tokio::net::lookup_host((grant.address.as_str(), grant.port))
         .await
@@ -176,20 +214,41 @@ pub async fn connect(endpoint: &Endpoint, grant: &Grant) -> Result<Connection> {
         !addresses.is_empty(),
         "server address resolved to no IP addresses"
     );
+    let mut attempts = tokio::task::JoinSet::new();
     let mut last_error = None;
     for address in addresses {
-        let connecting = match endpoint.connect(address, "mosh.local") {
-            Ok(connecting) => connecting,
+        let address = if let IpAddr::V6(ipv6) = address.ip()
+            && let Some(ipv4) = ipv6.to_ipv4_mapped()
+        {
+            SocketAddr::new(ipv4.into(), address.port())
+        } else {
+            address
+        };
+        let endpoint = if address.is_ipv4() {
+            &endpoints.ipv4
+        } else {
+            &endpoints.ipv6
+        };
+        let Some(endpoint) = endpoint.clone() else {
+            last_error = Some(anyhow::anyhow!("no client UDP socket for {address}"));
+            continue;
+        };
+        attempts.spawn(async move {
+            let connecting = endpoint
+                .connect(address, "mosh.local")
+                .with_context(|| format!("cannot start UDP connection to {address}"))?;
+            tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                .await
+                .with_context(|| format!("UDP connection to {address} timed out"))?
+                .with_context(|| format!("UDP handshake with {address} failed"))
+        });
+    }
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(error)) => last_error = Some(error),
             Err(error) => {
                 last_error = Some(anyhow::Error::from(error));
-                continue;
-            }
-        };
-        match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-            Ok(Ok(connection)) => return Ok(connection),
-            Ok(Err(error)) => last_error = Some(anyhow::Error::from(error)),
-            Err(error) => {
-                last_error = Some(anyhow::Error::from(error).context("UDP connection timed out"))
             }
         }
     }

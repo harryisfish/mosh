@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
 use mosh_rs::model::*;
 use mosh_rs::session::SessionActor;
-use mosh_rs::transport::{self, ClientIdentity, Incoming};
+use mosh_rs::transport::{self, ClientEndpoints, ClientIdentity, Incoming};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -34,7 +34,7 @@ struct Peer {
 
 impl Peer {
     async fn attach(
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoints,
         grant: &Grant,
         view: &mut View,
         attempt: u64,

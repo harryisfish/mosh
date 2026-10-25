@@ -59,9 +59,10 @@ The server also retains unconfirmed final output within this lifetime.
 | Clipboard | OSC 52 UTF-8 writes; reads require `--clipboard-read` and can be refused or time out |
 | Images | Static Kitty direct RGB/RGBA/PNG, SIXEL, and iTerm inline PNG/JPEG become bounded image resources |
 
-`--graphics auto` selects Kitty for recognized Kitty and WezTerm environments,
-and SIXEL for recognized foot, mlterm, and Contour environments. Other terminals
-use text output. Override with `--graphics kitty`, `--graphics sixel`, or
+`--graphics auto` selects Kitty for recognized Kitty, WezTerm, and Ghostty
+environments, including cmux, and SIXEL for recognized foot, mlterm, and Contour
+environments. Other terminals use text output. Override with `--graphics kitty`,
+`--graphics sixel`, or
 `--graphics none` when the terminal's capability differs from its environment.
 The terminal must support the selected output protocol. Automatic selection is
 based on environment variables, not a complete terminal capability probe.
@@ -104,6 +105,9 @@ These tools drive real core, QUIC, renderer, and PTY paths. The CLI tool creates
 only its own local sessions. Its network option places an actual UDP relay
 between the binaries and temporarily drops packets. It checks the original
 command survives and queued input is applied once.
+
+The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
+debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
 No compatibility with the old Mosh wire protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client
