@@ -369,10 +369,7 @@ impl View {
                 }
             }
         }
-        loop {
-            let Some((&id, effect)) = self.effects.first_key_value() else {
-                break;
-            };
+        while let Some((&id, effect)) = self.effects.first_key_value() {
             if effect.after > self.display.revision() {
                 break;
             }
