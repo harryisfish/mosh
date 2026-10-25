@@ -22,7 +22,9 @@ mosh-rs --server /home/user/bin/mosh-rs-server user@host -- /bin/sh -lc 'cd proj
 The server runs as the SSH user. The UDP port must be reachable directly from
 the client. `--port` selects a fixed server port for firewall rules. Without it,
 the operating system selects a port, which the client prints before entering
-the terminal. `--ssh-port` changes the SSH port. `--bind` selects a server IP.
+the terminal. `--ssh-port` changes the SSH port. `--bind` selects a server IP
+to listen on and advertise; an explicit interface IP takes priority over SSH
+connection metadata and the SSH hostname.
 An SSH jump host alone does not provide a UDP route.
 
 To run both binaries locally:

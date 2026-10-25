@@ -344,9 +344,12 @@ impl<W: Write> Display<W> {
                         "invalid hyperlink"
                     );
                 }
-                ensure!(cell.images.len() <= 32, "too many image tiles in a cell");
+                ensure!(
+                    cell.images.len() <= MAX_CELL_IMAGES,
+                    "too many image tiles in a cell"
+                );
                 tiles += cell.images.len();
-                ensure!(tiles <= 131072, "too many image placements");
+                ensure!(tiles <= MAX_IMAGE_TILES, "too many image placements");
                 for tile in &cell.images {
                     let resource = pinned
                         .get(&tile.resource)
@@ -918,7 +921,7 @@ fn write_sixel(writer: &mut impl Write, image: &Resource) -> Result<()> {
     write!(writer, "\x1bP0;1q\"1;1;{width};{height}")?;
     let mut palette = BTreeSet::new();
     let mut pixels = Vec::with_capacity(width * height);
-    for rgba in image.rgba.chunks_exact(4) {
+    for rgba in image.rgba.as_chunks::<4>().0 {
         if rgba[3] < 128 {
             pixels.push(None);
             continue;

@@ -41,8 +41,10 @@ These content limits apply even when the requested window size itself is valid.
 A decoded image is at most 16 MiB RGBA and 16384 pixels in either dimension.
 Core live decoded images are at most 64 MiB, with at most 4096 image objects,
 4096 Kitty chunks and 4096 placements. Image-cell associations are capped at
-262144. Kitty accumulated encoded chunks are at most 24 MiB; decoded compressed
-or direct payloads are at most 16 MiB. Image readers receive a 32 MiB logical
+262144. The wire model and renderer share the same 4096-layer per-cell and
+262144-tile per-screen limits, in addition to the frame byte budget.
+Kitty accumulated encoded chunks are at most 24 MiB; decoded compressed or direct
+payloads are at most 16 MiB. Image readers receive a 32 MiB logical
 decoder budget before constructing the decoder, including dimension probes.
 This is a best-effort dependency limit, not a strict allocation cap. PNG metadata
 inflation is length-bounded, but its Vec capacity and decoder bookkeeping can

@@ -340,13 +340,10 @@ impl TerminalState {
                 ..
             } => self.mouse_wheel(event),
             MouseEvent {
-                kind: MouseEventKind::Press | MouseEventKind::Release,
+                kind: MouseEventKind::Press,
                 button: MouseButton::None,
                 ..
-            } => {
-                // Horizontal wheel not plumbed to anything useful
-                Ok(())
-            }
+            } => Ok(()),
             MouseEvent {
                 kind: MouseEventKind::Press,
                 ..

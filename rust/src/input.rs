@@ -369,9 +369,9 @@ fn named(name: &str, modifiers: u16) -> InputEvent {
 fn decode_plain(bytes: &[u8], modifiers: u16) -> Result<Option<(InputEvent, usize)>> {
     let byte = bytes[0];
     let event = match byte {
-        b'\r' | b'\n' => named("Enter", modifiers),
+        b'\r' => named("Enter", modifiers),
         b'\t' => named("Tab", modifiers),
-        0x7f | 0x08 => named("Backspace", modifiers),
+        0x7f => named("Backspace", modifiers),
         0 => key(KeyCode::Char(' '), modifiers | 4),
         1..=26 => key(KeyCode::Char(char::from(b'a' + byte - 1)), modifiers | 4),
         0x1b => named("Escape", modifiers),

@@ -17,8 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::model::{
-    BootstrapRequest, Frame, Grant, MAX_CONTROL, MAX_FRAME, MAX_RESOURCE, MAX_RESOURCES,
-    PROTOCOL_VERSION, Resource, ResourceMeta,
+    BootstrapRequest, Frame, Grant, MAX_CELL_IMAGES, MAX_CONTROL, MAX_FRAME, MAX_IMAGE_TILES,
+    MAX_RESOURCE, MAX_RESOURCES, PROTOCOL_VERSION, Resource, ResourceMeta,
 };
 
 const ALPN: &[u8] = b"mosh-rs/1";
@@ -135,21 +135,21 @@ pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
         }
     })?;
     let local = endpoint.local_addr()?;
-    let address = std::env::var("SSH_CONNECTION")
-        .ok()
-        .and_then(|value| value.split_whitespace().nth(2).map(str::to_owned))
-        .filter(|value| value.parse::<IpAddr>().is_ok())
-        .unwrap_or_else(|| {
-            if local.ip().is_unspecified() {
+    let address = if !local.ip().is_unspecified() {
+        local.ip().to_string()
+    } else {
+        std::env::var("SSH_CONNECTION")
+            .ok()
+            .and_then(|value| value.split_whitespace().nth(2).map(str::to_owned))
+            .filter(|value| value.parse::<IpAddr>().is_ok())
+            .unwrap_or_else(|| {
                 if local.is_ipv6() {
                     "::1".into()
                 } else {
                     "127.0.0.1".into()
                 }
-            } else {
-                local.ip().to_string()
-            }
-        });
+            })
+    };
     let session = blake3::derive_key("mosh-rs session identity v1", &key)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -225,9 +225,16 @@ pub async fn bootstrap_ssh(
         .arg(target)
         .arg(format!("{} bootstrap", shell_quote(server_path)));
     let mut grant = run_bootstrap(command, &request).await?;
+    let use_ssh_hostname = request
+        .bind
+        .as_deref()
+        .map(str::parse::<IpAddr>)
+        .transpose()?
+        .is_none_or(|ip| ip.is_unspecified());
     let mut query = ssh_command(ssh_port);
     query.arg("-G").arg("--").arg(target);
-    if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), query.output()).await
+    if use_ssh_hostname
+        && let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), query.output()).await
         && output.status.success()
         && output.stdout.len() <= MAX_CONTROL
         && let Some(hostname) = String::from_utf8_lossy(&output.stdout)
@@ -393,7 +400,7 @@ async fn read_async_line<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: R) -
         let available = reader.fill_buf().await?;
         ensure!(!available.is_empty(), "bootstrap stream ended before grant");
         let end = available.iter().position(|byte| *byte == b'\n');
-        let count = end.map_or(available.len(), |index| index);
+        let count = end.unwrap_or(available.len());
         ensure!(
             bytes.len() + count < MAX_CONTROL,
             "bootstrap message exceeds limit"
@@ -668,6 +675,7 @@ pub fn validate_frame(frame: &Frame) -> Result<()> {
         "frame image bytes exceed session limit"
     );
     let mut rows = BTreeSet::new();
+    let mut image_tiles = 0usize;
     for patch in &frame.rows {
         ensure!(
             patch.y < frame.size.rows && rows.insert(patch.y),
@@ -687,9 +695,11 @@ pub fn validate_frame(frame: &Frame) -> Result<()> {
                 "invalid cell position or width"
             );
             ensure!(
-                safe_text(&cell.text, 4096) && cell.images.len() <= 64,
+                safe_text(&cell.text, 4096) && cell.images.len() <= MAX_CELL_IMAGES,
                 "cell content exceeds limit"
             );
+            image_tiles += cell.images.len();
+            ensure!(image_tiles <= MAX_IMAGE_TILES, "too many image placements");
             if let Some(link) = &cell.style.hyperlink {
                 ensure!(
                     safe_text(&link.params, 4096) && safe_text(&link.url, 16384),

@@ -68,6 +68,8 @@ PTY writer. External effects are not transactional across a client crash.
 
 Windows are at most 512 columns by 256 rows. A control message is at most 512 KiB;
 a decoded or compressed frame is at most 16 MiB. An image is at most 16 MiB RGBA.
+Each cell contains at most 4096 image tiles, and a screen at most 262144 tiles.
+The frame byte budget can require a smaller tile limit.
 Each current screen, the core's decoded image store, and the adapter's exported
 cache have separate 64 MiB limits. The actor retains at most 128 MiB of unique
 resources across display roots plus two independent resource transfers. A client

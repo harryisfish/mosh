@@ -196,6 +196,9 @@ impl TerminalModel {
                     MouseKind::Press(button) => {
                         (core::MouseEventKind::Press, mouse_button(button)?)
                     }
+                    MouseKind::Release(3) => {
+                        (core::MouseEventKind::Release, core::MouseButton::None)
+                    }
                     MouseKind::Release(button) => {
                         (core::MouseEventKind::Release, mouse_button(button)?)
                     }
@@ -277,6 +280,7 @@ impl TerminalModel {
         let mut resources = BTreeMap::new();
         let mut used = BTreeSet::new();
         let mut rows = Vec::new();
+        let mut image_tiles = 0usize;
         let mut string_budget = 4 * 1024 * 1024usize;
         let mut encoded_budget = FrameBudget {
             remaining: MAX_FRAME - 1024 * 1024,
@@ -305,6 +309,11 @@ impl TerminalModel {
                 string_budget -= string_bytes;
                 let mut images = Vec::new();
                 for image in attrs.images().unwrap_or_default() {
+                    image_tiles += 1;
+                    ensure!(
+                        images.len() < MAX_CELL_IMAGES && image_tiles <= MAX_IMAGE_TILES,
+                        "snapshot image placements exceed limit"
+                    );
                     let data = image.image_data().data();
                     let (width, height) = data.dimensions()?;
                     let key = (image.image_data().hash(), width, height);

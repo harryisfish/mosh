@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+pub const MAX_CELL_IMAGES: usize = 4096;
+pub const MAX_IMAGE_TILES: usize = 262144;
 pub const MAX_RESOURCE: usize = 16 * 1024 * 1024;
 pub const MAX_RESOURCES: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_INPUT: usize = 256 * 1024;

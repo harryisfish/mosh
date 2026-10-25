@@ -6,6 +6,7 @@ use anyhow::Result;
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
 use mosh_rs::input::{EscapeAction, EscapeSequence, InputDecoder, LocalEvent};
 use mosh_rs::model::*;
+use mosh_rs::{state, terminal::TerminalModel, transport};
 use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
 #[derive(Debug)]
@@ -396,7 +397,12 @@ fn verify_render(graphics: Graphics) -> Result<()> {
         let decoded = images[0].image_data().data().clone().decode();
         match decoded {
             tattoy_wezterm_term::image::ImageDataType::Rgba8 { data, .. } => {
-                assert!(data.chunks_exact(4).all(|pixel| pixel == [255, 0, 0, 255]));
+                assert!(
+                    data.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| *pixel == [255, 0, 0, 255])
+                );
             }
             other => panic!("expected static RGBA image, got {other:?}"),
         }
@@ -649,11 +655,71 @@ fn verify_escape_sequences() -> Result<()> {
 
 fn main() -> Result<()> {
     verify_input()?;
+    verify_legacy_roundtrip()?;
+    verify_image_layers()?;
     verify_render(Graphics::None)?;
     verify_render(Graphics::Kitty)?;
     verify_render(Graphics::Sixel)?;
     verify_prediction_modes()?;
     verify_lifecycle()?;
     verify_escape_sequences()?;
+    Ok(())
+}
+
+fn verify_legacy_roundtrip() -> Result<()> {
+    for (mode, mouse_bytes) in [
+        (b"\x1b[?1000h".as_slice(), b"\x1b[M !!\x1b[M#!!".as_slice()),
+        (
+            b"\x1b[?1000h\x1b[?1006h".as_slice(),
+            b"\x1b[<0;1;1M\x1b[<0;1;1m".as_slice(),
+        ),
+    ] {
+        let mut model = TerminalModel::new(Size::default(), false)?;
+        model.advance(mode)?;
+        let mut decoder = InputDecoder::new();
+        let mut encoded = Vec::new();
+        for event in decoder.feed(b"\n\x08\x1b[M !!\x1b[M#!!")? {
+            if let LocalEvent::Input(event) = event {
+                encoded.extend(model.encode_input(&event)?);
+            }
+        }
+        assert_eq!(encoded, [b"\n\x08".as_slice(), mouse_bytes].concat());
+        assert!(model.encode_input(&InputEvent::Focus(false))?.is_empty());
+    }
+    println!(
+        "legacy Ctrl-J/Ctrl-H and X10 release survive semantic input and both remote mouse encodings"
+    );
+    Ok(())
+}
+
+fn verify_image_layers() -> Result<()> {
+    let mut model = TerminalModel::new(Size::default(), false)?;
+    for id in 1..=65 {
+        model.advance(
+            format!("\x1b[H\x1b_Ga=T,f=24,s=1,v=1,i={id},q=2,C=1,z={id};/wAA\x1b\\").as_bytes(),
+        )?;
+    }
+    let screen = model.snapshot()?;
+    let frame = state::frame(1, 1, 0, &screen, None)?;
+    transport::validate_frame(&frame)?;
+    for graphics in [Graphics::None, Graphics::Kitty] {
+        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+        display.set_epoch(1);
+        assert!(display.install(frame.clone(), &screen.resources)?);
+        assert_eq!(
+            display
+                .screen()
+                .unwrap()
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .map(|cell| cell.images.len())
+                .max(),
+            Some(65)
+        );
+    }
+    println!(
+        "65 static image layers in one cell survive core, frame validation, and display installation"
+    );
     Ok(())
 }

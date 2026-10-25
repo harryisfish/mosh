@@ -51,9 +51,11 @@ def remote_fixture(mode, state):
     os.write(1, b"KEY_CLI_OK\r\n")
     exact(b"\x1b[<0;3;2M")
     exact(b"\x1b[<0;3;2m")
+    exact(b"\x1b[<0;1;1M\x1b[<0;1;1m")
     exact(b"\x1b[<66;3;2M")
     exact(b"\x1b[O\x1b[I")
     os.write(1, b"\x1b[<u\r\nINPUT_CLI_OK\r\n")
+    exact(b"\n\x08")
     exact(b"\r")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -104,13 +106,14 @@ def proxy_bootstrap(server, state):
 
 
 class TerminalProcess:
-    def __init__(self, command):
+    def __init__(self, command, extra_env=None):
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 800, 480))
         self.saved = termios.tcgetattr(self.slave)
         self.output = bytearray()
         self.closing = False
         environment = dict(os.environ, TERM="xterm-kitty", COLORTERM="truecolor")
+        environment.update(extra_env or {})
 
         def session():
             os.setsid()
@@ -196,12 +199,12 @@ def verify(bin_dir, network):
             process.until(b"READY_CLI")
             assert b"38;2;12;34;56" in process.output and "e\u0301中文".encode() in process.output
             process.send(b"\x1b[200~paste \xe4\xb8\xad\xe6\x96\x87\x1b[201~")
-            process.send(b"\x1b[97:65:97;5:2;65:98u\x1b[<0;3;2M\x1b[<0;3;2m\x1b[<66;3;2M\x1b[O\x1b[I")
+            process.send(b"\x1b[97:65:97;5:2;65:98u\x1b[<0;3;2M\x1b[<0;3;2m\x1b[M !!\x1b[M#!!\x1b[<66;3;2M\x1b[O\x1b[I")
             process.until(b"PASTE_CLI_OK")
             process.until(b"KEY_CLI_OK")
             process.until(b"INPUT_CLI_OK")
             fcntl.ioctl(process.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 600, 240))
-            process.send(b"\r")
+            process.send(b"\n\x08\r")
             process.until(b"\x1b]52;c;?\x1b\\")
             assert b"\x1b]52;c;cmVtb3Rl\x1b\\" in process.output
             process.send(b"\x1b]52;c;bG9jYWw=\x1b\\")
@@ -211,6 +214,24 @@ def verify(bin_dir, network):
             process.close()
             cleanup(state)
         print("CLI modern input, clipboard, literal argv, resize, exit code, and termios restoration passed", flush=True)
+
+        shim = Path(temporary) / "ssh"
+        shim.write_text(f"#!{sys.executable}\nimport os,sys\nif '-G' in sys.argv:\n    print('hostname ::1')\nelse:\n    os.execl('/bin/sh','sh','-c',sys.argv[-1])\n")
+        shim.chmod(0o700)
+        state = str(Path(temporary) / "ssh-bind.json")
+        process = TerminalProcess(
+            [client, "--server", server, "--bind", "127.0.0.1", "fixture", "--",
+             sys.executable, script, "--remote", "wait", state],
+            {"PATH": temporary + os.pathsep + os.environ["PATH"],
+             "SSH_CONNECTION": "192.0.2.1 40000 ::1 22"})
+        try:
+            process.until(b"WAIT_READY")
+            process.send(b"\x1e.")
+            process.finish(0)
+        finally:
+            process.close()
+            cleanup(state)
+        print("CLI explicit bind survives conflicting SSH metadata through a local SSH shim", flush=True)
 
         for suffix, prefix_bytes in [("legacy", b"\x1e"), ("kitty", b"\x1b[94;5u\x1b[94;5:3u")]:
             state = str(Path(temporary) / f"detach-{suffix}.json")

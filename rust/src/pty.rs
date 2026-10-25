@@ -40,7 +40,7 @@ impl Pty {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut window,
+                &raw mut window,
             )
         };
         if result == -1 {
