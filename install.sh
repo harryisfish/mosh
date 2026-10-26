@@ -58,6 +58,19 @@ resolve_target() {
 	esac
 }
 
+is_musl_linux() {
+	local ldd_output
+	if command -v ldd >/dev/null 2>&1; then
+		ldd_output=$(ldd --version 2>&1 || true)
+		[[ "$ldd_output" == *musl* ]] && return 0
+		return 1
+	fi
+	for loader in /lib/ld-musl-*.so.1 /lib64/ld-musl-*.so.1; do
+		[[ -e "$loader" ]] && return 0
+	done
+	return 1
+}
+
 normalize_version() {
 	local version=$1
 	version=${version#rust-v}
@@ -126,10 +139,9 @@ esac
 os=$(uname -s)
 arch=$(uname -m)
 if [[ "$os" == Linux ]]; then
-	for loader in /lib/ld-musl-*.so.1 /lib64/ld-musl-*.so.1; do
-		[[ -e "$loader" ]] || continue
+	if is_musl_linux; then
 		die "musl Linux is not supported by this release; build mosh-rs from source"
-	done
+	fi
 fi
 target=$(resolve_target "$os" "$arch")
 if [[ "$version" == latest ]]; then

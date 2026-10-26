@@ -46,6 +46,7 @@ review the script first, download it and run `bash install.sh`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
+cat install.sh
 bash install.sh
 ```
 

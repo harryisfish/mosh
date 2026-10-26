@@ -31,6 +31,7 @@ script first, download it and run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
+cat install.sh
 bash install.sh
 ```
 

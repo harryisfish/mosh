@@ -43,6 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh 
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
+cat install.sh
 bash install.sh
 ```
 
