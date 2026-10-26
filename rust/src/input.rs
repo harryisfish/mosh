@@ -360,10 +360,14 @@ impl InputDecoder {
 }
 
 fn key(code: KeyCode, modifiers: u16) -> InputEvent {
+    key_with_phase(code, modifiers, KeyPhase::Press)
+}
+
+fn key_with_phase(code: KeyCode, modifiers: u16, phase: KeyPhase) -> InputEvent {
     InputEvent::Key(Key {
         code,
         modifiers,
-        phase: KeyPhase::Press,
+        phase,
         shifted: None,
         base: None,
         text: None,
@@ -434,11 +438,31 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         ("", b'O') => return Ok(Some(InputEvent::Focus(false))),
         _ => (),
     }
-    if body.starts_with(['?', '>', '<', '=']) || final_byte == b'c' {
+    if body.starts_with(['?', '>', '<', '='])
+        || !matches!(
+            final_byte,
+            b'A' | b'B' | b'C' | b'D' | b'H' | b'F' | b'Z' | b'P' | b'Q' | b'R' | b'S' | b'~'
+        )
+    {
         return Ok(None);
     }
-    let fields = numeric_fields(body, ';')?;
-    let modifiers = fields.get(1).copied().unwrap_or(1).saturating_sub(1);
+    let (parameters, phase) = if let Some((parameters, event)) = body.split_once(':') {
+        ensure!(
+            parameters.split(';').count() == 2,
+            "invalid keyboard event modifiers"
+        );
+        let phase = match event {
+            "1" | "" => KeyPhase::Press,
+            "2" => KeyPhase::Repeat,
+            "3" => KeyPhase::Release,
+            _ => bail!("unknown keyboard event type"),
+        };
+        (parameters, phase)
+    } else {
+        (body, KeyPhase::Press)
+    };
+    let fields = numeric_fields(parameters, ';')?;
+    let mut modifiers = fields.get(1).copied().unwrap_or(1).saturating_sub(1);
     ensure!(modifiers < 256, "unknown keyboard modifiers");
     let name = match final_byte {
         b'A' => "Up",
@@ -447,7 +471,10 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         b'D' => "Left",
         b'H' => "Home",
         b'F' => "End",
-        b'Z' => return Ok(Some(named("Tab", modifiers | 1))),
+        b'Z' => {
+            modifiers |= 1;
+            "Tab"
+        }
         b'P' => "F1",
         b'Q' => "F2",
         b'R' if fields.first().copied().unwrap_or(1) == 1 => "F3",
@@ -457,7 +484,7 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
             if code == 27 && fields.len() == 3 {
                 let ch = char::from_u32(u32::from(fields[2]))
                     .context("invalid modifyOtherKeys codepoint")?;
-                return Ok(Some(key(KeyCode::Char(ch), modifiers)));
+                return Ok(Some(key_with_phase(KeyCode::Char(ch), modifiers, phase)));
             }
             match code {
                 1 | 7 => "Home",
@@ -492,7 +519,11 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         }
         _ => return Ok(None),
     };
-    Ok(Some(named(name, modifiers)))
+    Ok(Some(key_with_phase(
+        KeyCode::Named(name.into()),
+        modifiers,
+        phase,
+    )))
 }
 
 fn decode_ss3(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
