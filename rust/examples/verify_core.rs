@@ -60,6 +60,7 @@ fn model() -> TerminalModel {
     .unwrap()
 }
 fn main() -> Result<()> {
+    verify_default_colors()?;
     verify_terminal_boundaries()?;
     verify_png_metadata()?;
     verify_projection_regressions()?;
@@ -400,6 +401,53 @@ fn main() -> Result<()> {
     );
     println!(
         "query/file/shared-memory/animation/dimensions/repeat limits, unplaced upload, collector sticky error, parser limit passed"
+    );
+    Ok(())
+}
+
+fn verify_default_colors() -> Result<()> {
+    let mut term = model();
+    term.advance(b"D\x1b[40mB\x1b[49mR\x1b[30mF\x1b[39mD")?;
+    let screen = term.snapshot()?;
+    let cells = &screen.rows[0].cells;
+    assert_eq!(cells[0].style.fg, Color::Default);
+    assert_eq!(cells[0].style.bg, Color::Default);
+    assert_eq!(cells[1].style.bg, Color::Rgb([0, 0, 0]));
+    assert_eq!(cells[2].style.bg, Color::Default);
+    assert_eq!(cells[3].style.fg, Color::Rgb([0, 0, 0]));
+    assert_eq!(cells[4].style.fg, Color::Default);
+
+    term.advance(b"\x1b]11;#000000\x07")?;
+    let screen = term.snapshot()?;
+    assert_eq!(screen.rows[0].cells[0].style.bg, Color::Rgb([0, 0, 0]));
+    assert_eq!(screen.rows[0].cells[0].style.fg, Color::Default);
+    term.advance(b"\x1b]111\x07\x1b]10;#b2b2b2\x07")?;
+    let screen = term.snapshot()?;
+    assert_eq!(screen.rows[0].cells[0].style.bg, Color::Default);
+    assert_eq!(screen.rows[0].cells[0].style.fg, Color::Rgb([178; 3]));
+    assert_eq!(screen.rows[0].cells[3].style.fg, Color::Rgb([0, 0, 0]));
+
+    term.advance(b"\x1b]10;#123456;#654321\x07\x1b]11;?\x07")?;
+    let screen = term.snapshot()?;
+    assert_eq!(screen.rows[0].cells[0].style.fg, Color::Rgb([18, 52, 86]));
+    assert_eq!(screen.rows[0].cells[0].style.bg, Color::Rgb([101, 67, 33]));
+    assert_eq!(screen.rows[0].cells[1].style.bg, Color::Rgb([0, 0, 0]));
+    term.advance(b"\x1b]110\x07\x1b]111\x07\x1b]4;0;#010203\x07")?;
+    let screen = term.snapshot()?;
+    assert_eq!(screen.rows[0].cells[0].style.fg, Color::Default);
+    assert_eq!(screen.rows[0].cells[0].style.bg, Color::Default);
+    assert_eq!(screen.rows[0].cells[1].style.bg, Color::Rgb([1, 2, 3]));
+
+    for reset in [b"\x1b]104\x07".as_slice(), b"\x1bc"] {
+        term.advance(b"\x1b]10;#123456;#000000\x07")?;
+        term.advance(reset)?;
+        term.advance(b"\rZ")?;
+        let screen = term.snapshot()?;
+        assert_eq!(screen.rows[0].cells[0].style.fg, Color::Default);
+        assert_eq!(screen.rows[0].cells[0].style.bg, Color::Default);
+    }
+    println!(
+        "default terminal colors stay symbolic; explicit black, dynamic colors and resets survive snapshots"
     );
     Ok(())
 }

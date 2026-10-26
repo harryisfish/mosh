@@ -64,11 +64,14 @@ def remote_fixture(mode, state):
         os.write(1, b"\r\nNETWORK_ONCE_OK\r\n")
         return 9
     assert sys.argv[4] == "literal ' quotes $HOME $(printf unsafe) ; &"
-    os.write(1, b"\x1b[2J\x1b[H\x1b[?1h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[>31u\x1b[38;2;12;34;56mREADY_CLI\x1b[0m " + "e\u0301中文".encode())
+    os.write(1, b"\x1b[2J\x1b[HDEFAULT_COLOR_CLI\x1b[40mBLACK_COLOR_CLI\x1b[49mRESTORED_COLOR_CLI\r\n"
+                b"\x1b[?1h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[>31u\x1b[38;2;12;34;56mREADY_CLI\x1b[0m " + "e\u0301中文".encode())
     exact(b"\x1b[200~paste \xe4\xb8\xad\xe6\x96\x87\x1b[201~")
     os.write(1, b"\r\nPASTE_CLI_OK\r\n")
     exact(b"\x1b[97:65:97;5:2;65:98u")
     os.write(1, b"KEY_CLI_OK\r\n")
+    exact(b"\x1b[1;1:1A\x1b[1;1:2A\x1b[1;1:3A")
+    os.write(1, b"ARROW_CLI_OK\r\n")
     exact(b"\x1b[<0;3;2M")
     exact(b"\x1b[<0;3;2m")
     exact(b"\x1b[<0;1;1M\x1b[<0;1;1m")
@@ -411,10 +414,15 @@ def verify(bin_dir, network):
         try:
             process.until(b"READY_CLI")
             assert b"38;2;12;34;56" in process.output and "e\u0301中文".encode() in process.output
+            assert b"\x1b[0mDEFAULT_COLOR_CLI" in process.output, "default text must inherit the terminal theme"
+            assert b"\x1b[0;48;2;0;0;0mBLACK_COLOR_CLI" in process.output, "explicit black must remain black"
+            assert b"\x1b[0mRESTORED_COLOR_CLI" in process.output, "SGR 49 must restore the terminal theme"
             process.send(b"\x1b[200~paste \xe4\xb8\xad\xe6\x96\x87\x1b[201~")
-            process.send(b"\x1b[97:65:97;5:2;65:98u\x1b[<0;3;2M\x1b[<0;3;2m\x1b[M !!\x1b[M#!!\x1b[<66;3;2M\x1b[O\x1b[I")
+            process.send(b"\x1b[97:65:97;5:2;65:98u\x1b[1;1A\x1b[1;1:2A\x1b[1;1:3A"
+                         b"\x1b[<0;3;2M\x1b[<0;3;2m\x1b[M !!\x1b[M#!!\x1b[<66;3;2M\x1b[O\x1b[I")
             process.until(b"PASTE_CLI_OK")
             process.until(b"KEY_CLI_OK")
+            process.until(b"ARROW_CLI_OK")
             process.until(b"INPUT_CLI_OK")
             fcntl.ioctl(process.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 600, 240))
             process.send(b"\n\x08\r")
@@ -426,7 +434,7 @@ def verify(bin_dir, network):
         finally:
             process.close()
             cleanup(state)
-        print("CLI modern input, clipboard, literal argv, resize, exit code, and termios restoration passed", flush=True)
+        print("CLI default colors, explicit black, arrow phases, modern input, clipboard, literal argv, resize, exit code, and termios restoration passed", flush=True)
 
         shim = Path(temporary) / "ssh"
         shim.write_text(f"#!{sys.executable}\nimport os,sys\nif '-G' in sys.argv:\n    print('hostname ::1')\nelse:\n    os.execl('/bin/sh','sh','-c',sys.argv[-1])\n")
