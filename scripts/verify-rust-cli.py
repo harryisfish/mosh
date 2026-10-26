@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pty
 import random
+import shlex
 import select
 import signal
 import socket
@@ -43,6 +44,16 @@ def remote_fixture(mode, state):
         while os.read(0, 1):
             pass
         return 0
+    if mode == "job":
+        os.write(1, b"\x1b[2J\x1b[H\x1b[?5h\x1b]2;JOB_TITLE\x1b\\\x1b]7;file:///tmp/mosh-job\x1b\\"
+                    b"\x1b]133;A\x1b\\\x07\x1b]52;c;am9i\x1b\\"
+                    b"JOB_CACHED_TEXT\r\n\x1b_Ga=T,f=32,s=1,v=1,i=9,c=1,r=1,C=1,q=2;/wAA/w==\x1b\\\r\nJOB_READY")
+        exact(b"\x1a")
+        os.write(1, b"\r\nREMOTE_CTRL_Z_OK")
+        for stage in [b"first", b"second", b"third", b"external", b"final"]:
+            exact(stage + b"\r", timeout=60)
+            os.write(1, b"\r\nJOB_" + stage.upper() + b"_OK")
+        return 9
     if mode == "network":
         os.write(1, b"\x1b[2J\x1b[HNETWORK_READY\r\n")
         exact(b"baseline\r")
@@ -206,9 +217,9 @@ class TerminalProcess:
         else:
             assert len(self.output) < 4 * 1024 * 1024, f"CLI output exceeded fixture limit: {bytes(self.output[-1000:])!r}"
 
-    def until(self, marker, timeout=15):
+    def until(self, marker, timeout=15, start=0):
         deadline = time.monotonic() + timeout
-        while marker not in self.output:
+        while marker not in self.output[start:]:
             self.pump()
             if self.process.poll() is not None:
                 raise AssertionError(f"CLI exited {self.process.returncode} before {marker!r}: {bytes(self.output[-4000:])!r}")
@@ -253,6 +264,139 @@ def cleanup(state):
             os.kill(int(Path(state + ".proxy").read_text()), signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+
+def verify_job_control(command, state, inspect_session=None, cleanup_session=cleanup):
+    shell_path = "/bin/zsh" if Path("/bin/zsh").exists() else "/bin/bash"
+    shell = TerminalProcess([shell_path, "-f", "-i"] if shell_path.endswith("zsh")
+                            else [shell_path, "--noprofile", "--norc", "-i"])
+    prompt = b"LOCAL_JOB_PROMPT> "
+    client_pid = None
+    if inspect_session is None:
+        inspect_session = lambda: json.loads(Path(state).read_text())
+    try:
+        shell.send(b"PS1='LOCAL_JOB_''PROMPT> '; unset PROMPT_COMMAND\n")
+        shell.until(prompt)
+        shell.pump(0.05)
+        prompt_modes = termios.tcgetattr(shell.master)
+        start = len(shell.output)
+        shell.send(shlex.join(command).encode() + b"\n")
+        shell.until(b"JOB_READY", start=start)
+        client_pid = os.tcgetpgrp(shell.master)
+        assert client_pid != shell.process.pid
+        original_processes = inspect_session()
+        shell.send(b"\x1a")
+        shell.until(b"REMOTE_CTRL_Z_OK")
+        for stage, prefix, pause in [(b"first", b"\x1e\x1a", 0),
+                                     (b"second", b"\x1b[94;5u\x1b[94;5:3u\x1b[122;5u", 22),
+                                     (b"third", b"\x1e\x1a", 0),
+                                     (b"external", None, 0)]:
+            start = len(shell.output)
+            if prefix is None:
+                os.kill(client_pid, signal.SIGSTOP)
+            else:
+                shell.send(stage + b"\r" + prefix)
+            shell.until(prompt, start=start)
+            assert os.tcgetpgrp(shell.master) == shell.process.pid
+            modes = termios.tcgetattr(shell.master)
+            assert modes == prompt_modes, (modes, prompt_modes)
+            if stage in [b"first", b"external"]:
+                start = len(shell.output)
+                shell.send(b"bg\n")
+                shell.until(prompt, start=start)
+                start = len(shell.output)
+                for _ in range(2):
+                    os.kill(client_pid, signal.SIGCONT)
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    shell.pump(0.02)
+                assert b"\x1b[?1049h" not in shell.output[start:]
+                assert b"\x1b_G" not in shell.output[start:]
+                assert termios.tcgetattr(shell.master) == prompt_modes
+            deadline = time.monotonic() + pause
+            while time.monotonic() < deadline:
+                shell.pump(0.05)
+            if stage == b"third":
+                fcntl.ioctl(shell.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 600, 240))
+            start = len(shell.output)
+            shell.send(b"fg\n")
+            shell.until(b"JOB_CACHED_TEXT", start=start)
+            if prefix is None:
+                shell.send(stage + b"\r")
+            shell.until(b"JOB_" + stage.upper() + b"_OK", start=start)
+            assert os.tcgetpgrp(shell.master) == client_pid
+            assert b"\x1b]2;JOB_TITLE\x1b\\" in shell.output[start:]
+            assert b"\x1b]7;file:///tmp/mosh-job\x1b\\" in shell.output[start:]
+            assert b"\x1b_Ga=t," in shell.output[start:]
+            assert b"\x1b[?5h" in shell.output[start:]
+            assert shell.output.count(b"\x1b]52;c;am9i\x1b\\") == 1
+            assert shell.output.count(b"\x1b]133;A\x1b\\") == 1
+            assert inspect_session() == original_processes
+            print(f"CLI job-control {stage.decode()} passed with the original session", flush=True)
+        start = len(shell.output)
+        shell.send(b"final\r")
+        shell.until(prompt, start=start)
+        assert b"JOB_FINAL_OK" in shell.output[start:]
+        assert shell.output.count(b"\x1b[22;0t") == shell.output.count(b"\x1b[23;0t")
+        assert shell.output.count(b"\x1b[>31u") == shell.output.count(b"\x1b[<u")
+        shell.send(b"exit\n")
+        shell.finish(9)
+    finally:
+        if client_pid is not None:
+            try:
+                os.kill(client_pid, signal.SIGTERM)
+                os.kill(client_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        shell.close()
+        cleanup_session(state)
+    print("CLI suspend/bg/fg, long suspension, cached graphics/metadata, effects once, queued keys once, resize and termios passed", flush=True)
+
+
+def verify_background_exit(command, state, termination):
+    shell_path = "/bin/zsh" if Path("/bin/zsh").exists() else "/bin/bash"
+    shell = TerminalProcess([shell_path, "-f", "-i"] if shell_path.endswith("zsh")
+                            else [shell_path, "--noprofile", "--norc", "-i"])
+    prompt = b"LOCAL_BACKGROUND_PROMPT> "
+    client_pid = None
+    try:
+        shell.send(b"PS1='LOCAL_BACKGROUND_''PROMPT> '; unset PROMPT_COMMAND\n")
+        shell.until(prompt)
+        shell.send(shlex.join(command).encode() + b"\n")
+        shell.until(b"WAIT_READY")
+        client_pid = os.tcgetpgrp(shell.master)
+        original_processes = json.loads(Path(state).read_text())
+        start = len(shell.output)
+        shell.send(b"\x1e\x1a")
+        shell.until(prompt, start=start)
+        start = len(shell.output)
+        shell.send(b"bg\n")
+        shell.until(prompt, start=start)
+        start = len(shell.output)
+        os.kill(client_pid, termination)
+        deadline = time.monotonic() + 5
+        while True:
+            shell.pump(0.02)
+            try:
+                os.kill(client_pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, "background client did not exit"
+        assert b"\x1b[?1049h" not in shell.output[start:]
+        assert b"\x1b[23;0t" not in shell.output[start:]
+        for pid in original_processes.values():
+            os.kill(pid, 0)
+        shell.send(b"exit 0\n")
+        shell.finish(0)
+    finally:
+        if client_pid is not None:
+            try:
+                os.kill(client_pid, signal.SIGTERM)
+                os.kill(client_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        shell.close()
+        cleanup(state)
 
 
 def verify(bin_dir, network):
@@ -314,6 +458,14 @@ def verify(bin_dir, network):
                 process.close()
                 cleanup(state)
         print("CLI legacy and kitty release escape sequences detach without terminating the remote command", flush=True)
+
+        state = str(Path(temporary) / "job.json")
+        verify_job_control(prefix + [sys.executable, script, "--remote", "job", state], state)
+        for termination in [signal.SIGTERM, signal.SIGHUP]:
+            state = str(Path(temporary) / f"background-{termination}.json")
+            verify_background_exit(prefix + [sys.executable, script, "--remote", "wait", state],
+                                   state, termination)
+        print("CLI running background clients exit on TERM/HUP without touching the terminal or ending the remote command", flush=True)
 
         if network:
             state = str(Path(temporary) / "network.json")

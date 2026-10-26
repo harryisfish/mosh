@@ -68,7 +68,7 @@ struct PreparedGraphics {
     placements: Vec<Placement>,
 }
 
-pub struct Display<W: Write> {
+pub struct Display<W> {
     writer: W,
     epoch: u64,
     revision: u64,
@@ -84,6 +84,37 @@ pub struct Display<W: Write> {
     status: String,
     emitted_markers: VecDeque<ShellMarker>,
     checkpoint_required: bool,
+}
+
+impl<W> Display<W> {
+    fn with_writer<T>(self, writer: T) -> (Display<T>, W) {
+        (
+            Display {
+                writer,
+                epoch: self.epoch,
+                revision: self.revision,
+                effects: self.effects,
+                screen: self.screen,
+                graphics: self.graphics,
+                policy: self.policy,
+                guesses: self.guesses,
+                confidence: self.confidence,
+                image_ids: self.image_ids,
+                placements: self.placements,
+                next_image_id: self.next_image_id,
+                status: self.status,
+                emitted_markers: self.emitted_markers,
+                checkpoint_required: self.checkpoint_required,
+            },
+            self.writer,
+        )
+    }
+}
+
+impl Display<()> {
+    pub fn bind<W: Write>(self, writer: W) -> Display<W> {
+        self.with_writer(writer).0
+    }
 }
 
 impl<W: Write> Display<W> {
@@ -134,13 +165,26 @@ impl<W: Write> Display<W> {
         self.writer
     }
 
+    pub fn into_cached(mut self) -> (Display<()>, W) {
+        self.guesses.clear();
+        self.confidence = 0;
+        self.image_ids.clear();
+        self.placements.clear();
+        self.with_writer(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
     pub fn set_effect_floor(&mut self, floor: u64) {
         self.effects = self.effects.max(floor);
     }
 
     pub fn install(
         &mut self,
-        frame: Frame,
+        frame: &Frame,
         resources: &BTreeMap<Digest, Resource>,
     ) -> Result<bool> {
         if frame.epoch != self.epoch || frame.revision <= self.revision {
@@ -152,7 +196,7 @@ impl<W: Write> Display<W> {
             self.checkpoint_required = true;
             return Ok(false);
         }
-        let mut screen = self.assemble(&frame, resources)?;
+        let mut screen = self.assemble(frame, resources)?;
         let graphics = prepare_graphics(&screen, self.graphics)?;
         let mode_changed = self.screen.as_ref().is_none_or(|old| {
             old.prediction.generation != screen.prediction.generation
@@ -526,6 +570,66 @@ impl<W: Write> Display<W> {
             )?;
             self.writer.flush()?;
         }
+        Ok(())
+    }
+
+    pub fn redraw_cached(&mut self, size: Size) -> Result<()> {
+        let Some(mut screen) = self.screen.clone() else {
+            return self.write_status(&self.status.clone());
+        };
+        self.guesses.clear();
+        self.confidence = 0;
+        self.image_ids.clear();
+        self.placements.clear();
+        screen.size.cols = screen.size.cols.min(size.cols);
+        screen.size.rows = screen.size.rows.min(size.rows);
+        screen.size.pixel_width =
+            size.pixel_width / u32::from(size.cols) * u32::from(screen.size.cols);
+        screen.size.pixel_height =
+            size.pixel_height / u32::from(size.rows) * u32::from(screen.size.rows);
+        screen.rows.truncate(usize::from(screen.size.rows));
+        for row in &mut screen.rows {
+            row.cells.retain(|cell| cell.x < screen.size.cols);
+            for cell in &mut row.cells {
+                if cell.x + u16::from(cell.width) > screen.size.cols {
+                    cell.width = 1;
+                    cell.text = " ".into();
+                }
+            }
+        }
+        screen.cursor.x = screen.cursor.x.min(screen.size.cols - 1);
+        screen.cursor.y = screen.cursor.y.min(screen.size.rows - 1);
+        let graphics = prepare_graphics(&screen, self.graphics)?;
+        self.writer
+            .write_all(b"\x1b[?2026h\x1b[?25l\x1b[0m\x1b[2J")?;
+        self.writer.write_all(if screen.reverse_video {
+            b"\x1b[?5h"
+        } else {
+            b"\x1b[?5l"
+        })?;
+        if self.graphics == Graphics::Kitty {
+            self.writer.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")?;
+        }
+        for y in 0..screen.size.rows {
+            render_row(&mut self.writer, &screen, y)?;
+        }
+        self.render_graphics(&graphics)?;
+        write!(
+            self.writer,
+            "\x1b]2;{}\x1b\\\x1b]7;{}\x1b\\",
+            screen.title,
+            screen.directory.as_deref().unwrap_or("")
+        )?;
+        if !self.status.is_empty() {
+            render_status(&mut self.writer, &screen, &self.status)?;
+        }
+        render_cursor(
+            &mut self.writer,
+            &screen,
+            (screen.cursor.x, screen.cursor.y),
+        )?;
+        self.writer.write_all(b"\x1b[?2026l")?;
+        self.writer.flush()?;
         Ok(())
     }
 

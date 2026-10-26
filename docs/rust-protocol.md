@@ -43,6 +43,13 @@ Frames use bounded postcard encoding and zstd compression. Image keys hash their
 dimensions followed by their RGBA bytes. A cache miss explicitly requests the
 missing resources. A base mismatch requests a checkpoint. Application exit has its own final acknowledgement.
 
+Local suspension retains the client input queue, display revision, cached screen,
+and effect acknowledgements. Foreground recovery redraws cached state without
+replaying effects or shell markers. A long suspension uses the same reattachment
+path as network loss. A background client leaves the local terminal to its shell
+and can exit on TERM or HUP. Explicit suspension restores modes before stopping;
+external SIGSTOP cannot provide that cleanup.
+
 `echo_through` advances only after PTY output has been observed following input.
 It is a prediction lifetime bound, not proof that a particular glyph was echoed.
 `PredictionContext` carries mode generation and PTY echo eligibility separately

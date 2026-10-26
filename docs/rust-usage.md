@@ -42,7 +42,12 @@ all remote output. See [the protocol reference](rust-protocol.md).
 
 Press Ctrl-^, then `.` to close the local client, or Ctrl-^, then `q` to end the
 remote command. Ctrl-^, then `^` sends a literal Ctrl-^. Ctrl-^, then `?` shows
-these commands. Reconnection credentials live in the running client process.
+these commands. Press Ctrl-^, then Ctrl-Z to return to the local shell without
+ending the remote command. Run `fg` to restore the session, including its cached
+text and images. Ordinary Ctrl-Z goes to the remote program. A client resumed
+with `bg` waits for `fg` before reading or drawing on the terminal.
+
+Reconnection credentials live in the running client process.
 Closing or crashing that process does not provide a resumable session file.
 An abandoned worker expires after `--idle-seconds`, which defaults to 86400.
 The server also retains unconfirmed final output within this lifetime.

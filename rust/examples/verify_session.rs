@@ -355,7 +355,7 @@ impl View {
             } else {
                 let frame = self.pending.take().expect("complete frame");
                 let desired: BTreeSet<_> = frame.resources.iter().map(|meta| meta.digest).collect();
-                if self.display.install(frame, &self.resources)? {
+                if self.display.install(&frame, &self.resources)? {
                     self.frames += 1;
                     peer.send(ClientMessage::Rendered {
                         epoch: peer.epoch,

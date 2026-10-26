@@ -350,7 +350,7 @@ fn verify_render(graphics: Graphics) -> Result<()> {
     first.rows[2].row.cells.push(tile);
     let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Adaptive);
     display.set_epoch(1);
-    assert!(display.install(first.clone(), &resources)?);
+    assert!(display.install(&first, &resources)?);
     assert_eq!(display.screen().unwrap().rows[0], first.rows[0].row);
     display.predict(1, &printable('X'))?;
     let mut second = frame(2, Some(1), vec![image.meta.clone()]);
@@ -362,8 +362,8 @@ fn verify_render(graphics: Graphics) -> Result<()> {
             stable_id: 1,
         },
     }];
-    assert!(display.install(second.clone(), &resources)?);
-    assert!(!display.install(first, &resources)?);
+    assert!(display.install(&second, &resources)?);
+    assert!(!display.install(&first, &resources)?);
     let effect = Effect {
         id: 1,
         after: 2,
@@ -393,16 +393,34 @@ fn verify_render(graphics: Graphics) -> Result<()> {
     invalid.revision = 3;
     invalid.base = Some(2);
     invalid.rows[0].row.cells[0].text = "\x1b[2J".into();
-    assert!(display.install(invalid, &resources).is_err());
-    let output = display.into_inner();
+    assert!(display.install(&invalid, &resources).is_err());
+    let (cached, output) = display.into_cached();
     assert!(
         output
             .windows(b"\x1b]52;c;aGVsbG8=\x1b\\".len())
             .any(|bytes| bytes == b"\x1b]52;c;aGVsbG8=\x1b\\")
     );
+    let mut display = cached.bind(Vec::new());
+    display.redraw_cached(Size {
+        cols: 4,
+        rows: 2,
+        ..first.size
+    })?;
+    assert_eq!(display.screen().unwrap().size, first.size);
+    let (cached, _) = display.into_cached();
+    let mut display = cached.bind(Vec::new());
+    display.redraw_cached(first.size)?;
+    assert_eq!(display.revision(), 2);
+    assert_eq!(display.effects_applied(), 2);
+    assert_eq!(display.apply_effect(&write, false)?, None);
+    let redraw = display.into_inner();
+    assert!(!redraw.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    assert!(!redraw.windows(6).any(|bytes| bytes == b"\x1b]133;"));
+    assert!(redraw.windows(4).any(|bytes| bytes == b"\x1b]2;"));
+    assert!(redraw.windows(4).any(|bytes| bytes == b"\x1b]7;"));
     let mut term = terminal();
     term.advance_bytes(b"\x1b[?7l");
-    term.advance_bytes(&output);
+    term.advance_bytes(&redraw);
     let lines = visible(&term);
     let cells: Vec<_> = lines[0].visible_cells().collect();
     assert_eq!(cells[0].str(), "R");
@@ -488,7 +506,7 @@ fn verify_prediction_modes() -> Result<()> {
     let mut current = frame(1, None, Vec::new());
     current.prediction.echo_enabled = false;
     current.prediction.alternate_screen = true;
-    assert!(display.install(current.clone(), &BTreeMap::new())?);
+    assert!(display.install(&current, &BTreeMap::new())?);
     for (index, text) in ['a', 'b', 'c'].into_iter().enumerate() {
         let before = capture.0.lock().unwrap().len();
         display.predict(index as u64 + 1, &printable(text))?;
@@ -512,7 +530,7 @@ fn verify_prediction_modes() -> Result<()> {
                 stable_id: 1,
             },
         }];
-        assert!(display.install(current.clone(), &BTreeMap::new())?);
+        assert!(display.install(&current, &BTreeMap::new())?);
     }
     let before = capture.0.lock().unwrap().len();
     display.predict(4, &printable('d'))?;
@@ -524,7 +542,7 @@ fn verify_prediction_modes() -> Result<()> {
     current.revision += 1;
     current.echo_through = 4;
     current.prediction.generation += 1;
-    assert!(display.install(current, &BTreeMap::new())?);
+    assert!(display.install(&current, &BTreeMap::new())?);
     let mut term = terminal();
     term.advance_bytes(&*capture.0.lock().unwrap());
     let lines = visible(&term);
@@ -574,7 +592,7 @@ fn verify_lifecycle() -> Result<()> {
     initial.rows[0].row.cells.push(tile);
     let mut display = Display::new(Vec::new(), Graphics::Kitty, PredictionPolicy::Never);
     display.set_epoch(1);
-    assert!(display.install(initial.clone(), &resources)?);
+    assert!(display.install(&initial, &resources)?);
     display.write_status("reconnecting")?;
     display.write_status("")?;
     let mut removed = frame(2, Some(1), Vec::new());
@@ -583,14 +601,14 @@ fn verify_lifecycle() -> Result<()> {
         row: Row::default(),
     }];
     removed.directory = None;
-    assert!(display.install(removed, &BTreeMap::new())?);
-    assert!(!display.install(initial.clone(), &resources)?);
+    assert!(display.install(&removed, &BTreeMap::new())?);
+    assert!(!display.install(&initial, &resources)?);
     initial.revision = 100;
     initial.epoch = 99;
-    assert!(!display.install(initial, &resources)?);
+    assert!(!display.install(&initial, &resources)?);
     let mut mismatch = frame(3, Some(1), Vec::new());
     mismatch.rows.clear();
-    assert!(!display.install(mismatch, &BTreeMap::new())?);
+    assert!(!display.install(&mismatch, &BTreeMap::new())?);
     assert!(display.needs_checkpoint());
     display.set_effect_floor(4);
     display.set_epoch(2);
@@ -599,7 +617,7 @@ fn verify_lifecycle() -> Result<()> {
     let mut checkpoint = frame(4, None, Vec::new());
     checkpoint.epoch = 2;
     checkpoint.directory = None;
-    assert!(display.install(checkpoint, &BTreeMap::new())?);
+    assert!(display.install(&checkpoint, &BTreeMap::new())?);
     assert!(!display.needs_checkpoint());
     assert_eq!(display.revision(), 4);
     let mut term = terminal();
@@ -656,6 +674,24 @@ fn verify_escape_sequences() -> Result<()> {
     assert_eq!(actions[1], EscapeAction::Close);
     let (_, actions) = escape_actions(b"\x1e?")?;
     assert_eq!(actions[1], EscapeAction::Help);
+    let (_, actions) = escape_actions(b"\x1e\x1a")?;
+    assert_eq!(actions[1], EscapeAction::Suspend);
+    let (events, actions) = escape_actions(b"\x1a")?;
+    assert_eq!(sent_events(actions), events);
+    let (_, actions) = escape_actions(b"\x1b[54;6u\x1b[122;6u")?;
+    assert_eq!(actions[1], EscapeAction::Suspend);
+    let (_, actions) =
+        escape_actions(b"\x1b[94;5u\x1b[94;5:3u\x1b[122;5u\x1b[122;5:2u\x1b[122;5:3u")?;
+    assert_eq!(
+        actions,
+        vec![
+            EscapeAction::Send(Vec::new()),
+            EscapeAction::Send(Vec::new()),
+            EscapeAction::Suspend,
+            EscapeAction::Send(Vec::new()),
+            EscapeAction::Send(Vec::new()),
+        ]
+    );
     let (events, actions) = escape_actions(b"\x1ex")?;
     assert_eq!(
         sent_events(actions),
@@ -770,7 +806,7 @@ fn verify_image_layers() -> Result<()> {
     for graphics in [Graphics::None, Graphics::Kitty] {
         let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
         display.set_epoch(1);
-        assert!(display.install(frame.clone(), &screen.resources)?);
+        assert!(display.install(&frame, &screen.resources)?);
         assert_eq!(
             display
                 .screen()

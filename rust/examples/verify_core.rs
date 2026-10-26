@@ -512,7 +512,7 @@ fn verify_terminal_boundaries() -> Result<()> {
                 display
             });
             for display in &mut displays {
-                assert!(display.install(frame.clone(), &screen.resources)?);
+                assert!(display.install(&frame, &screen.resources)?);
             }
             for (revision, cols) in [(2, 16), (3, 20), (4, 21)] {
                 image.resize(Size {
@@ -526,7 +526,7 @@ fn verify_terminal_boundaries() -> Result<()> {
                 })?;
                 transport::validate_frame(&frame)?;
                 for display in &mut displays {
-                    assert!(display.install(frame.clone(), &screen.resources)?);
+                    assert!(display.install(&frame, &screen.resources)?);
                 }
                 if cols == 16 && column == 19 {
                     assert!(screen.resources.is_empty());
@@ -791,7 +791,7 @@ fn verify_projection_regressions() -> Result<()> {
         let frame = state::frame(1, 1, 0, &screen, None)?;
         let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
         display.set_epoch(1);
-        display.install(frame, &screen.resources)?;
+        display.install(&frame, &screen.resources)?;
         Ok(screen)
     }
     fn small() -> Result<TerminalModel> {
@@ -880,7 +880,7 @@ fn verify_projection_regressions() -> Result<()> {
     for graphics in [Graphics::Kitty, Graphics::Sixel] {
         let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
         display.set_epoch(1);
-        display.install(state::frame(1, 1, 0, &screen, None)?, &screen.resources)?;
+        display.install(&state::frame(1, 1, 0, &screen, None)?, &screen.resources)?;
     }
 
     let mut keyboard = small()?;

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -66,7 +67,9 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(error) => {
-            eprintln!("mosh-rs: {error:#}");
+            if can_report() {
+                eprintln!("mosh-rs: {error:#}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -107,7 +110,9 @@ async fn run() -> Result<i32> {
         )
         .await?
     };
-    eprintln!("mosh-rs: UDP {}:{}", grant.address, grant.port);
+    if can_report() {
+        eprintln!("mosh-rs: UDP {}:{}", grant.address, grant.port);
+    }
     let endpoint = identity.endpoint(&grant)?;
     let graphics = match args.graphics {
         GraphicsArg::Auto => Graphics::detect(),
@@ -130,4 +135,8 @@ async fn run() -> Result<i32> {
         },
     )
     .await
+}
+
+fn can_report() -> bool {
+    !std::io::stderr().is_terminal() || LocalTerminal::foreground().unwrap_or(true)
 }

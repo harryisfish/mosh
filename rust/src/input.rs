@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -26,6 +26,7 @@ pub enum EscapeAction {
     Detach,
     Close,
     Help,
+    Suspend,
 }
 
 struct PendingEscape {
@@ -87,6 +88,7 @@ impl EscapeSequence {
         }
         let suffix = escape_suffix(key);
         let action = match suffix {
+            Some('\x1a') => EscapeAction::Suspend,
             Some('.') => EscapeAction::Detach,
             Some('q') => EscapeAction::Close,
             Some('?') => EscapeAction::Help,
@@ -137,6 +139,12 @@ fn is_escape_prefix(key: &Key) -> bool {
 fn escape_suffix(key: &Key) -> Option<char> {
     if is_escape_prefix(key) {
         return Some('^');
+    }
+    if key.modifiers & !(1 | 4 | 64 | 128) == 0
+        && key.modifiers & 4 != 0
+        && matches!(key.code, KeyCode::Char('z' | 'Z'))
+    {
+        return Some('\x1a');
     }
     if key.modifiers & !(1 | 64 | 128) != 0 {
         return None;
@@ -763,15 +771,24 @@ fn string_end(bytes: &[u8]) -> Option<(usize, usize)> {
 
 pub struct LocalTerminal {
     tty: File,
-    saved: libc::termios,
+    saved: Option<libc::termios>,
 }
 
 impl LocalTerminal {
+    pub fn foreground() -> io::Result<bool> {
+        let group = unsafe { libc::tcgetpgrp(0) };
+        if group == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(group == unsafe { libc::getpgrp() })
+    }
+
     pub fn enter() -> Result<Self> {
         ensure!(
             unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 },
             "mosh-rs requires a terminal on stdin and stdout"
         );
+        require_foreground()?;
         let tty = OpenOptions::new()
             .read(true)
             .write(true)
@@ -794,12 +811,49 @@ impl LocalTerminal {
             "set raw terminal modes: {}",
             io::Error::last_os_error()
         );
-        let mut guard = Self { tty, saved };
+        let mut guard = Self {
+            tty,
+            saved: Some(saved),
+        };
         if let Err(error) = guard.tty.write_all(b"\x1b[22;0t\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1006h\x1b[>31u\x1b[?25l").and_then(|_| guard.tty.flush()) {
             drop(guard);
             return Err(error).context("enable terminal input modes");
         }
         Ok(guard)
+    }
+
+    pub fn reassert_owned_modes(&mut self) -> Result<()> {
+        require_foreground()?;
+        let mut raw = self.saved.context("terminal modes have been released")?;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        ensure!(
+            unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &raw) } == 0,
+            "restore raw terminal modes: {}",
+            io::Error::last_os_error()
+        );
+        self.tty.write_all(
+            b"\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1006h\x1b[=31u\x1b[?25l",
+        )?;
+        self.tty.flush()?;
+        Ok(())
+    }
+
+    pub fn release(&mut self) -> Result<()> {
+        if self.saved.is_none() {
+            return Ok(());
+        }
+        require_foreground()?;
+        let saved = self.saved.take().expect("owned terminal modes");
+        let output = self.tty.write_all(b"\x1b[?2026l\x1b_Ga=d,d=A,q=2\x1b\\\x1b[<u\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b]8;;\x1b\\\x1b[0m\x1b[?5l\x1b[?25h\x1b[?7h\x1b[?1049l\x1b[23;0t")
+            .and_then(|_| self.tty.flush());
+        let restored = unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &saved) };
+        output?;
+        ensure!(
+            restored == 0,
+            "restore terminal modes: {}",
+            io::Error::last_os_error()
+        );
+        Ok(())
     }
 
     pub fn size() -> Result<Size> {
@@ -823,10 +877,61 @@ impl LocalTerminal {
 
 impl Drop for LocalTerminal {
     fn drop(&mut self) {
-        let _ = self.tty.write_all(b"\x1b[?2026l\x1b_Ga=d,d=A,q=2\x1b\\\x1b[<u\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b]8;;\x1b\\\x1b[0m\x1b[?5l\x1b[?25h\x1b[?7h\x1b[?1049l\x1b[23;0t");
-        let _ = self.tty.flush();
-        unsafe {
-            libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &self.saved);
+        let _ = self.release();
+    }
+}
+
+#[derive(Debug)]
+struct ForegroundLost;
+
+impl std::fmt::Display for ForegroundLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("local terminal is no longer in the foreground")
+    }
+}
+impl std::error::Error for ForegroundLost {}
+
+fn require_foreground() -> io::Result<()> {
+    if !LocalTerminal::foreground()? {
+        return Err(io::Error::other(ForegroundLost));
+    }
+    Ok(())
+}
+
+pub fn foreground_lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<ForegroundLost>())
+        })
+    })
+}
+
+pub struct TtyOutput(Option<BufWriter<File>>);
+
+impl TtyOutput {
+    pub fn new() -> Result<Self> {
+        let tty = OpenOptions::new().write(true).open("/dev/tty")?;
+        Ok(Self(Some(BufWriter::new(tty))))
+    }
+}
+
+impl Write for TtyOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        require_foreground()?;
+        self.0.as_mut().expect("terminal output").write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        require_foreground()?;
+        self.0.as_mut().expect("terminal output").flush()
+    }
+}
+
+impl Drop for TtyOutput {
+    fn drop(&mut self) {
+        if let Some(writer) = self.0.take() {
+            let _ = writer.into_parts();
         }
     }
 }
