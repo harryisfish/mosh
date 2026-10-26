@@ -578,20 +578,34 @@ impl Drop for CancellableStream {
     }
 }
 
-pub async fn send_frame(connection: &Connection, frame: &Frame) -> Result<()> {
-    validate_frame(frame)?;
-    let bytes = postcard::to_allocvec(frame)?;
-    ensure!(bytes.len() <= MAX_FRAME, "display frame exceeds limit");
-    let compressed = zstd::bulk::compress(&bytes, 1)?;
-    ensure!(
-        compressed.len() <= MAX_FRAME,
-        "compressed frame exceeds limit"
-    );
-    let mut stream = CancellableStream(Some(connection.open_uni().await?));
-    stream.stream().set_priority(0)?;
-    stream.stream().write_all(&[FRAME_STREAM]).await?;
-    stream.stream().write_all(&compressed).await?;
-    stream.complete().await
+pub struct EncodedFrame {
+    compressed: Vec<u8>,
+}
+
+impl EncodedFrame {
+    pub fn new(frame: &Frame) -> Result<Self> {
+        validate_frame(frame)?;
+        let bytes = postcard::to_allocvec(frame)?;
+        ensure!(bytes.len() <= MAX_FRAME, "display frame exceeds limit");
+        let compressed = zstd::bulk::compress(&bytes, 1)?;
+        ensure!(
+            compressed.len() <= MAX_FRAME,
+            "compressed frame exceeds limit"
+        );
+        Ok(Self { compressed })
+    }
+
+    pub fn compressed_len(&self) -> usize {
+        self.compressed.len()
+    }
+
+    pub async fn send(self, connection: &Connection) -> Result<()> {
+        let mut stream = CancellableStream(Some(connection.open_uni().await?));
+        stream.stream().set_priority(0)?;
+        stream.stream().write_all(&[FRAME_STREAM]).await?;
+        stream.stream().write_all(&self.compressed).await?;
+        stream.complete().await
+    }
 }
 
 pub async fn send_resource(connection: &Connection, resource: &Resource) -> Result<()> {

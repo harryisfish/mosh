@@ -10,8 +10,8 @@ use mosh_rs::model::{
     ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
-    ClientEndpoints, ClientIdentity, Incoming, bootstrap_local, connect, listen, read_request,
-    receive_uni, recv_message, send_frame, send_message, send_resource, spawn_worker,
+    ClientEndpoints, ClientIdentity, EncodedFrame, Incoming, bootstrap_local, connect, listen,
+    read_request, receive_uni, recv_message, send_message, send_resource, spawn_worker,
     validate_frame, write_grant,
 };
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
@@ -581,7 +581,7 @@ async fn verify() -> Result<()> {
     cancelled.reset(VarInt::from_u32(0x10))?;
     let frame_sender = tokio::spawn({
         let connection = server_connection.clone();
-        async move { send_frame(&connection, &frame()).await }
+        async move { EncodedFrame::new(&frame())?.send(&connection).await }
     });
     let incoming = receive_uni(&client_connection).await?;
     ensure!(
