@@ -123,7 +123,15 @@ case "$install_dir" in
 	-*) die 'install directory cannot start with -' ;;
 esac
 
-target=$(resolve_target "$(uname -s)" "$(uname -m)")
+os=$(uname -s)
+arch=$(uname -m)
+if [[ "$os" == Linux ]]; then
+	for loader in /lib/ld-musl-*.so.1 /lib64/ld-musl-*.so.1; do
+		[[ -e "$loader" ]] || continue
+		die "musl Linux is not supported by this release; build mosh-rs from source"
+	done
+fi
+target=$(resolve_target "$os" "$arch")
 if [[ "$version" == latest ]]; then
 	version=$(resolve_latest_version)
 else

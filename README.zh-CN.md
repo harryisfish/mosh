@@ -69,8 +69,8 @@ export PATH="$HOME/.local/bin:$PATH"
 请在客户端和远端主机分别运行安装脚本。每台主机会选择自己的目标平台。
 两端必须使用同一版本。Rust 版不兼容原版 Mosh 协议。
 
-Linux x86_64 包在 Ubuntu 22.04 上构建，arm64 包在 Ubuntu 24.04 上构建。
-更旧的系统请从源码构建。macOS 二进制文件未签名。
+Linux x86_64 包在 Ubuntu 22.04 上构建，arm64 包在 Ubuntu 24.04 上构建，
+并需要 glibc。musl 系统或更旧的系统请从源码构建。macOS 二进制文件未签名。
 
 ## 连接
 

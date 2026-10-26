@@ -74,8 +74,9 @@ Run the installer on the client and the remote host. Each host selects its own
 target. Both endpoints must use the same release. This Rust version does not
 speak the original Mosh wire protocol.
 
-Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64.
-Build from source for older systems. The macOS binaries are unsigned.
+Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64,
+and require glibc. Build from source on musl systems or older systems. The macOS
+binaries are unsigned.
 
 ## Connect
 
