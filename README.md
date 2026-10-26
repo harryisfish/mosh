@@ -3,8 +3,9 @@
 Mosh: the mobile shell
 ======================
 
-The Rust client and server are built with `cargo build --release --locked`.
-They use a new authenticated protocol and must be installed together.
+Download the Rust client and server for Linux or macOS from
+[GitHub Releases](https://github.com/harryisfish/mosh/releases), or build them
+with `cargo build --release --locked`. Install both endpoints from the same release.
 See [the Rust usage guide](docs/rust-usage.md) for commands, terminal capabilities,
 reconnection behavior, and verification. The existing C++ commands remain available.
 
