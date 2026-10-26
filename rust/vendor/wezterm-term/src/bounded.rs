@@ -1,12 +1,14 @@
 use anyhow::{Result, ensure};
 use std::borrow::Cow;
 use std::convert::TryInto;
+use wezterm_escape_parser::csi::Edit;
 use wezterm_escape_parser::osc::{ITermProprietary, OperatingSystemCommand};
-use wezterm_escape_parser::{Action, DeviceControlMode, Sixel, SixelData};
+use wezterm_escape_parser::{Action, DeviceControlMode, Sixel, SixelData, CSI};
 
 pub const MAX_IMAGE: usize = 16 * 1024 * 1024;
 pub const MAX_IMAGES: usize = 64 * 1024 * 1024;
 pub const MAX_STRING: usize = 24 * 1024 * 1024;
+const MAX_REPEAT_CELLS: u32 = 32 * 1024;
 
 #[derive(Default)]
 pub struct ParserBudget {
@@ -112,6 +114,9 @@ pub fn sixel_dimensions(sixel: &Sixel) -> Result<(u32, u32)> {
 
 pub fn validate_action(action: &Action) -> Result<()> {
     match action {
+        Action::CSI(CSI::Edit(Edit::Repeat(n))) => {
+            ensure!(*n <= MAX_REPEAT_CELLS, "REP exceeds per-action write limit");
+        }
         Action::Sixel(sixel) => {
             sixel_dimensions(sixel)?;
         }

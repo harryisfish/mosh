@@ -1916,53 +1916,40 @@ impl TerminalState {
     }
 
     fn checksum_rectangle(&mut self, left: u32, top: u32, right: u32, bottom: u32) -> u16 {
+        if left > right || top > bottom {
+            return 0;
+        }
         let y_origin = if self.dec_origin_mode {
-            self.top_and_bottom_margins.start
+            self.top_and_bottom_margins.start as u64
         } else {
             0
-        } as u32;
+        };
         let x_origin = if self.dec_origin_mode {
-            self.left_and_right_margins.start
+            self.left_and_right_margins.start as u64
         } else {
             0
         };
         let screen = self.screen_mut();
-        let mut checksum = 0;
-        /*
-        debug!(
-            "checksum left={} top={} right={} bottom={}",
-            left as usize + x_origin,
-            top + y_origin,
-            right as usize + x_origin,
-            bottom + y_origin
-        );
-        */
-
-        for y in top..=bottom {
-            let line_idx = screen.phys_row(VisibleRowIndex::from(y_origin + y));
-            let line = screen.line_mut(line_idx);
-            for cell in line.visible_cells().skip(x_origin + left as usize) {
-                if cell.cell_index() > x_origin + right as usize {
-                    break;
-                }
-
-                let ch = cell.str().chars().next().unwrap() as u32;
-                // debug!("y={} col={} ch={:x} cell={:?}", y + y_origin, col, ch, cell);
-
-                checksum += u16::from(ch as u8);
+        let rows = (y_origin + u64::from(top)).min(screen.physical_rows as u64)
+            ..(y_origin + u64::from(bottom) + 1).min(screen.physical_rows as u64);
+        let cols = (x_origin + u64::from(left)).min(screen.physical_cols as u64)
+            ..(x_origin + u64::from(right) + 1).min(screen.physical_cols as u64);
+        if rows.is_empty() || cols.is_empty() {
+            return 0;
+        }
+        let mut checksum = 0u16;
+        for y in rows {
+            let line_idx = screen.phys_row(y as VisibleRowIndex);
+            let cells = screen.line_mut(line_idx).cells_mut();
+            for x in cols.clone() {
+                let ch = cells
+                    .get(x as usize)
+                    .and_then(|cell| cell.str().chars().next())
+                    .unwrap_or(' ');
+                checksum = checksum.wrapping_add(u16::from(ch as u8));
             }
         }
-
-        // Treat uninitialized cells as spaces.
-        // The concept of uninitialized cells in wezterm is not the same as that on VT520 or that
-        // on xterm, so, to prevent a lot of noise in esctest, treat them as spaces, at least when
-        // asking for the checksum of a single cell (which is what esctest does).
-        // See: https://github.com/wezterm/wezterm/pull/4565
-        if checksum == 0 {
-            32u16
-        } else {
-            checksum
-        }
+        checksum
     }
 
     fn perform_csi_window(&mut self, window: Window) {
@@ -2100,11 +2087,11 @@ impl TerminalState {
 
                 if x >= self.left_and_right_margins.start && x < self.left_and_right_margins.end {
                     let right_margin = self.left_and_right_margins.end;
-                    let limit = (x + n as usize).min(right_margin);
+                    let count = (n as usize).min(right_margin - x);
 
                     let blank_attr = self.pen.clone_sgr_only();
                     let screen = self.screen_mut();
-                    for _ in x..limit as usize {
+                    for _ in 0..count {
                         screen.erase_cell(x, y, right_margin, seqno, blank_attr.clone());
                     }
                 }
@@ -2174,8 +2161,9 @@ impl TerminalState {
                     && self.left_and_right_margins.contains(&x)
                 {
                     let margin = self.left_and_right_margins.end;
+                    let count = (n as usize).min(margin - x);
                     let screen = self.screen_mut();
-                    for _ in 0..n as usize {
+                    for _ in 0..count {
                         screen.insert_cell(x, y, margin, seqno);
                     }
                 }
@@ -2316,16 +2304,24 @@ impl TerminalState {
 
             Cursor::ForwardTabulation(n) => {
                 for _ in 0..n {
+                    let x = self.cursor.x;
                     self.c0_horizontal_tab();
+                    if self.cursor.x == x {
+                        break;
+                    }
                 }
             }
             Cursor::BackwardTabulation(n) => {
                 for _ in 0..n {
+                    let previous_x = self.cursor.x;
                     let x = match self.tabs.find_prev_tab_stop(self.cursor.x) {
                         Some(x) => x,
                         None => 0,
                     };
                     self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Relative(0));
+                    if self.cursor.x == previous_x {
+                        break;
+                    }
                 }
             }
 

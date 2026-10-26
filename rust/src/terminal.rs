@@ -288,12 +288,23 @@ impl TerminalModel {
         for (y, line) in lines.iter().enumerate() {
             let mut cells = Vec::new();
             for cell in line.visible_cells() {
+                if cell.cell_index() >= usize::from(self.size.cols) {
+                    break;
+                }
+                let width = cell
+                    .width()
+                    .min(usize::from(self.size.cols) - cell.cell_index());
+                let text = if width < cell.width() {
+                    " "
+                } else {
+                    cell.str()
+                };
                 ensure!(
-                    cell.str().len() <= MAX_CELL_BYTES,
+                    text.len() <= MAX_CELL_BYTES,
                     "grapheme exceeds snapshot limit"
                 );
                 let attrs = cell.attrs();
-                let string_bytes = cell.str().len()
+                let string_bytes = text.len()
                     + attrs.hyperlink().map_or(0, |link| {
                         link.uri().len()
                             + link
@@ -400,8 +411,8 @@ impl TerminalModel {
                 };
                 let projected = Cell {
                     x: cell.cell_index() as u16,
-                    text: cell.str().to_owned(),
-                    width: cell.width() as u8,
+                    text: text.to_owned(),
+                    width: width as u8,
                     style: Style {
                         fg: resolved_color(attrs.foreground(), &palette, palette.foreground),
                         bg: resolved_color(attrs.background(), &palette, palette.background),

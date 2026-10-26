@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use mosh_rs::model::*;
 use mosh_rs::terminal::TerminalModel;
@@ -405,7 +405,10 @@ fn main() -> Result<()> {
 }
 
 fn verify_terminal_boundaries() -> Result<()> {
-    use mosh_rs::{state, transport};
+    use mosh_rs::{
+        display::{Display, Graphics, PredictionPolicy},
+        state, transport,
+    };
 
     let size = Size {
         cols: 80,
@@ -456,23 +459,33 @@ fn verify_terminal_boundaries() -> Result<()> {
         encoder.write_header()?.write_image_data(&rgba)?;
     }
     let commands = [
-        format!(
-            "\x1b_Ga=T,f=32,s=210,v=1;{}\x1b\\",
-            base64::engine::general_purpose::STANDARD.encode(&rgba)
+        (
+            "Kitty",
+            format!(
+                "\x1b_Ga=T,f=32,s=210,v=1;{}\x1b\\",
+                base64::engine::general_purpose::STANDARD.encode(&rgba)
+            ),
         ),
-        format!(
-            "\x1b]1337;File=inline=1:{}\x1b\\",
-            base64::engine::general_purpose::STANDARD.encode(&png)
+        (
+            "iTerm",
+            format!(
+                "\x1b]1337;File=inline=1;width=210px;height=1px;preserveAspectRatio=0:{}\x1b\\",
+                base64::engine::general_purpose::STANDARD.encode(&png)
+            ),
         ),
-        "\x1bPq#1;2;100;0;0#1!210~\x1b\\".into(),
+        ("SIXEL", "\x1bPq#1;2;100;0;0#1!210~\x1b\\".into()),
     ];
-    for command in commands {
+    for (kind, command) in commands {
         for column in [1, 19] {
             let mut image = TerminalModel::new(size, false)?;
-            image.advance(format!("\x1b[1;{column}H{command}").as_bytes())?;
+            image
+                .advance(format!("\x1b[1;{column}H{command}").as_bytes())
+                .with_context(|| format!("{kind} native image input at column {column}"))?;
             let screen = image.snapshot()?;
-            let frame = state::frame(1, 1, 0, &screen, None)?;
-            transport::validate_frame(&frame)?;
+            let frame = state::frame(1, 1, 0, &screen, None)
+                .with_context(|| format!("{kind} native image at column {column}"))?;
+            transport::validate_frame(&frame)
+                .with_context(|| format!("{kind} native image validation at column {column}"))?;
             assert!(
                 screen
                     .rows
@@ -492,15 +505,60 @@ fn verify_terminal_boundaries() -> Result<()> {
                     .iter()
                     .all(|tile| tile.source[0] + tile.source[2] < 210)
             );
-            image.resize(Size {
-                cols: 16,
-                pixel_width: 160,
-                ..size
-            })?;
-            let screen = image.snapshot()?;
-            transport::validate_frame(&state::frame(1, 2, 0, &screen, None)?)?;
+            let original = screen.rows.clone();
+            let mut displays = [Graphics::Kitty, Graphics::Sixel].map(|graphics| {
+                let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+                display.set_epoch(1);
+                display
+            });
+            for display in &mut displays {
+                assert!(display.install(frame.clone(), &screen.resources)?);
+            }
+            for (revision, cols) in [(2, 16), (3, 20), (4, 21)] {
+                image.resize(Size {
+                    cols,
+                    pixel_width: u32::from(cols) * 10,
+                    ..size
+                })?;
+                let screen = image.snapshot()?;
+                let frame = state::frame(1, revision, 0, &screen, None).with_context(|| {
+                    format!("{kind} image at {cols} columns from column {column}")
+                })?;
+                transport::validate_frame(&frame)?;
+                for display in &mut displays {
+                    assert!(display.install(frame.clone(), &screen.resources)?);
+                }
+                if cols == 16 && column == 19 {
+                    assert!(screen.resources.is_empty());
+                } else if cols == 20 {
+                    assert_eq!(screen.rows, original);
+                } else if cols == 21 {
+                    assert!(
+                        screen
+                            .rows
+                            .iter()
+                            .flat_map(|row| &row.cells)
+                            .any(|cell| { cell.x == 20 && !cell.images.is_empty() })
+                    );
+                }
+            }
         }
     }
+
+    let mut narrow = TerminalModel::new(Size { cols: 2, ..size }, false)?;
+    narrow.advance("界".as_bytes())?;
+    narrow.resize(Size { cols: 1, ..size })?;
+    let screen = narrow.snapshot()?;
+    transport::validate_frame(&state::frame(1, 1, 0, &screen, None)?)?;
+    assert_eq!(
+        (
+            screen.rows[0].cells[0].text.as_str(),
+            screen.rows[0].cells[0].width
+        ),
+        (" ", 1)
+    );
+    narrow.resize(Size { cols: 2, ..size })?;
+    assert_eq!(narrow.snapshot()?.rows[0].cells[0].text, "界");
 
     let mut controls = TerminalModel::new(size, false)?;
     controls.advance(b"\x1b[20G\x1b[4294967295D")?;
@@ -535,6 +593,18 @@ fn verify_terminal_boundaries() -> Result<()> {
         (reverse.snapshot()?.cursor.x, reverse.snapshot()?.cursor.y),
         (1, 2)
     );
+    let mut repeat = TerminalModel::new(size, false)?;
+    repeat.advance(b"X\x1b[32768b")?;
+    let screen = repeat.snapshot()?;
+    transport::validate_frame(&state::frame(1, 1, 0, &screen, None)?)?;
+    for count in [32769u32, u32::MAX] {
+        let mut repeat = TerminalModel::new(size, false)?;
+        assert!(
+            repeat
+                .advance(format!("X\x1b[{count}b").as_bytes())
+                .is_err()
+        );
+    }
     println!("rectangle checksums, clipped native images and bounded control counts passed");
     Ok(())
 }

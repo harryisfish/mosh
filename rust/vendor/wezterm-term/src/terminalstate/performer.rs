@@ -7,6 +7,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use log::{debug, error};
 use num_traits::FromPrimitive;
 use ordered_float::NotNan;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
@@ -555,6 +556,40 @@ impl<'a> Performer<'a> {
         }
     }
 
+    fn cursor_left(&mut self, mut n: u32) {
+        let state_limit = self
+            .screen()
+            .physical_cols
+            .saturating_mul(self.screen().physical_rows)
+            .saturating_mul(2);
+        let mut cycles =
+            if self.reverse_wraparound_mode && self.dec_auto_wrap && n as usize > state_limit {
+                let mut seen = HashMap::new();
+                seen.insert((self.cursor.x, self.cursor.y, self.wrap_next), 0u32);
+                Some(seen)
+            } else {
+                None
+            };
+        let mut steps = 0u32;
+        while n > 0 {
+            let previous = (self.cursor.x, self.cursor.y, self.wrap_next);
+            self.control(ControlCode::Backspace);
+            n -= 1;
+            steps += 1;
+            let current = (self.cursor.x, self.cursor.y, self.wrap_next);
+            if current == previous {
+                break;
+            }
+            if let Some(seen) = cycles.as_mut() {
+                if let Some(first) = seen.insert(current, steps) {
+                    // Execute a real cycle before skipping its idempotent side effects.
+                    n %= steps - first;
+                    cycles = None;
+                }
+            }
+        }
+    }
+
     fn csi_dispatch(&mut self, csi: CSI) {
         self.pop_tmux_title_state();
         self.flush_print();
@@ -564,9 +599,7 @@ impl<'a> Performer<'a> {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
                 // <https://github.com/wezterm/wezterm/issues/1273>
-                for _ in 0..n {
-                    self.control(ControlCode::Backspace);
-                }
+                self.cursor_left(n);
             }
             CSI::Cursor(cursor) => self.state.perform_csi_cursor(cursor),
             CSI::Edit(edit) => self.state.perform_csi_edit(edit),
@@ -623,9 +656,8 @@ impl<'a> Performer<'a> {
                 }
             }
             CSI::Keyboard(Keyboard::PopKittyState(n)) => {
-                for _ in 0..n {
-                    self.screen_mut().keyboard_stack.pop();
-                }
+                let stack = &mut self.screen_mut().keyboard_stack;
+                stack.truncate(stack.len().saturating_sub(n as usize));
             }
             CSI::Keyboard(Keyboard::QueryKittySupport) => {
                 if self.config.enable_kitty_keyboard() {

@@ -28,6 +28,11 @@ compatibility and is not the application's entry point.
 - Bound user variables, Unicode mode stacks and accumulated titles. Join
   graphemes across PTY reads, with a 64-byte bound per grapheme.
 - Return Kitty success replies for explicit image IDs as well as image numbers.
+- Intersect rectangular checksum queries with the viewport and sum modulo 65536.
+  Count physical columns, including blank cells and wide-character continuations.
+- Stop cursor and tab loops at their fixed point. Reverse-wrap cursor movement
+  skips complete cycles after executing one cycle. Insert/delete operations use
+  the remaining margin width, and Kitty keyboard pops truncate the stack.
 
 # Budgets and error behavior
 
@@ -56,6 +61,12 @@ ICC color management is outside this static profile. Discarded metadata and its
 CRC are ignored; retained chunks follow the decoder's existing tolerance rules.
 The decoder budget is still a dependency limit, not a total allocation or RSS cap.
 OSC/APC strings are at most 24 MiB; SIXEL/DCS parser input is at most 256 KiB.
+One REP action writes at most 32768 cells. Larger counts return an error.
+
+Core lines may retain columns outside the current viewport after resize or image
+placement. The adapter exports only visible columns without trimming core storage.
+A wide glyph crossing the right edge exports a space until both columns fit.
+Hidden image tiles remain available when the window grows again.
 
 The adapter's exported image cache is a separate maximum of 64 MiB. Its immutable
 RGBA Arcs are shared by display roots and transfers; they are not copied every
