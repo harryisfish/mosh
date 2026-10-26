@@ -9,9 +9,8 @@ interruptions, client sleep, or a change of network. Local input prediction
 reduces typing latency. SSH authenticates and starts the server, then terminal
 state travels over QUIC.
 
-This is a fork of [Mosh](https://github.com/mobile-shell/mosh). The Rust commands
-are `mosh-rs` and `mosh-rs-server`. The original C++ implementation remains in
-this repository.
+This project is a Rust rewrite of [Mosh](https://github.com/mobile-shell/mosh).
+The client and server are `mosh-rs` and `mosh-rs-server`.
 
 The Rust pair uses protocol v2 and is not compatible with the original Mosh wire
 protocol or Rust protocol v1. Install both endpoints from the same release.
@@ -144,12 +143,10 @@ Further documentation:
 - [Rust protocol reference](docs/rust-protocol.md)
 - [Mac mini acceptance report](docs/rust-macmini-verification.md)
 
-## Original C++ Mosh
+## Origin and license
 
-The original `mosh`, `mosh-client`, and `mosh-server` commands remain separate
-from the Rust pair. For their installation, usage, and source-build instructions,
-see [mosh.org](https://mosh.org/) and the
-[upstream repository](https://github.com/mobile-shell/mosh).
+This project is based on [Mosh](https://mosh.org/). See [AUTHORS](AUTHORS) and
+[THANKS](THANKS) for the upstream authors and acknowledgements.
 
 This project is licensed under [GPL-3.0-or-later](COPYING). The vendored WezTerm
 terminal core retains its [MIT license](rust/vendor/wezterm-term/LICENSE.md).

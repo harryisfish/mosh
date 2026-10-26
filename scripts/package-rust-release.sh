@@ -16,7 +16,7 @@ mkdir -p "$stage/$package/bin" "$stage/$package/docs" \
   "$stage/$package/rust/vendor/wezterm-term" "$output_dir"
 cp "$build_root/$release_target/release/mosh-rs" \
   "$build_root/$release_target/release/mosh-rs-server" "$stage/$package/bin/"
-cp README.md README.zh-CN.md COPYING "$stage/$package/"
+cp README.md README.zh-CN.md COPYING AUTHORS THANKS "$stage/$package/"
 cp docs/rust-usage.md docs/rust-protocol.md docs/rust-macmini-verification.md \
   "$stage/$package/docs/"
 cp rust/vendor/wezterm-term/LICENSE.md rust/vendor/wezterm-term/MOSH_PATCHES.md \

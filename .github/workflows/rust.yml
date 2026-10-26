@@ -1,10 +1,6 @@
 name: rust
 
-on:
-  push:
-    paths: ['rust/**', 'Cargo.toml', 'Cargo.lock', 'scripts/verify-rust-cli.py', 'scripts/package-rust-release.sh', '.github/workflows/rust.yml', '.github/workflows/rust-release.yml']
-  pull_request:
-    paths: ['rust/**', 'Cargo.toml', 'Cargo.lock', 'scripts/verify-rust-cli.py', 'scripts/package-rust-release.sh', '.github/workflows/rust.yml', '.github/workflows/rust-release.yml']
+on: [push, pull_request]
 
 permissions:
   contents: read
