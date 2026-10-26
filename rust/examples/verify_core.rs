@@ -60,6 +60,7 @@ fn model() -> TerminalModel {
     .unwrap()
 }
 fn main() -> Result<()> {
+    verify_terminal_boundaries()?;
     verify_png_metadata()?;
     verify_projection_regressions()?;
     verify_scrollback_wrap()?;
@@ -400,6 +401,141 @@ fn main() -> Result<()> {
     println!(
         "query/file/shared-memory/animation/dimensions/repeat limits, unplaced upload, collector sticky error, parser limit passed"
     );
+    Ok(())
+}
+
+fn verify_terminal_boundaries() -> Result<()> {
+    use mosh_rs::{state, transport};
+
+    let size = Size {
+        cols: 80,
+        rows: 24,
+        pixel_width: 800,
+        pixel_height: 480,
+    };
+    let mut query = TerminalModel::new(size, false)?;
+    for row in 1..=24 {
+        query.advance(format!("\x1b[{row};1H{}", "X".repeat(80)).as_bytes())?;
+    }
+    for command in [b"\x1b[7;1;1;1;24;80*y".as_slice(), b"\x1b[7;1;1;1;25;80*y"] {
+        assert_eq!(query.advance(command)?.replies, b"\x1bP7!~9400\x1b\\");
+    }
+    for command in [b"\x1b[7;1;25;1;26;80*y".as_slice(), b"\x1b[7;1;2;2;1;1*y"] {
+        assert_eq!(query.advance(command)?.replies, b"\x1bP7!~0000\x1b\\");
+    }
+    let mut wide = TerminalModel::new(size, false)?;
+    wide.advance("界A".as_bytes())?;
+    assert_eq!(
+        wide.advance(b"\x1b[1;1;1;3;1;3*y")?.replies,
+        b"\x1bP1!~0041\x1b\\"
+    );
+    let mut blank = TerminalModel::new(
+        Size {
+            cols: 64,
+            rows: 32,
+            ..size
+        },
+        false,
+    )?;
+    assert_eq!(
+        blank.advance(b"\x1b[2;1;1;1;32;64*y")?.replies,
+        b"\x1bP2!~0000\x1b\\"
+    );
+
+    let size = Size {
+        cols: 20,
+        rows: 4,
+        pixel_width: 200,
+        pixel_height: 80,
+    };
+    let rgba = [10, 20, 30, 255].repeat(210);
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, 210, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.write_header()?.write_image_data(&rgba)?;
+    }
+    let commands = [
+        format!(
+            "\x1b_Ga=T,f=32,s=210,v=1;{}\x1b\\",
+            base64::engine::general_purpose::STANDARD.encode(&rgba)
+        ),
+        format!(
+            "\x1b]1337;File=inline=1:{}\x1b\\",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        ),
+        "\x1bPq#1;2;100;0;0#1!210~\x1b\\".into(),
+    ];
+    for command in commands {
+        for column in [1, 19] {
+            let mut image = TerminalModel::new(size, false)?;
+            image.advance(format!("\x1b[1;{column}H{command}").as_bytes())?;
+            let screen = image.snapshot()?;
+            let frame = state::frame(1, 1, 0, &screen, None)?;
+            transport::validate_frame(&frame)?;
+            assert!(
+                screen
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .all(|cell| usize::from(cell.x) + usize::from(cell.width) <= 20)
+            );
+            let tiles: Vec<_> = screen
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .flat_map(|cell| &cell.images)
+                .collect();
+            assert!(!tiles.is_empty());
+            assert!(
+                tiles
+                    .iter()
+                    .all(|tile| tile.source[0] + tile.source[2] < 210)
+            );
+            image.resize(Size {
+                cols: 16,
+                pixel_width: 160,
+                ..size
+            })?;
+            let screen = image.snapshot()?;
+            transport::validate_frame(&state::frame(1, 2, 0, &screen, None)?)?;
+        }
+    }
+
+    let mut controls = TerminalModel::new(size, false)?;
+    controls.advance(b"\x1b[20G\x1b[4294967295D")?;
+    assert_eq!(controls.snapshot()?.cursor.x, 0);
+    controls.advance(b"\x1b[4294967295I")?;
+    assert_eq!(controls.snapshot()?.cursor.x, 19);
+    controls.advance(b"\x1b[4294967295Z")?;
+    assert_eq!(controls.snapshot()?.cursor.x, 0);
+    controls.advance(b"abc\r\x1b[4294967295@")?;
+    assert!(
+        controls.snapshot()?.rows[0]
+            .cells
+            .iter()
+            .all(|cell| cell.text == " ")
+    );
+    assert_eq!(
+        controls
+            .advance(b"\x1b[>31u\x1b[<4294967295u\x1b[?u")?
+            .replies,
+        b"\x1b[?0u"
+    );
+    let mut reverse = TerminalModel::new(
+        Size {
+            cols: 4,
+            rows: 3,
+            ..size
+        },
+        false,
+    )?;
+    reverse.advance(b"\x1b[?45h\x1b[4294967295D")?;
+    assert_eq!(
+        (reverse.snapshot()?.cursor.x, reverse.snapshot()?.cursor.y),
+        (1, 2)
+    );
+    println!("rectangle checksums, clipped native images and bounded control counts passed");
     Ok(())
 }
 
