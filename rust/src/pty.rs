@@ -1,17 +1,18 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, Stdio};
+use std::os::unix::process::ExitStatusExt;
+use std::process::Stdio;
 
 use anyhow::{Context, Result, ensure};
 use tokio::io::unix::AsyncFd;
+use tokio::process::{Child, Command};
 
 use crate::model::Size;
 
 pub struct Pty {
     pub io: AsyncFd<OwnedFd>,
-    child: Child,
+    child: Option<Child>,
     exited: Option<i32>,
 }
 
@@ -95,11 +96,12 @@ impl Pty {
                 Ok(())
             });
         }
+        command.kill_on_drop(true);
         let io = unsafe { AsyncFd::register(master) }?;
         let child = command.spawn().context("start remote command")?;
         Ok(Self {
             io,
-            child,
+            child: Some(child),
             exited: None,
         })
     }
@@ -148,7 +150,8 @@ impl Pty {
 
     pub fn poll_exit(&mut self) -> Result<Option<i32>> {
         if self.exited.is_none()
-            && let Some(status) = self.child.try_wait()?
+            && let Some(child) = self.child.as_mut()
+            && let Some(status) = child.try_wait()?
         {
             self.exited = Some(
                 status
@@ -160,13 +163,16 @@ impl Pty {
     }
 
     pub fn close(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
         if self.exited.is_none() {
-            unsafe {
-                libc::kill(-(self.child.id() as i32), libc::SIGHUP);
+            if let Some(pid) = child.id() {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGHUP);
+                }
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.exited = Some(129);
+            let _ = child.start_kill();
         }
     }
 }

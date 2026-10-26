@@ -434,14 +434,23 @@ fn size(cols: u16, rows: u16) -> Size {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--fixture") {
-        return fixture();
+    let mode = std::env::args().nth(1);
+    match mode.as_deref() {
+        Some("--fixture") => return fixture(),
+        Some("--close-fixture") => return close_fixture(),
+        _ => (),
     }
     tokio::task::LocalSet::new()
         .run_until(async {
-            tokio::time::timeout(Duration::from_secs(180), verify())
-                .await
-                .context("entire session fixture exceeded its deadline")?
+            tokio::time::timeout(Duration::from_secs(180), async {
+                if mode.as_deref() == Some("--verify-close") {
+                    verify_close().await
+                } else {
+                    verify().await
+                }
+            })
+            .await
+            .context("entire session fixture exceeded its deadline")?
         })
         .await
 }
@@ -892,9 +901,103 @@ async fn verify() -> Result<()> {
             String::from_utf8_lossy(expected)
         );
     }
+    verify_close().await?;
     println!(
-        "session verification passed: {} installed frames; raw PTY input modes, partial writes, reconnect deduplication, fencing, resize, graphics, late resources, effects, queries, flood convergence, final exit barriers",
+        "session verification passed: {} installed frames; raw PTY input modes, partial writes, reconnect deduplication, fencing, resize, graphics, late resources, effects, queries, flood convergence, final exit barriers, explicit close and child reaping",
         view.frames
+    );
+    Ok(())
+}
+
+async fn verify_close() -> Result<()> {
+    let identity = ClientIdentity::generate()?;
+    let request = BootstrapRequest {
+        version: PROTOCOL_VERSION,
+        client_cert: identity.certificate(),
+        size: size(80, 12),
+        command: vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            "--close-fixture".into(),
+        ],
+        bind: Some("127.0.0.1".into()),
+        port: None,
+        idle_seconds: 60,
+        clipboard_read: false,
+    };
+    let (endpoint, grant) = transport::listen(&request)?;
+    let actor = SessionActor::new(&request, grant.session.clone())?;
+    let mut running = Running {
+        task: Some(tokio::task::spawn_local(actor.run(endpoint.clone()))),
+        endpoint,
+    };
+    let client = identity.endpoint(&grant)?;
+    let mut view = View::new();
+    view.ack_effects = true;
+    let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 3).await?;
+    view.wait_text(&mut peer, "CLOSE_READY").await?;
+    let pid = extract_pid(&view.text())?;
+    ensure!(
+        unsafe { libc::kill(pid as libc::pid_t, 0) } == 0,
+        "close fixture child ended before the close request"
+    );
+    let initial_revision = view.display.revision();
+    for _ in 0..2 {
+        peer.send(ClientMessage::Close { epoch: peer.epoch })
+            .await?;
+    }
+    peer.send(ClientMessage::Resync { epoch: peer.epoch })
+        .await?;
+    tokio::time::timeout(WAIT, async {
+        while view.exit.is_none() {
+            let event = peer.receive().await?;
+            view.process(&mut peer, event).await?;
+        }
+        Result::<()>::Ok(())
+    })
+    .await
+    .context("explicit close stopped network progress before the exit barrier")??;
+    ensure!(
+        view.exit.is_some_and(|(code, ..)| code == 129),
+        "explicit close lost its exit status"
+    );
+    ensure!(
+        view.display.revision() > initial_revision,
+        "explicit close did not publish its final display"
+    );
+    ensure!(
+        !running
+            .task
+            .as_ref()
+            .context("close actor task missing")?
+            .is_finished(),
+        "closed actor ended before ExitAck"
+    );
+    peer.send(ClientMessage::ExitAck { epoch: peer.epoch })
+        .await?;
+    tokio::time::timeout(
+        WAIT,
+        running.task.take().context("close actor task missing")?,
+    )
+    .await
+    .context("closed actor did not finish after ExitAck")???;
+    tokio::time::timeout(WAIT, async {
+        let mut retry = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1 {
+                let error = std::io::Error::last_os_error();
+                ensure!(
+                    error.raw_os_error() == Some(libc::ESRCH),
+                    "cannot inspect closed PTY child: {error}"
+                );
+                return Result::<()>::Ok(());
+            }
+            retry.tick().await;
+        }
+    })
+    .await
+    .context("closed PTY child was not reaped")??;
+    println!(
+        "verified repeated explicit close, final exit barriers, actor completion and child reaping"
     );
     Ok(())
 }
@@ -972,6 +1075,17 @@ fn extract_pid(text: &str) -> Result<u32> {
         .take_while(char::is_ascii_digit)
         .collect();
     Ok(pid.parse()?)
+}
+
+fn close_fixture() -> Result<()> {
+    ensure!(
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } != libc::SIG_ERR,
+        "cannot ignore SIGHUP in close fixture"
+    );
+    emit(format!("\x1b[2J\x1b[HCLOSE_READY pid={}\r\n", std::process::id()).as_bytes())?;
+    loop {
+        std::thread::park();
+    }
 }
 
 fn fixture() -> Result<()> {
