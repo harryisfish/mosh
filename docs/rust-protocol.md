@@ -1,8 +1,7 @@
 # Rust terminal protocol
 
-This is the implementation contract for the Rust client and server. It replaces
-the old wire protocol. The C++ implementation remains available while the new
-implementation is verified.
+This is the implementation contract for the Rust client and server. The protocol
+is not compatible with the original Mosh wire protocol.
 
 The current Rust protocol is version 2, with ALPN `mosh-rs/2`. Both endpoints
 must use this version. Version 1 workers cannot resume with a version 2 client.

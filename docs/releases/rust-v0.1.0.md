@@ -25,7 +25,8 @@ the SSH user's `PATH`. The selected UDP port must be reachable from the client.
 ## Compatibility and validation
 
 This release uses protocol v2. It does not interoperate with the original Mosh
-protocol or Rust protocol v1. The original C++ commands remain available.
+protocol or Rust protocol v1. The original C++ commands were still included in
+the source tree at this release.
 Reconnect credentials remain in the running client process, so a closed or
 crashed client cannot reattach using a session file.
 

@@ -7,8 +7,8 @@
 用 Rust 编写的远程终端。网络中断、客户端休眠或切换网络后，可以恢复到同一个远程命令。
 本地输入预测降低打字时的延迟感。SSH 负责认证和启动服务端，随后通过 QUIC 同步终端状态。
 
-本仓库基于 [Mosh](https://github.com/mobile-shell/mosh)。Rust 客户端和服务端分别是
-`mosh-rs` 与 `mosh-rs-server`，仓库中也保留了原版 C++ 实现。
+本项目是 [Mosh](https://github.com/mobile-shell/mosh) 的 Rust 重写版本。
+客户端和服务端分别为 `mosh-rs` 与 `mosh-rs-server`。
 
 Rust 版使用协议 v2，与原版 Mosh 协议和 Rust 协议 v1 均不兼容。
 客户端和服务端请安装同一版本。
@@ -131,11 +131,10 @@ target/release/mosh-rs --local
 - [Rust 协议参考](docs/rust-protocol.md)
 - [Mac mini 验收报告](docs/rust-macmini-verification.md)
 
-## 原版 C++ Mosh
+## 来源与许可
 
-原版 `mosh`、`mosh-client` 和 `mosh-server` 命令与 Rust 版各自独立。
-原版的安装、使用和源码构建说明见 [mosh.org](https://mosh.org/) 和
-[上游仓库](https://github.com/mobile-shell/mosh)。
+本项目基于 [Mosh](https://mosh.org/)。上游作者和致谢记录保留在
+[AUTHORS](AUTHORS) 与 [THANKS](THANKS) 中。
 
 本项目采用 [GPL-3.0-or-later](COPYING) 许可证。
 内置的 WezTerm 终端核心保留其 [MIT 许可证](rust/vendor/wezterm-term/LICENSE.md)。

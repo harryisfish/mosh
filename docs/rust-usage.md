@@ -30,7 +30,7 @@ mosh-rs --local
 
 Install the server host's matching package there as well. Use `--server` with
 its absolute path when the remote SSH environment does not include its directory
-in `PATH`. The original `mosh` commands keep their existing names.
+in `PATH`.
 
 Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64.
 Build from source for older systems. The macOS binaries are unsigned.
