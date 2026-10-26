@@ -250,10 +250,40 @@ fn verify_input() -> Result<()> {
         b"\x1b[105;1:1;105u\x1b[105;1:3u\x1b[27;1:1u\x1b[27;1:3u"
     );
     assert_eq!(InputDecoder::new().feed(&kitty_bytes)?, expected);
+    for (sequence, name, modifiers, phase) in [
+        ("\x1bOA", "Up", 0, KeyPhase::Press),
+        ("\x1b[1;1:1A", "Up", 0, KeyPhase::Press),
+        ("\x1b[1;1:2A", "Up", 0, KeyPhase::Repeat),
+        ("\x1b[1;1:3A", "Up", 0, KeyPhase::Release),
+        ("\x1b[1;5:3D", "Left", 4, KeyPhase::Release),
+        ("\x1b[3;2:3~", "Delete", 1, KeyPhase::Release),
+        ("\x1b[15;1:2~", "F5", 0, KeyPhase::Repeat),
+        ("\x1b[1;1:3R", "F3", 0, KeyPhase::Release),
+        ("\x1b[1;1:3Z", "Tab", 1, KeyPhase::Release),
+    ] {
+        let mut decoder = InputDecoder::new();
+        let split = sequence.len() - 2;
+        assert!(decoder.feed(&sequence.as_bytes()[..split])?.is_empty());
+        assert_eq!(
+            decoder.feed(&sequence.as_bytes()[split..])?,
+            vec![LocalEvent::Input(InputEvent::Key(Key {
+                code: KeyCode::Named(name.into()),
+                modifiers,
+                phase,
+                shifted: None,
+                base: None,
+                text: None,
+            }))],
+            "{sequence:?}"
+        );
+    }
+    assert!(InputDecoder::new().feed(b"\x1b[4;1$y")?.is_empty());
     for invalid in [
         b"\x1b[97;0u".as_slice(),
         b"\x1b[97;257u".as_slice(),
         b"\x1b[97;1:4u".as_slice(),
+        b"\x1b[1;257A".as_slice(),
+        b"\x1b[1;1:4A".as_slice(),
     ] {
         assert!(InputDecoder::new().feed(invalid).is_err());
     }
