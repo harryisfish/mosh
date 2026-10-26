@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::model::*;
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine;
-use core::escape::osc::{FinalTermSemanticPrompt as Marker, Selection};
+use core::escape::osc::{ColorOrQuery, FinalTermSemanticPrompt as Marker, Selection};
 use core::escape::{Action, OperatingSystemCommand as Osc};
 use tattoy_wezterm_term as core;
 
@@ -81,6 +81,7 @@ pub struct TerminalModel {
 }
 struct Observer {
     clipboard_read: bool,
+    default_colors: [Color; 2],
     queries: BTreeMap<u64, String>,
     next_query: u64,
     markers: VecDeque<ShellMarker>,
@@ -105,6 +106,7 @@ impl TerminalModel {
             size,
             state: Observer {
                 clipboard_read,
+                default_colors: [Color::Default; 2],
                 queries: BTreeMap::new(),
                 next_query: 0,
                 markers: VecDeque::new(),
@@ -414,8 +416,16 @@ impl TerminalModel {
                     text: text.to_owned(),
                     width: width as u8,
                     style: Style {
-                        fg: resolved_color(attrs.foreground(), &palette, palette.foreground),
-                        bg: resolved_color(attrs.background(), &palette, palette.background),
+                        fg: resolved_color(
+                            attrs.foreground(),
+                            &palette,
+                            self.state.default_colors[0],
+                        ),
+                        bg: resolved_color(
+                            attrs.background(),
+                            &palette,
+                            self.state.default_colors[1],
+                        ),
                         flags,
                         underline,
                         underline_color: color(attrs.underline_color(), &palette),
@@ -560,8 +570,35 @@ impl Observer {
             }
         }
         let effect = match action {
+            Action::Esc(core::escape::Esc::Code(core::escape::EscCode::FullReset)) => {
+                self.default_colors = [Color::Default; 2];
+                None
+            }
             Action::Control(core::escape::ControlCode::Bell) => Some(EffectKind::Bell),
             Action::OperatingSystemCommand(osc) => match osc.as_ref() {
+                Osc::ChangeDynamicColors(first, colors) => {
+                    for (value, target) in colors
+                        .iter()
+                        .zip(self.default_colors.iter_mut().skip(*first as usize - 10))
+                    {
+                        if let ColorOrQuery::Color(value) = value {
+                            let rgba: core::color::SrgbaTuple = (*value).into();
+                            let (r, g, b, _) = rgba.as_rgba_u8();
+                            *target = Color::Rgb([r, g, b]);
+                        }
+                    }
+                    None
+                }
+                Osc::ResetDynamicColor(which) => {
+                    if let Some(target) = self.default_colors.get_mut(*which as usize - 10) {
+                        *target = Color::Default;
+                    }
+                    None
+                }
+                Osc::ResetColors(colors) if colors.is_empty() => {
+                    self.default_colors = [Color::Default; 2];
+                    None
+                }
                 Osc::SetSelection(selection, _) | Osc::ClearSelection(selection)
                     if selection.intersects(Selection::CUT8 | Selection::CUT9) =>
                 {
@@ -809,11 +846,10 @@ fn key_code(key: &KeyCode) -> Result<core::KeyCode> {
 fn resolved_color(
     value: core::color::ColorAttribute,
     palette: &core::color::ColorPalette,
-    fallback: core::color::SrgbaTuple,
+    fallback: Color,
 ) -> Color {
     if value == core::color::ColorAttribute::Default {
-        let (r, g, b, _) = fallback.as_rgba_u8();
-        Color::Rgb([r, g, b])
+        fallback
     } else {
         color(value, palette)
     }
