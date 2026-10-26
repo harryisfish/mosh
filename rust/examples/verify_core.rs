@@ -446,7 +446,9 @@ fn verify_default_colors() -> Result<()> {
         assert_eq!(screen.rows[0].cells[0].style.fg, Color::Default);
         assert_eq!(screen.rows[0].cells[0].style.bg, Color::Default);
     }
-    println!("default terminal colors stay symbolic; explicit black, dynamic colors and resets survive snapshots");
+    println!(
+        "default terminal colors stay symbolic; explicit black, dynamic colors and resets survive snapshots"
+    );
     Ok(())
 }
 
