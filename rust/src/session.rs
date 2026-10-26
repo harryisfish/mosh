@@ -787,17 +787,19 @@ impl SessionActor {
                 break;
             }
         }
-        let mut candidate = None;
         let stable = self.last_output.elapsed() >= Duration::from_millis(75)
             && attachment.display_started.elapsed() >= Duration::from_millis(250)
             && attachment.cancellations == 0;
-        if attachment.last_sent < self.revision
+        let check_replacement = attachment.display.is_some()
             && (attachment.checked_revision < self.revision || stable)
-            && attachment.display.is_some()
-            && attachment.display_started.elapsed() >= Duration::from_millis(75)
+            && attachment.display_started.elapsed() >= Duration::from_millis(75);
+        if attachment.last_sent < self.revision
+            && (attachment.display.is_none() || check_replacement)
         {
-            attachment.checked_revision = self.revision;
-            let replacement = state::frame(
+            if check_replacement {
+                attachment.checked_revision = self.revision;
+            }
+            let frame = transport::EncodedFrame::new(&state::frame(
                 attachment.epoch,
                 self.revision,
                 self.echo_through,
@@ -806,61 +808,40 @@ impl SessionActor {
                     .confirmed
                     .as_ref()
                     .map(|(revision, screen)| (*revision, screen.as_ref())),
-            )?;
-            let encoded = postcard::to_allocvec(&replacement)?;
-            let bytes = zstd::bulk::compress(&encoded, 1)?.len();
+            )?)?;
+            let bytes = frame.compressed_len();
             let smaller = attachment.display_bytes > 8192 && bytes < attachment.display_bytes / 2;
-            if smaller || stable {
+            if attachment.display.is_none() || smaller || stable {
                 if let Some(task) = attachment.display.take() {
                     task.abort();
+                    attachment.cancellations = attachment.cancellations.saturating_add(1);
                 }
-                attachment.cancellations = attachment.cancellations.saturating_add(1);
-                candidate = Some((replacement, bytes));
-            }
-        }
-        if attachment.display.is_none() && attachment.last_sent < self.revision {
-            let (frame, bytes) = if let Some(candidate) = candidate {
-                candidate
-            } else {
-                let frame = state::frame(
-                    attachment.epoch,
-                    self.revision,
-                    self.echo_through,
-                    screen,
-                    attachment
-                        .confirmed
-                        .as_ref()
-                        .map(|(revision, screen)| (*revision, screen.as_ref())),
-                )?;
-                let bytes = zstd::bulk::compress(&postcard::to_allocvec(&frame)?, 1)?.len();
-                (frame, bytes)
-            };
-            transport::validate_frame(&frame)?;
-            attachment.sent.insert(self.revision, screen.clone());
-            while attachment.sent.len() > 2 {
-                attachment.sent.pop_first();
-            }
-            attachment.last_sent = self.revision;
-            attachment.display_started = Instant::now();
-            attachment.display_bytes = bytes;
-            let connection = attachment.connection.clone();
-            let epoch = attachment.epoch;
-            let revision = self.revision;
-            let sender = self.sender.clone();
-            attachment.display = Some(tokio::spawn(async move {
-                let result = transport::send_frame(&connection, &frame).await;
-                if let Err(error) = &result {
-                    eprintln!("mosh-rs-server: display revision {revision} failed: {error:#}");
+                attachment.sent.insert(self.revision, screen.clone());
+                while attachment.sent.len() > 2 {
+                    attachment.sent.pop_first();
                 }
-                let success = result.is_ok();
-                let _ = sender
-                    .send(Event::DisplaySent {
-                        epoch,
-                        revision,
-                        success,
-                    })
-                    .await;
-            }));
+                attachment.last_sent = self.revision;
+                attachment.display_started = Instant::now();
+                attachment.display_bytes = bytes;
+                let connection = attachment.connection.clone();
+                let epoch = attachment.epoch;
+                let revision = self.revision;
+                let sender = self.sender.clone();
+                attachment.display = Some(tokio::spawn(async move {
+                    let result = frame.send(&connection).await;
+                    if let Err(error) = &result {
+                        eprintln!("mosh-rs-server: display revision {revision} failed: {error:#}");
+                    }
+                    let success = result.is_ok();
+                    let _ = sender
+                        .send(Event::DisplaySent {
+                            epoch,
+                            revision,
+                            success,
+                        })
+                        .await;
+                }));
+            }
         }
         let desired: BTreeSet<_> = attachment
             .sent
