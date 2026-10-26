@@ -1,0 +1,44 @@
+use std::process::ExitCode;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use mosh_rs::{session::SessionActor, transport};
+
+#[derive(Parser)]
+#[command(version, about = "Host a resumable Rust terminal session")]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Read an authenticated bootstrap request from SSH standard input.
+    Bootstrap,
+    #[command(hide = true)]
+    Worker,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("mosh-rs-server: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
+    match Args::parse().command {
+        Command::Bootstrap => transport::spawn_worker().await,
+        Command::Worker => {
+            let request = transport::read_request(std::io::stdin().lock())?;
+            let (endpoint, grant) = transport::listen(&request)?;
+            let session = SessionActor::new(&request, grant.session.clone())?;
+            transport::write_grant(std::io::stdout().lock(), &grant)?;
+            session.run(endpoint).await
+        }
+    }
+}
