@@ -582,8 +582,7 @@ impl Observer {
                         .zip(self.default_colors.iter_mut().skip(*first as usize - 10))
                     {
                         if let ColorOrQuery::Color(value) = value {
-                            let rgba: core::color::SrgbaTuple = (*value).into();
-                            let (r, g, b, _) = rgba.as_rgba_u8();
+                            let (r, g, b, _) = value.as_rgba_u8();
                             *target = Color::Rgb([r, g, b]);
                         }
                     }
