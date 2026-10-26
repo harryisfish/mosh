@@ -1,5 +1,42 @@
 # Use the Rust client and server
 
+## Install a release
+
+Download the archive for each host from
+[GitHub Releases](https://github.com/harryisfish/mosh/releases).
+Each archive contains both `bin/mosh-rs` and `bin/mosh-rs-server`.
+
+| Host | Archive target |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+
+Download `SHA256SUMS` into the same directory as the archive. Verify your download
+with `shasum -a 256 --ignore-missing -c SHA256SUMS` on macOS or
+`sha256sum --ignore-missing -c SHA256SUMS` on Linux.
+
+For example, install release 0.1.0 on an Apple Silicon Mac:
+
+```sh
+tar -xzf mosh-rs-0.1.0-aarch64-apple-darwin.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 mosh-rs-0.1.0-aarch64-apple-darwin/bin/mosh-rs \
+  mosh-rs-0.1.0-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
+mosh-rs --local
+```
+
+Install the server host's matching package there as well. Use `--server` with
+its absolute path when the remote SSH environment does not include its directory
+in `PATH`. The original `mosh` commands keep their existing names.
+
+Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64.
+Build from source for older systems. The macOS binaries are unsigned.
+
+## Build from source
+
 Build on macOS or Linux with Rust 1.88 or newer and a C toolchain:
 
 ```sh
@@ -10,6 +47,8 @@ Install `target/release/mosh-rs` on the client and
 `target/release/mosh-rs-server` on the server. Build for each host's operating
 system and architecture. Put the server in the remote user's `PATH`, or specify
 its absolute path with `--server`.
+
+## Connect
 
 Connect with your existing OpenSSH authentication and configuration:
 
