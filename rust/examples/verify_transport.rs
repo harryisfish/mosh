@@ -444,6 +444,11 @@ fn bootstrap_fixture(mode: &str) -> Result<()> {
             serde_json::to_writer(&mut stdout, &grant)?;
             stdout.write_all(b"\n")?;
         }
+        "prefixed-unframed" => {
+            stdout.write_all(b"welcome ")?;
+            serde_json::to_writer(&mut stdout, &grant)?;
+            stdout.write_all(b"\n")?;
+        }
         "malformed-unframed" => {
             writeln!(stdout, "{{\"session\":\"{GRANT_CANARY}\",broken}}")?;
         }
@@ -498,7 +503,7 @@ async fn bootstrap_probe(mode: &str) -> Result<()> {
             Some("output line exceeds limit")
         }
         "duplicate" => Some("duplicate bootstrap grant frame"),
-        "unframed" | "malformed-unframed" => Some("unframed bootstrap grant"),
+        "unframed" | "prefixed-unframed" | "malformed-unframed" => Some("unframed bootstrap grant"),
         "invalid-json" => Some("invalid bootstrap grant JSON"),
         "invalid-grant" => Some("unsupported server protocol version"),
         "truncated-body" => Some("grant body is incomplete"),
@@ -566,6 +571,7 @@ async fn verify_bootstrap_framing() -> Result<()> {
         "trailing-oversize",
         "duplicate",
         "unframed",
+        "prefixed-unframed",
         "malformed-unframed",
         "invalid-json",
         "invalid-grant",

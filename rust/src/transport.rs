@@ -563,13 +563,17 @@ fn write_bootstrap_diagnostic(bytes: &[u8], total: &mut usize) -> Result<()> {
 }
 
 fn is_unframed_grant(line: &[u8]) -> bool {
+    let sensitive_fields = [b"\"session\"".as_slice(), b"\"server_cert\"".as_slice()];
+    if sensitive_fields
+        .iter()
+        .any(|key| line.windows(key.len()).any(|part| part == *key))
+    {
+        return true;
+    }
     if let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(line) {
         return fields.contains_key("session") || fields.contains_key("server_cert");
     }
     line.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{')
-        && [b"\"session\"".as_slice(), b"\"server_cert\"".as_slice()]
-            .iter()
-            .any(|key| line.windows(key.len()).any(|part| part == *key))
 }
 
 async fn read_bootstrap_line<R: AsyncBufRead + Unpin>(
