@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -16,7 +17,10 @@ enum Command {
     /// Read an authenticated bootstrap request from SSH standard input.
     Bootstrap,
     #[command(hide = true)]
-    Worker,
+    Worker {
+        #[arg(long, hide = true)]
+        cleanup_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,7 +37,8 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     match Args::parse().command {
         Command::Bootstrap => transport::spawn_worker().await,
-        Command::Worker => {
+        Command::Worker { cleanup_dir } => {
+            let _cleanup = cleanup_dir.map(transport::WorkerTempDirGuard::new);
             let request = transport::read_request(std::io::stdin().lock())?;
             let (endpoint, grant) = transport::listen(&request)?;
             let session = SessionActor::new(&request, grant.session.clone())?;
