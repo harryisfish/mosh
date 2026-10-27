@@ -138,6 +138,12 @@ concrete bind, the client uses the effective hostname from local `ssh -G` for
 UDP and requires that query to succeed before starting the remote worker.
 It does not fall back to an address chosen by the worker. Reconnection resolves
 the same hostname again.
+By default the server listens on both available address families using one
+session port. An explicit `--bind` keeps its chosen interface and family:
+`--bind 0.0.0.0` selects IPv4 and `--bind ::` selects IPv6 only. A fixed-port
+conflict fails startup rather than silently changing the port or address family.
+macOS uses separate IPv4 and IPv6 listeners because one IPv6 socket cannot
+reliably reserve an already occupied IPv4 port. Both listeners share the session.
 An SSH jump host alone does not provide a UDP route.
 
 The remote command requires a usable UTF-8 locale on the server. The client

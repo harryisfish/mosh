@@ -33,6 +33,27 @@ hostname again. Certificate validation remains required at that destination.
 Local bootstrap trusts the executable explicitly selected by the caller,
 including controlled local relays. The wire format remains version 4.
 
+Default server listening uses one dual-stack UDP socket where it can own both
+address families, explicitly disabling and verifying `IPV6_V6ONLY`. On macOS,
+an IPv6 wildcard can bind over an existing IPv4 port even with V6ONLY disabled,
+so the server always uses separate IPv6-only and native IPv4 listeners. Other
+platforms also use separate listeners if single-socket dual-stack capability is
+unavailable. Both listeners use the same port, certificate, session, and actor.
+Only an unavailable address family permits a single-family fallback;
+permissions and fixed-port conflicts fail startup. Split listeners each allow
+16 pending incoming connections and 2 MiB of incoming buffers, preserving the
+group's 32-connection and 4 MiB limits. The actor shares eight connection permits
+across both families and starts only one PTY. Normal completion, errors, and
+cancellation, including dropping an unpolled actor future, close the whole
+listener group. Cross-family recovery between
+separate QUIC endpoints reattaches to the same actor; it does not migrate one
+QUIC connection between their independent routing tables.
+
+An explicit bind keeps its selected interface and address family, with mapped
+IPv4 normalized to native IPv4. `0.0.0.0` listens on IPv4 and `::` on IPv6 only;
+omitting bind selects automatic dual-stack listening. Both automatic listeners
+must bind the same OS-assigned or fixed port before the grant is published.
+
 ## UTF-8 locale and PTY startup
 
 Version 4 appends the required `locale_candidates` field to `BootstrapRequest`.

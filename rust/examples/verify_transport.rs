@@ -11,11 +11,11 @@ use mosh_rs::model::{
     ResourceMeta, Row, RowPatch, ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
-    ClientEndpoints, ClientIdentity, EncodedFrame, Incoming, bootstrap_local, connect, listen,
-    read_request, receive_uni, recv_message, send_message, send_resource, spawn_worker,
-    validate_frame, write_grant,
+    ClientEndpoints, ClientIdentity, EncodedFrame, Incoming, ServerListeners, bootstrap_local,
+    connect, listen, read_request, receive_uni, recv_message, send_message, send_resource,
+    spawn_worker, validate_frame, write_grant,
 };
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use quinn::{Connection, RecvStream, SendStream, VarInt};
 
 async fn rejected_control<T: serde::de::DeserializeOwned>(
     send: &mut SendStream,
@@ -339,7 +339,7 @@ fn frame() -> Frame {
 }
 
 async fn pair(
-    server: &Endpoint,
+    server: &ServerListeners,
     client: &ClientEndpoints,
     grant: &mosh_rs::model::Grant,
 ) -> Result<(Connection, Connection)> {
@@ -655,8 +655,105 @@ async fn worker() -> Result<()> {
     Ok(())
 }
 
+async fn verify_listeners() -> Result<()> {
+    let identity = ClientIdentity::generate()?;
+    for (name, bind, addresses) in [
+        ("default", None, vec!["127.0.0.1", "::1"]),
+        ("IPv4 wildcard", Some("0.0.0.0"), vec!["127.0.0.1"]),
+        ("IPv6 wildcard", Some("::"), vec!["::1"]),
+        ("IPv4 interface", Some("127.0.0.1"), vec!["127.0.0.1"]),
+        ("IPv6 interface", Some("::1"), vec!["::1"]),
+        (
+            "mapped interface",
+            Some("::ffff:127.0.0.1"),
+            vec!["127.0.0.1"],
+        ),
+    ] {
+        let mut request = request(&identity);
+        request.bind = bind.map(str::to_owned);
+        let (server, grant) = listen(&request)?;
+        ensure!(grant.port != 0, "listener advertised an unassigned port");
+        let client = identity.endpoint(&grant)?;
+        for address in addresses {
+            let mut destination = grant.clone();
+            destination.address = address.into();
+            let (server_connection, client_connection) =
+                tokio::time::timeout(Duration::from_secs(2), pair(&server, &client, &destination))
+                    .await
+                    .with_context(|| {
+                        format!("{name} listener did not accept native {address}")
+                    })??;
+            ensure!(
+                client_connection.remote_address().ip() == address.parse::<std::net::IpAddr>()?
+                    && client_connection.remote_address().port() == grant.port,
+                "listener used a different destination family or port"
+            );
+            let (mut send, mut receive) = client_connection.open_bi().await?;
+            let expected = format!("{name} {address}");
+            send_message(&mut send, &expected).await?;
+            let (mut reply, mut incoming) = server_connection.accept_bi().await?;
+            let received: String = recv_message(&mut incoming)
+                .await?
+                .context("missing native input")?;
+            ensure!(received == expected, "listener changed native input");
+            send_message(&mut reply, &received).await?;
+            let echoed: String = recv_message(&mut receive)
+                .await?
+                .context("missing native reply")?;
+            ensure!(echoed == expected, "listener changed native reply");
+            client_connection.close(0_u32.into(), b"native fixture complete");
+            server_connection.close(0_u32.into(), b"native fixture complete");
+        }
+        if bind == Some("::") {
+            let _ipv4 = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, grant.port))
+                .context("explicit IPv6 wildcard also reserved the IPv4 port")?;
+        }
+        server.close(0_u32.into(), b"listener fixture complete");
+        client.close(0_u32.into(), b"listener fixture complete");
+        tokio::join!(server.wait_idle(), client.wait_idle());
+    }
+
+    let occupied = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+    let port = occupied.local_addr()?.port();
+    let mut fixed = request(&identity);
+    fixed.bind = None;
+    fixed.port = Some(port);
+    ensure!(
+        listen(&fixed).is_err(),
+        "default listener bypassed a fixed-port conflict"
+    );
+    drop(occupied);
+    let (server, grant) = listen(&fixed).context("failed listener retained a socket or port")?;
+    ensure!(
+        grant.port == port,
+        "listener changed the requested fixed port"
+    );
+    let client = identity.endpoint(&grant)?;
+    for address in ["127.0.0.1", "::1"] {
+        let mut destination = grant.clone();
+        destination.address = address.into();
+        let (server_connection, client_connection) =
+            tokio::time::timeout(Duration::from_secs(2), pair(&server, &client, &destination))
+                .await??;
+        ensure!(
+            client_connection.remote_address().port() == port,
+            "fixed ports differ by family"
+        );
+        client_connection.close(0_u32.into(), b"fixed-port fixture complete");
+        server_connection.close(0_u32.into(), b"fixed-port fixture complete");
+    }
+    server.close(0_u32.into(), b"fixed-port fixture complete");
+    client.close(0_u32.into(), b"fixed-port fixture complete");
+    tokio::join!(server.wait_idle(), client.wait_idle());
+    println!(
+        "default listeners serve native IPv4/IPv6 on one assigned or fixed port; explicit families, mapped bind, conflicts and failed-startup socket release passed"
+    );
+    Ok(())
+}
+
 async fn verify() -> Result<()> {
     verify_bootstrap_framing().await?;
+    verify_listeners().await?;
     let identity = ClientIdentity::generate()?;
     let request = request(&identity);
     let mut legacy_request = request.clone();
