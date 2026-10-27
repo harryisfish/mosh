@@ -28,7 +28,6 @@ contents:
     dst: /usr/share/doc/mosh-rs/README.zh-CN.md
   - src: COPYING
     dst: /usr/share/doc/mosh-rs/copyright
-    type: license
   - src: AUTHORS
     dst: /usr/share/doc/mosh-rs/AUTHORS
   - src: THANKS
@@ -37,7 +36,6 @@ contents:
     dst: /usr/share/doc/mosh-rs/rust-usage.md
   - src: rust/vendor/wezterm-term/LICENSE.md
     dst: /usr/share/doc/mosh-rs/wezterm-copyright
-    type: license
   - src: rust/vendor/wezterm-term/MOSH_PATCHES.md
     dst: /usr/share/doc/mosh-rs/wezterm-patches.md
 overrides:
