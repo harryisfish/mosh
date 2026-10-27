@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
@@ -9,6 +10,7 @@ use crate::model::{InputEvent, Key, KeyCode, KeyPhase, MAX_PENDING_INPUT, Mouse,
 
 const ESC: u8 = 0x1b;
 const MAX_SEQUENCE: usize = 4096;
+const PARTIAL_WAIT: Duration = Duration::from_millis(30);
 const MAX_CLIPBOARD: usize = MAX_PENDING_INPUT / 2;
 pub const MAX_INPUT_CHUNK: usize = 256;
 const MAX_CAPTURED_EVENTS: usize = MAX_INPUT_CHUNK + 1;
@@ -24,6 +26,7 @@ pub enum PasteAdmission {
 pub enum InputRejection {
     PasteTooLarge,
     InvalidPaste,
+    SequenceTimeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +202,17 @@ fn is_modifier_key(code: &KeyCode) -> bool {
 pub struct InputDecoder {
     pending: Vec<u8>,
     paste: Option<PasteState>,
+    escape: EscapeState,
+}
+
+#[derive(Default)]
+enum EscapeState {
+    #[default]
+    Parse,
+    Waiting {
+        deadline: Instant,
+    },
+    DiscardCsi,
 }
 
 enum PasteState {
@@ -211,18 +225,24 @@ impl InputDecoder {
         Self::default()
     }
 
-    pub fn feed(&mut self, bytes: &[u8], admission: PasteAdmission) -> Result<Vec<LocalEvent>> {
+    pub fn feed(
+        &mut self,
+        bytes: &[u8],
+        admission: PasteAdmission,
+        received_at: Instant,
+    ) -> Result<Vec<LocalEvent>> {
         ensure!(
             bytes.len() <= MAX_INPUT_CHUNK,
             "local input chunk exceeds limit"
         );
+        let mut events = Vec::new();
+        self.expire(received_at, &mut events);
         ensure!(
             self.pending.len() + bytes.len() <= MAX_PENDING_INPUT,
             "local input buffer exceeds limit"
         );
-        let mut events = Vec::new();
         self.pending.extend_from_slice(bytes);
-        self.decode(&mut events, admission)?;
+        self.decode(&mut events, admission, received_at)?;
         assert!(events.len() <= MAX_CAPTURED_EVENTS);
         let payload_bytes: usize = events
             .iter()
@@ -254,21 +274,60 @@ impl InputDecoder {
         }
     }
 
-    pub fn flush_escape(&mut self) -> Vec<LocalEvent> {
-        if self.paste.is_none() && self.pending == [ESC] {
-            self.pending.clear();
-            vec![LocalEvent::Input(named("Escape", 0))]
-        } else {
-            Vec::new()
+    pub fn poll(&mut self, now: Instant) -> Vec<LocalEvent> {
+        let mut events = Vec::new();
+        self.expire(now, &mut events);
+        events
+    }
+
+    fn expire(&mut self, now: Instant, events: &mut Vec<LocalEvent>) {
+        let EscapeState::Waiting { deadline } = self.escape else {
+            return;
+        };
+        if now < deadline {
+            return;
         }
+        self.escape = EscapeState::Parse;
+        let event = match self.pending.as_slice() {
+            [ESC] => named("Escape", 0),
+            [ESC, byte @ (b'[' | b'O')] => key(KeyCode::Char(char::from(*byte)), 2),
+            [ESC, byte, ..] if !matches!(byte, b'[' | b'O') => {
+                self.pending.remove(0);
+                events.push(LocalEvent::Input(named("Escape", 0)));
+                return;
+            }
+            _ => {
+                self.pending.clear();
+                self.escape = EscapeState::DiscardCsi;
+                events.push(LocalEvent::Rejected(InputRejection::SequenceTimeout));
+                return;
+            }
+        };
+        self.pending.clear();
+        events.push(LocalEvent::Input(event));
     }
 
-    pub fn has_pending_escape(&self) -> bool {
-        self.paste.is_none() && self.pending == [ESC]
-    }
-
-    fn decode(&mut self, events: &mut Vec<LocalEvent>, admission: PasteAdmission) -> Result<()> {
+    fn decode(
+        &mut self,
+        events: &mut Vec<LocalEvent>,
+        admission: PasteAdmission,
+        received_at: Instant,
+    ) -> Result<()> {
         loop {
+            if matches!(self.escape, EscapeState::DiscardCsi) {
+                let end = self
+                    .pending
+                    .iter()
+                    .position(|byte| matches!(*byte, ESC | 0x1e) || (0x40..=0x7e).contains(byte));
+                let Some(end) = end else {
+                    self.pending.clear();
+                    break;
+                };
+                let recovery = matches!(self.pending[end], ESC | 0x1e);
+                self.pending.drain(..end + usize::from(!recovery));
+                self.escape = EscapeState::Parse;
+                continue;
+            }
             if let Some(paste) = self.paste.as_mut() {
                 let end = find(&self.pending, b"\x1b[201~");
                 let take = end.unwrap_or_else(|| {
@@ -299,6 +358,7 @@ impl InputDecoder {
                 break;
             };
             if byte != ESC {
+                self.escape = EscapeState::Parse;
                 let Some((event, consumed)) = decode_plain(&self.pending, 0)? else {
                     break;
                 };
@@ -306,12 +366,47 @@ impl InputDecoder {
                 events.push(LocalEvent::Input(event));
                 continue;
             }
+            if self
+                .pending
+                .get(1)
+                .is_some_and(|byte| matches!(byte, b']' | b'_' | b'P'))
+            {
+                self.escape = EscapeState::Parse;
+            } else if !matches!(self.escape, EscapeState::Waiting { .. }) {
+                self.escape = EscapeState::Waiting {
+                    deadline: received_at + PARTIAL_WAIT,
+                };
+            }
             if self.pending.len() < 2 {
                 break;
             }
             match self.pending[1] {
                 b'[' => {
+                    if self.pending.starts_with(b"\x1b[[") {
+                        let end = self.pending[3..]
+                            .iter()
+                            .position(|byte| (0x40..=0x7e).contains(byte))
+                            .map(|index| index + 3);
+                        let Some(end) = end else {
+                            ensure!(
+                                self.pending.len() <= MAX_SEQUENCE,
+                                "keyboard sequence exceeds limit"
+                            );
+                            break;
+                        };
+                        ensure!(end <= MAX_SEQUENCE, "keyboard sequence exceeds limit");
+                        if end == 3 && (b'A'..=b'E').contains(&self.pending[end]) {
+                            events.push(LocalEvent::Input(named(
+                                &format!("F{}", self.pending[end] - b'A' + 1),
+                                0,
+                            )));
+                        }
+                        self.pending.drain(..end + 1);
+                        self.escape = EscapeState::Parse;
+                        continue;
+                    }
                     if self.pending.starts_with(b"\x1b[M") {
+                        self.escape = EscapeState::Parse;
                         if self.pending.len() < 6 {
                             break;
                         }
@@ -328,6 +423,7 @@ impl InputDecoder {
                             .then(|| mouse(u16::from(code), u16::from(x), u16::from(y), false))
                             .transpose()?;
                         self.pending.drain(..6);
+                        self.escape = EscapeState::Parse;
                         if let Some(event) = event {
                             events.push(LocalEvent::Input(event));
                         }
@@ -350,6 +446,7 @@ impl InputDecoder {
                     let final_byte = self.pending[end];
                     if body == "200" && final_byte == b'~' {
                         self.pending.drain(..end + 1);
+                        self.escape = EscapeState::Parse;
                         self.paste = Some(match admission {
                             PasteAdmission::Capture => PasteState::Collecting(Vec::new()),
                             PasteAdmission::Discard => PasteState::Discarding,
@@ -376,6 +473,7 @@ impl InputDecoder {
                     };
                     let body =
                         std::str::from_utf8(&self.pending[2..end]).context("invalid SS3 input")?;
+                    ensure!(end <= MAX_SEQUENCE, "SS3 input exceeds limit");
                     if let Some(event) = decode_ss3(body, self.pending[end])? {
                         events.push(LocalEvent::Input(event));
                     }
@@ -411,6 +509,7 @@ impl InputDecoder {
                     events.push(LocalEvent::Input(event));
                 }
             }
+            self.escape = EscapeState::Parse;
         }
         Ok(())
     }
@@ -498,7 +597,18 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
     if body.starts_with(['?', '>', '<', '='])
         || !matches!(
             final_byte,
-            b'A' | b'B' | b'C' | b'D' | b'H' | b'F' | b'Z' | b'P' | b'Q' | b'R' | b'S' | b'~'
+            b'A' | b'B'
+                | b'C'
+                | b'D'
+                | b'E'
+                | b'H'
+                | b'F'
+                | b'Z'
+                | b'P'
+                | b'Q'
+                | b'R'
+                | b'S'
+                | b'~'
         )
     {
         return Ok(None);
@@ -526,6 +636,7 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         b'B' => "Down",
         b'C' => "Right",
         b'D' => "Left",
+        b'E' => "KeypadBegin",
         b'H' => "Home",
         b'F' => "End",
         b'Z' => {
@@ -570,6 +681,10 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
                 32 => "F18",
                 33 => "F19",
                 34 => "F20",
+                42 => "F21",
+                43 => "F22",
+                44 => "F23",
+                45 => "F24",
                 201 => return Ok(None),
                 _ => return Ok(None),
             }
@@ -594,6 +709,7 @@ fn decode_ss3(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         b'B' => "Down",
         b'C' => "Right",
         b'D' => "Left",
+        b'E' => "KeypadBegin",
         b'H' => "Home",
         b'F' => "End",
         b'P' => "F1",
@@ -601,6 +717,7 @@ fn decode_ss3(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         b'R' => "F3",
         b'S' => "F4",
         b'M' => "KeypadEnter",
+        b'X' => "KeypadEqual",
         b'j' => "KeypadMultiply",
         b'k' => "KeypadAdd",
         b'l' => "KeypadSeparator",

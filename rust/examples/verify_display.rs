@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
@@ -118,14 +119,377 @@ fn printable(ch: char) -> InputEvent {
 fn feed(decoder: &mut InputDecoder, bytes: &[u8]) -> Result<Vec<LocalEvent>> {
     let mut events = Vec::new();
     for chunk in bytes.chunks(MAX_INPUT_CHUNK) {
-        let batch = decoder.feed(chunk, PasteAdmission::Capture)?;
+        let batch = decoder.feed(chunk, PasteAdmission::Capture, Instant::now())?;
         assert!(batch.len() <= MAX_INPUT_CHUNK + 1);
         events.extend(batch);
     }
     Ok(events)
 }
 
+fn verify_legacy_input() -> Result<()> {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(30);
+    for (prefix, code, modifiers) in [
+        (b"\x1b".as_slice(), KeyCode::Named("Escape".into()), 0),
+        (b"\x1b[".as_slice(), KeyCode::Char('['), 2),
+        (b"\x1bO".as_slice(), KeyCode::Char('O'), 2),
+    ] {
+        let expected = LocalEvent::Input(InputEvent::Key(Key {
+            code,
+            modifiers,
+            phase: KeyPhase::Press,
+            shifted: None,
+            base: None,
+            text: None,
+        }));
+        let mut decoder = InputDecoder::new();
+        assert!(
+            decoder
+                .feed(prefix, PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+        assert!(decoder.poll(deadline - Duration::from_nanos(1)).is_empty());
+        assert_eq!(decoder.poll(deadline), vec![expected.clone()]);
+        assert!(decoder.poll(deadline + Duration::from_secs(1)).is_empty());
+        assert_eq!(
+            decoder.feed(b"x", PasteAdmission::Capture, deadline)?,
+            vec![LocalEvent::Input(printable('x'))]
+        );
+        let mut decoder = InputDecoder::new();
+        assert!(
+            decoder
+                .feed(prefix, PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.feed(b"x", PasteAdmission::Capture, deadline)?,
+            vec![expected, LocalEvent::Input(printable('x'))]
+        );
+    }
+    for (sequence, name, legacy) in [
+        (b"\x1b[[A".as_slice(), "F1", b"\x1bOP".as_slice()),
+        (b"\x1b[[B", "F2", b"\x1bOQ"),
+        (b"\x1b[[C", "F3", b"\x1bOR"),
+        (b"\x1b[[D", "F4", b"\x1bOS"),
+        (b"\x1b[[E", "F5", b"\x1b[15~"),
+        (b"\x1b[42~", "F21", b"\x1b[42~"),
+        (b"\x1b[43~", "F22", b"\x1b[43~"),
+        (b"\x1b[44~", "F23", b"\x1b[44~"),
+        (b"\x1b[45~", "F24", b"\x1b[45~"),
+        (b"\x1b[E", "KeypadBegin", b"\x1b[E"),
+        (b"\x1bOE", "KeypadBegin", b"\x1b[E"),
+        (b"\x1bOX", "KeypadEqual", b"="),
+    ] {
+        let event = InputEvent::Key(Key {
+            code: KeyCode::Named(name.into()),
+            modifiers: 0,
+            phase: KeyPhase::Press,
+            shifted: None,
+            base: None,
+            text: None,
+        });
+        for split in 0..=sequence.len() {
+            let mut decoder = InputDecoder::new();
+            let mut events = decoder.feed(&sequence[..split], PasteAdmission::Capture, start)?;
+            events.extend(decoder.feed(
+                &sequence[split..],
+                PasteAdmission::Capture,
+                deadline - Duration::from_nanos(1),
+            )?);
+            assert_eq!(
+                events,
+                vec![LocalEvent::Input(event.clone())],
+                "{sequence:?}, split={split}"
+            );
+            assert!(decoder.poll(deadline).is_empty());
+        }
+        let mut terminal = TerminalModel::new(Size::default(), false)?;
+        assert_eq!(terminal.encode_input(&event)?, legacy, "{name}");
+        if name == "KeypadEqual" {
+            terminal.advance(b"\x1b=")?;
+            assert_eq!(terminal.encode_input(&event)?, b"\x1bOX");
+            terminal.advance(b"\x1b[>31u")?;
+            assert_eq!(terminal.encode_input(&event)?, b"\x1b[57415;1:1u");
+        }
+    }
+    for (sequence, event) in [
+        ("中".as_bytes(), printable('中')),
+        (
+            b"\x1b[1;5A".as_slice(),
+            InputEvent::Key(Key {
+                code: KeyCode::Named("Up".into()),
+                modifiers: 4,
+                phase: KeyPhase::Press,
+                shifted: None,
+                base: None,
+                text: None,
+            }),
+        ),
+        (
+            b"\x1b[97:65:113;7:2;233:769u",
+            InputEvent::Key(Key {
+                code: KeyCode::Char('a'),
+                modifiers: 6,
+                phase: KeyPhase::Repeat,
+                shifted: Some('A'),
+                base: Some('q'),
+                text: Some("é\u{301}".into()),
+            }),
+        ),
+    ] {
+        for split in 0..=sequence.len() {
+            let mut decoder = InputDecoder::new();
+            let mut events = decoder.feed(&sequence[..split], PasteAdmission::Capture, start)?;
+            events.extend(decoder.feed(
+                &sequence[split..],
+                PasteAdmission::Capture,
+                deadline - Duration::from_nanos(1),
+            )?);
+            assert_eq!(
+                events,
+                vec![LocalEvent::Input(event.clone())],
+                "{sequence:?}, split={split}"
+            );
+        }
+    }
+    for prefix in [b"\x1b[12;".as_slice(), b"\x1b[?1;", b"\x1bO1;", b"\x1b[["] {
+        let mut decoder = InputDecoder::new();
+        assert!(
+            decoder
+                .feed(prefix, PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.poll(deadline),
+            vec![LocalEvent::Rejected(InputRejection::SequenceTimeout)]
+        );
+        assert!(decoder.poll(deadline + Duration::from_secs(1)).is_empty());
+        for _ in 0..32 {
+            assert!(
+                decoder
+                    .feed(&[b'1'; MAX_INPUT_CHUNK], PasteAdmission::Capture, deadline)?
+                    .is_empty()
+            );
+        }
+        assert!(
+            decoder
+                .feed(b"R", PasteAdmission::Capture, deadline)?
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.feed(b"z", PasteAdmission::Capture, deadline)?,
+            vec![LocalEvent::Input(printable('z'))]
+        );
+    }
+    let mut slow = InputDecoder::new();
+    for (bytes, millis) in [(b"\x1b".as_slice(), 0), (b"[", 10), (b"1", 20), (b"2;", 29)] {
+        assert!(
+            slow.feed(
+                bytes,
+                PasteAdmission::Capture,
+                start + Duration::from_millis(millis)
+            )?
+            .is_empty()
+        );
+    }
+    assert_eq!(
+        slow.feed(b"A", PasteAdmission::Capture, deadline)?,
+        vec![LocalEvent::Rejected(InputRejection::SequenceTimeout)]
+    );
+    for (suffix, expected) in [
+        (b"?".as_slice(), EscapeAction::Help),
+        (b".", EscapeAction::Detach),
+        (b"q", EscapeAction::Close),
+        (b"\x1a", EscapeAction::Suspend),
+    ] {
+        let mut decoder = InputDecoder::new();
+        assert!(
+            decoder
+                .feed(b"\x1b[12;", PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.poll(deadline),
+            vec![LocalEvent::Rejected(InputRejection::SequenceTimeout)]
+        );
+        let mut keys = vec![0x1e];
+        keys.extend_from_slice(suffix);
+        let mut escape = EscapeSequence::new();
+        let actions: Vec<_> = decoder
+            .feed(&keys, PasteAdmission::Capture, deadline)?
+            .into_iter()
+            .map(|event| {
+                let LocalEvent::Input(event) = event else {
+                    panic!("management key was not input")
+                };
+                escape.feed(event)
+            })
+            .collect();
+        assert_eq!(actions, vec![EscapeAction::Send(Vec::new()), expected]);
+    }
+    let mut decoder = InputDecoder::new();
+    assert!(
+        decoder
+            .feed(b"\x1b[12;", PasteAdmission::Capture, start)?
+            .is_empty()
+    );
+    assert_eq!(
+        decoder.poll(deadline),
+        vec![LocalEvent::Rejected(InputRejection::SequenceTimeout)]
+    );
+    let mut escape = EscapeSequence::new();
+    let actions: Vec<_> = decoder
+        .feed(b"\x1b[94;5u\x1b[63u", PasteAdmission::Capture, deadline)?
+        .into_iter()
+        .map(|event| {
+            let LocalEvent::Input(event) = event else {
+                panic!("Kitty recovery was not input")
+            };
+            escape.feed(event)
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        vec![EscapeAction::Send(Vec::new()), EscapeAction::Help]
+    );
+    let mut maximal = InputDecoder::new();
+    let mut partial = b"\x1b[".to_vec();
+    partial.extend_from_slice(&vec![b'1'; 4094]);
+    for chunk in partial.chunks(MAX_INPUT_CHUNK) {
+        assert!(
+            maximal
+                .feed(chunk, PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        maximal.poll(deadline),
+        vec![LocalEvent::Rejected(InputRejection::SequenceTimeout)]
+    );
+    let mut limit = InputDecoder::new();
+    for chunk in partial.chunks(MAX_INPUT_CHUNK) {
+        assert!(
+            limit
+                .feed(chunk, PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+    }
+    assert!(limit.feed(b"1", PasteAdmission::Capture, start).is_err());
+    let mut capture = InputDecoder::new();
+    assert!(
+        capture
+            .feed(b"\x1b", PasteAdmission::Capture, start)?
+            .is_empty()
+    );
+    assert_eq!(
+        capture
+            .feed(&[b'a'; MAX_INPUT_CHUNK], PasteAdmission::Capture, deadline)?
+            .len(),
+        MAX_INPUT_CHUNK + 1
+    );
+    let mut utf8 = InputDecoder::new();
+    assert!(
+        utf8.feed(b"\x1b\xe4", PasteAdmission::Capture, start)?
+            .is_empty()
+    );
+    assert_eq!(
+        utf8.poll(deadline),
+        vec![LocalEvent::Input(InputEvent::Key(Key {
+            code: KeyCode::Named("Escape".into()),
+            modifiers: 0,
+            phase: KeyPhase::Press,
+            shifted: None,
+            base: None,
+            text: None
+        }))]
+    );
+    assert_eq!(
+        utf8.feed(b"\xb8\xad", PasteAdmission::Capture, deadline)?,
+        vec![LocalEvent::Input(printable('中'))]
+    );
+    for (prefix, terminator) in [
+        (b"\x1b]777;\x1e?".as_slice(), b"\x1b\\".as_slice()),
+        (b"\x1bP\x1e?", b"\x1b\\"),
+        (b"\x1b_\x1e?", b"\x1b\\"),
+    ] {
+        let mut reply = InputDecoder::new();
+        assert!(
+            reply
+                .feed(prefix, PasteAdmission::Capture, start)?
+                .is_empty()
+        );
+        assert!(reply.poll(start + Duration::from_secs(1)).is_empty());
+        assert!(
+            reply
+                .feed(
+                    terminator,
+                    PasteAdmission::Capture,
+                    start + Duration::from_secs(1)
+                )?
+                .is_empty()
+        );
+    }
+    let mut paste = InputDecoder::new();
+    assert!(
+        paste
+            .feed(b"\x1b[200~\x1e?", PasteAdmission::Capture, start)?
+            .is_empty()
+    );
+    assert!(paste.poll(start + Duration::from_secs(1)).is_empty());
+    assert_eq!(
+        paste.feed(
+            b"\x1b[201~",
+            PasteAdmission::Capture,
+            start + Duration::from_secs(1)
+        )?,
+        vec![LocalEvent::Input(InputEvent::Paste("\x1e?".into()))]
+    );
+    let mut reply = InputDecoder::new();
+    assert!(
+        reply
+            .feed(b"\x1b]52;c;YQ", PasteAdmission::Capture, start)?
+            .is_empty()
+    );
+    assert!(reply.poll(start + Duration::from_secs(1)).is_empty());
+    assert_eq!(
+        reply.feed(
+            b"==\x1b\\",
+            PasteAdmission::Capture,
+            start + Duration::from_secs(1)
+        )?,
+        vec![LocalEvent::Clipboard {
+            selection: "c".into(),
+            data: Some("a".into())
+        }]
+    );
+    let mut x10 = InputDecoder::new();
+    assert!(
+        x10.feed(b"\x1b[M", PasteAdmission::Capture, start)?
+            .is_empty()
+    );
+    let late = deadline + Duration::from_millis(1);
+    let mut mouse = x10.poll(late);
+    mouse.extend(x10.feed(&[32, 65, 66], PasteAdmission::Capture, late)?);
+    assert_eq!(
+        mouse,
+        vec![LocalEvent::Input(InputEvent::Mouse(Mouse {
+            x: 32,
+            y: 33,
+            pixel_x: 0,
+            pixel_y: 0,
+            modifiers: 0,
+            kind: MouseKind::Press(0)
+        }))]
+    );
+    assert!(feed(&mut InputDecoder::new(), b"\x1b[24;12R\x1b[?1;2c\x1b[4;1$y")?.is_empty());
+    println!(
+        "legacy input: absolute deadlines, late tails, Linux F1-F5, F21-F24, keypad, recovery and reply/paste boundaries verified"
+    );
+    Ok(())
+}
+
 fn verify_input() -> Result<()> {
+    verify_legacy_input()?;
     let mut decoder = InputDecoder::new();
     let events = feed(
         &mut decoder,
@@ -171,10 +535,15 @@ fn verify_input() -> Result<()> {
         feed(&mut decoder, &[0x98, 0x83])?,
         vec![LocalEvent::Input(printable('😃'))]
     );
-    assert!(feed(&mut decoder, b"\x1b")?.is_empty());
-    assert!(decoder.has_pending_escape());
+    let now = Instant::now();
+    assert!(
+        decoder
+            .feed(b"\x1b", PasteAdmission::Capture, now)?
+            .is_empty()
+    );
+    assert!(decoder.poll(now + Duration::from_millis(29)).is_empty());
     assert_eq!(
-        decoder.flush_escape(),
+        decoder.poll(now + Duration::from_millis(30)),
         vec![LocalEvent::Input(InputEvent::Key(Key {
             code: KeyCode::Named("Escape".into()),
             modifiers: 0,
@@ -348,7 +717,11 @@ fn verify_input() -> Result<()> {
     );
     assert!(
         InputDecoder::new()
-            .feed(&[b'a'; MAX_INPUT_CHUNK + 1], PasteAdmission::Capture)
+            .feed(
+                &[b'a'; MAX_INPUT_CHUNK + 1],
+                PasteAdmission::Capture,
+                Instant::now()
+            )
             .is_err()
     );
     let mut maximal = InputDecoder::new();
@@ -356,7 +729,7 @@ fn verify_input() -> Result<()> {
     assert!(feed(&mut maximal, &vec![b'a'; MAX_PENDING_INPUT / 2])?.is_empty());
     let mut tail = b"\x1b[201~".to_vec();
     tail.extend_from_slice(&[b'z'; MAX_INPUT_CHUNK - 6]);
-    let events = maximal.feed(&tail, PasteAdmission::Capture)?;
+    let events = maximal.feed(&tail, PasteAdmission::Capture, Instant::now())?;
     assert_eq!(events.len(), MAX_INPUT_CHUNK - 5);
     assert_eq!(
         events[0],
@@ -400,7 +773,11 @@ fn verify_input() -> Result<()> {
     assert!(feed(&mut interrupted, b"tail\x1e.\x1b[201~")?.is_empty());
     assert!(
         interrupted
-            .feed(b"\x1b[200~\x1eq\x1b[201~", PasteAdmission::Discard)?
+            .feed(
+                b"\x1b[200~\x1eq\x1b[201~",
+                PasteAdmission::Discard,
+                Instant::now()
+            )?
             .is_empty()
     );
     assert_eq!(
@@ -416,7 +793,9 @@ fn verify_input() -> Result<()> {
     let mut completing = vec![0x98, 0x83];
     completing.extend_from_slice(&[b'a'; MAX_INPUT_CHUNK - 2]);
     assert_eq!(
-        fragmented.feed(&completing, PasteAdmission::Capture)?.len(),
+        fragmented
+            .feed(&completing, PasteAdmission::Capture, Instant::now())?
+            .len(),
         MAX_INPUT_CHUNK - 1
     );
     println!(

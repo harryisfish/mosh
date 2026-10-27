@@ -659,6 +659,7 @@ enum InputNotice {
     Full,
     TooLarge,
     InvalidPaste,
+    SequenceTimeout,
     Ready,
 }
 
@@ -788,6 +789,7 @@ impl PendingInput {
                 Some(InputNotice::Full) => "Input not accepted. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
                 Some(InputNotice::TooLarge) => "Input too large. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
                 Some(InputNotice::InvalidPaste) => "Invalid paste. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
+                Some(InputNotice::SequenceTimeout) => "Input sequence timed out. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
                 Some(InputNotice::Ready) => "Input ready; retype refused input. Ctrl-^ then . detach; Ctrl-Z suspend; q close.",
                 None => "Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ send Ctrl-^.",
             });
@@ -800,6 +802,9 @@ impl PendingInput {
                     "Input not accepted: too large. Use smaller input. Ctrl-^ ? help."
                 }
                 InputNotice::InvalidPaste => "Paste not accepted: invalid UTF-8. Ctrl-^ ? help.",
+                InputNotice::SequenceTimeout => {
+                    "Input sequence timed out; please retype it. Ctrl-^ ? help."
+                }
                 InputNotice::Ready => "Input ready. Rejected input was not sent; please retype it.",
             });
         }
@@ -892,7 +897,6 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut clipboard_queries = VecDeque::<(u64, String, Instant)>::new();
     let mut resize_generation = 1u64;
     let mut size = LocalTerminal::size()?;
-    let mut last_escape = Instant::now();
     let mut remote_exit: Option<(i32, u64, u64)> = None;
     let mut resync_pending = false;
     let mut requested_resources = Instant::now() - Duration::from_secs(1);
@@ -940,6 +944,9 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 display.redraw_cached(size)?;
             }
             let mut resumed = false;
+            if captured.is_empty() {
+                captured = decoder.poll(Instant::now()).into();
+            }
             if !captured.is_empty() {
                 tokio::select! {
                     biased;
@@ -1059,9 +1066,6 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 }
                 _ = timer.tick() => {
                     display.tick()?;
-                    if captured.is_empty() && decoder.has_pending_escape() && last_escape.elapsed() >= Duration::from_millis(30) {
-                        captured = decoder.flush_escape().into();
-                    }
                 }
                 ready = tty.readable(), if captured.is_empty() => {
                     let mut ready = ready?;
@@ -1072,8 +1076,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                     match result {
                         Ok(Ok(0)) => return Ok(SessionAction::Detach),
                         Ok(Ok(count)) => {
-                            captured = decoder.feed(&buffer[..count], pending.paste_admission())?.into();
-                            last_escape = Instant::now();
+                            captured = decoder.feed(&buffer[..count], pending.paste_admission(), Instant::now())?.into();
                         }
                         Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => (),
                         Ok(Err(error)) => return Err(error).context("read local terminal"),
@@ -1119,6 +1122,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             pending.notice = Some(match reason {
                                 InputRejection::PasteTooLarge => InputNotice::TooLarge,
                                 InputRejection::InvalidPaste => InputNotice::InvalidPaste,
+                                InputRejection::SequenceTimeout => InputNotice::SequenceTimeout,
                             });
                         }
                     }

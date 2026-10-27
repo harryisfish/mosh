@@ -29,6 +29,23 @@ ATOMIC_SECOND_PASTE_BYTES = 128 * 1024 - 24 - 98
 GRANT_BEGIN = b"\x1eMOSH-RS-GRANT\n"
 GRANT_END = b"\x1eMOSH-RS-GRANT-END\n"
 SSH_LITERAL_ARG = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line"
+LEGACY_INPUT_EXPECTED = [
+    ("ESCAPE", b"\x1b"),
+    ("BRACKET", b"\x1b["),
+    ("SS3", b"\x1bO"),
+    ("LATE", b"\x1b[x"),
+    ("FUNCTIONS", b"\x1b[42~\x1b[43~\x1b[44~\x1b[45~\x1bOP\x1bOQ\x1bOR\x1bOS\x1b[15~"),
+    ("KEYPAD", b"\x1b[E\x1b[E="),
+    ("UTF8", "中".encode()),
+    ("PHASES", b"aa"),
+    ("TIMEOUT", b"after-timeout\r"),
+    ("RECOVERY", b"after-recovery\r"),
+    ("KITTY_RECOVERY", b"after-kitty\r"),
+    ("FILTERED", b"filtered\r"),
+    ("SUSPEND", b"after-suspend\r"),
+    ("APPLICATION", b"\x1bOX\x1b[E"),
+    ("KITTY", b"\x1b[57384;1:1u\x1b[1;1:1P\x1b[57415;1:1u\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u"),
+]
 
 
 def decode_grant(output):
@@ -58,6 +75,27 @@ def exact(data, timeout=5):
 def remote_fixture(mode, state):
     tty.setraw(0)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "legacy-input":
+        received = Path(state + ".received")
+        received.write_bytes(b"")
+        os.write(1, b"\x1b[2J\x1b[HLEGACY_INPUT_READY\r\n")
+        for name, expected in LEGACY_INPUT_EXPECTED:
+            if name == "APPLICATION":
+                os.write(1, b"\x1b=\r\nLEGACY_APPLICATION_READY\r\n")
+            elif name == "KITTY":
+                os.write(1, b"\x1b[>31u\r\nLEGACY_KITTY_READY\r\n")
+            observed = bytearray()
+            while len(observed) < len(expected):
+                assert select.select([0], [], [], 15)[0], (name, bytes(observed), expected)
+                chunk = os.read(0, len(expected) - len(observed))
+                assert chunk, (name, "legacy fixture input ended")
+                observed.extend(chunk)
+                with received.open("ab") as output:
+                    output.write(chunk)
+            assert bytes(observed) == expected, (name, bytes(observed), expected)
+            os.write(1, b"\r\nLEGACY_" + name.encode() + b"_OK\r\n")
+        os.write(1, b"\x1b[<u\r\nLEGACY_INPUT_DONE\r\n")
+        return 9
     if mode == "locale":
         locale.setlocale(locale.LC_CTYPE, "")
         observed = {key: os.environ.get(key) for key in ["LC_ALL", "LC_CTYPE", "LANG"]}
@@ -736,6 +774,112 @@ def verify_background_exit(command, state, termination):
         cleanup(state)
 
 
+def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
+    script = str(Path(__file__).resolve())
+    client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
+    state = str(Path(temporary) / "legacy-input.json")
+    process = TerminalProcess([client, "--local", "--server", server, "--predict", "never", "--",
+                               sys.executable, script, "--remote", "legacy-input", state])
+    facts = []
+    observed = Path(state + ".received")
+
+    def pump_for(duration):
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            process.pump(min(0.01, max(0, deadline - time.monotonic())))
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+
+    def confirmed(name):
+        process.until(b"LEGACY_" + name.encode() + b"_OK")
+        facts.append({"case": name, "received_bytes": observed.stat().st_size,
+                      "tty_bytes": len(process.output)})
+
+    def timeout():
+        start = len(process.output)
+        process.send(b"\x1b[12;")
+        process.until(b"Input sequence timed out", timeout=3, start=start)
+
+    try:
+        process.until(b"LEGACY_INPUT_READY")
+        original = json.loads(Path(state).read_text())
+        for name, key in [("ESCAPE", b"\x1b"), ("BRACKET", b"\x1b["), ("SS3", b"\x1bO")]:
+            process.send(key)
+            confirmed(name)
+        process.send(b"\x1b[")
+        pump_for(0.08)
+        process.send(b"x")
+        confirmed("LATE")
+        process.send(b"\x1b[42~\x1b[43~\x1b[44~\x1b[45~\x1b[[A\x1b[[B\x1b[[C\x1b[[D\x1b[[E")
+        confirmed("FUNCTIONS")
+        process.send(b"\x1b[E\x1bOE\x1bOX")
+        confirmed("KEYPAD")
+        process.send(b"\xe4")
+        pump_for(0.08)
+        process.send(b"\xb8\xad")
+        confirmed("UTF8")
+        process.send(b"\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u")
+        confirmed("PHASES")
+        before = observed.read_bytes()
+        timeout()
+        process.send(b"R")
+        pump_for(0.05)
+        assert observed.read_bytes() == before, "late CSI final escaped rejection"
+        process.send(b"after-timeout\r")
+        confirmed("TIMEOUT")
+        before = observed.read_bytes()
+        timeout()
+        process.send(b"1" * 8192)
+        start = len(process.output)
+        process.send(b"\x1e?")
+        process.until(b"Ctrl-^ then . detach", start=start)
+        assert observed.read_bytes() == before, "discarded CSI or management key reached the PTY"
+        process.send(b"after-recovery\r")
+        confirmed("RECOVERY")
+        before = observed.read_bytes()
+        timeout()
+        start = len(process.output)
+        process.send(b"\x1b[94;5u\x1b[63u")
+        process.until(b"Ctrl-^ then . detach", start=start)
+        assert observed.read_bytes() == before, "Kitty recovery escaped local management"
+        process.send(b"after-kitty\r")
+        confirmed("KITTY_RECOVERY")
+        process.send(b"\x1b[24;12R\x1b[?1;2c\x1b[4;1$y\x1b]52;c;YQ==\x1b\\"
+                     b"\x1bP\x1eq\x1b\\\x1b_\x1e.\x1b\\filtered\r")
+        confirmed("FILTERED")
+        start = len(process.output)
+        process.send(b"\x1b[12;")
+        os.kill(process.process.pid, signal.SIGSTOP)
+        time.sleep(0.2)
+        resumed_at = time.monotonic()
+        os.kill(process.process.pid, signal.SIGCONT)
+        process.until(b"Input sequence timed out", timeout=3, start=start)
+        facts.append({"case": "SIGCONT", "notice_after_resume": time.monotonic() - resumed_at})
+        process.send(b"Rafter-suspend\r")
+        confirmed("SUSPEND")
+        process.until(b"LEGACY_APPLICATION_READY")
+        process.send(b"\x1bOX\x1bOE")
+        confirmed("APPLICATION")
+        process.until(b"LEGACY_KITTY_READY")
+        process.send(b"\x1b[42~\x1b[[A\x1bOX\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u")
+        confirmed("KITTY")
+        process.until(b"LEGACY_INPUT_DONE")
+        process.finish(9)
+        assert observed.read_bytes() == b"".join(expected for _, expected in LEGACY_INPUT_EXPECTED)
+        assert json.loads(Path(state).read_text()) == original, "legacy input replaced the command"
+        print("CLI legacy input exact bytes, deadlines, late tails, Linux/F21/keypad, UTF-8, Kitty, filters, management recovery and SIGCONT passed "
+              + json.dumps({"received_bytes": observed.stat().st_size, "cases": facts}, sort_keys=True), flush=True)
+    finally:
+        if evidence_dir is not None:
+            output = evidence_dir / "legacy-input"
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "complete.tty").write_bytes(process.output)
+            (output / "cases.json").write_text(json.dumps(facts, indent=2) + "\n")
+            if observed.exists():
+                (output / "received.bin").write_bytes(observed.read_bytes())
+        process.close()
+        cleanup(state)
+
+
 def verify_liveness(bin_dir, temporary, evidence_dir=None):
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
     script = str(Path(__file__).resolve())
@@ -954,6 +1098,7 @@ else:
         print("CLI running background clients exit on TERM/HUP without touching the terminal or ending the remote command", flush=True)
 
         if network:
+            verify_legacy_input(bin_dir, temporary, evidence_dir)
             state = str(Path(temporary) / "network.json")
             wrapper = Path(temporary) / "bootstrap-proxy"
             wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
@@ -1383,12 +1528,16 @@ if __name__ == "__main__":
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
-    parser.add_argument("--evidence-dir", type=Path, help="save liveness raw TTY and relay observations")
+    parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
+    parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     arguments = parser.parse_args()
     if arguments.liveness:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-liveness-") as temporary:
             verify_liveness(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
+    elif arguments.legacy_input:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-legacy-input-") as temporary:
+            verify_legacy_input(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
     elif arguments.saturated_input:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-saturated-") as temporary:
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
