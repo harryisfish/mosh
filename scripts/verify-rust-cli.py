@@ -1234,7 +1234,7 @@ def verify_liveness(bin_dir, temporary, evidence_dir=None):
                 if not str(error).startswith(timeout_message + ":"):
                     raise
                 facts["original_timeout_after"] = time.monotonic() - restored_at
-                facts["original_timeout_error"] = timeout_message
+                facts["original_timeout_error"] = str(error)
                 facts["raw_udp_at_original_timeout"] = json.loads(Path(state + ".stats").read_text())
                 if evidence_dir is not None:
                     evidence_dir.mkdir(parents=True, exist_ok=True)
