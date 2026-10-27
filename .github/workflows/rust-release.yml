@@ -2,7 +2,27 @@ name: Rust release
 
 on:
   pull_request:
-    paths: ['.github/workflows/rust-release.yml', 'scripts/package-rust-release.sh']
+    paths:
+      - '.github/workflows/rust-release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust/**'
+      - 'install.sh'
+      - 'scripts/package-*-release.sh'
+      - 'scripts/verify-linux-packages.sh'
+      - 'scripts/verify-rust-cli.py'
+      - 'scripts/update-homebrew-formula.py'
+      - 'packaging/**'
+      - 'Formula/**'
+      - 'README*.md'
+      - 'COPYING'
+      - 'AUTHORS'
+      - 'THANKS'
+      - 'docs/rust-usage.md'
+      - 'docs/rust-protocol.md'
+      - 'docs/rust-macmini-verification.md'
+      - 'docs/rust-release.md'
+      - 'docs/releases/**'
   push:
     tags: ['rust-v*']
   workflow_dispatch:
@@ -21,6 +41,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            nfpm_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            nfpm_arch: arm64
           - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -32,9 +58,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      - name: Prepare the static musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools binutils
+          echo 'CC=musl-gcc' >> "$GITHUB_ENV"
+          linker_var="CARGO_TARGET_$(echo "$RELEASE_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          echo "$linker_var=musl-gcc" >> "$GITHUB_ENV"
       - name: Match the tag to the package version
         if: github.ref_type == 'tag'
         shell: bash
@@ -42,6 +79,17 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml)
           test "$GITHUB_REF_NAME" = "rust-v$version"
       - run: cargo build -p mosh-rs --bins --release --locked --target "$RELEASE_TARGET"
+      - name: Verify static musl linking
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          for binary in mosh-rs mosh-rs-server; do
+            readelf -l "target/$RELEASE_TARGET/release/$binary" > "$RUNNER_TEMP/$binary.program-headers"
+            if grep -q INTERP "$RUNNER_TEMP/$binary.program-headers"; then
+              echo "$binary unexpectedly requires a dynamic loader" >&2
+              exit 1
+            fi
+          done
       - name: Package and verify the extracted binaries
         shell: bash
         run: |
@@ -52,11 +100,35 @@ jobs:
           "$RUNNER_TEMP/$package/bin/mosh-rs" --version
           "$RUNNER_TEMP/$package/bin/mosh-rs-server" --version
           python3 scripts/verify-rust-cli.py --bin-dir "$RUNNER_TEMP/$package/bin" --network
+      - name: Install nFPM
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        env:
+          NFPM_VERSION: '2.48.0'
+          NFPM_ARCH: ${{ matrix.nfpm_arch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          cd "$RUNNER_TEMP/nfpm"
+          archive="nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"
+          release_url="https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION"
+          curl -fsSL "$release_url/$archive" -o "$archive"
+          curl -fsSL "$release_url/checksums.txt" -o checksums.txt
+          sha256sum --ignore-missing --check checksums.txt
+          tar -xzf "$archive" nfpm
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+      - name: Package and install on Linux distributions
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          bash scripts/package-native-release.sh "$RELEASE_TARGET"
+          bash scripts/verify-linux-packages.sh "$RELEASE_TARGET"
       - uses: actions/upload-artifact@v4
         with:
           name: mosh-rs-${{ matrix.target }}
           path: |
             target/dist/*.tar.gz
+            target/dist/*.deb
+            target/dist/*.rpm
             target/dist/*.sha256
           if-no-files-found: error
 
@@ -77,8 +149,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat target/dist/*.sha256 > target/dist/SHA256SUMS
+          cat target/dist/*.sha256 | sort -k 2 > target/dist/SHA256SUMS
+          (
+            cd target/dist
+            sha256sum --strict --check SHA256SUMS
+          )
           gh release create "$GITHUB_REF_NAME" --verify-tag \
             --title "mosh-rs ${GITHUB_REF_NAME#rust-v}" \
             --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
-            target/dist/*.tar.gz target/dist/SHA256SUMS
+            target/dist/*.tar.gz target/dist/*.deb target/dist/*.rpm target/dist/SHA256SUMS
