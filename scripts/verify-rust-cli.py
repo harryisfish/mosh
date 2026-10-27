@@ -568,6 +568,7 @@ def verify_prediction(bin_dir, temporary):
             process.send(b"\r")
             process.until(b"PREDICTION_DONE")
             process.finish(0)
+            assert b"\x1b[0;4mS" not in process.output[start:], "hidden prediction appeared in drained terminal output"
         finally:
             process.close()
             cleanup(state)
