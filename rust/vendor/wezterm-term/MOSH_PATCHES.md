@@ -112,6 +112,14 @@ Repeated enable commands cannot extend that deadline; disable re-arms it.
 
 # Verification
 
+`screen::set_line_wrapped` adapts the locked surface dependency's wide-tail
+setter. Its getter reads the last visible leader, while the Vec setter updates
+the raw spacer. The adapter calls the original setter first to retain sequence
+number and empty-line behavior, then synchronizes the wide leader and spacers.
+Both consumed-wrap sites and the reflow clear use this adapter. It traverses the
+line and can convert clustered wide lines to Vec storage. This is a fix for these
+three call sites, not a replacement for the surface dependency's other APIs.
+
 From the Mosh workspace run `cargo run -p mosh-rs --example verify_core`.
 The example exercises the actual modified core, not a mocked parser. It checks
 attributes, split graphemes, Kitty keyboard phases/alternate codes/text, keypad,

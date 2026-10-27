@@ -433,13 +433,15 @@ impl TerminalModel {
                     },
                     images,
                 };
-                postcard::to_io(&projected, &mut encoded_budget)?;
                 cells.push(projected);
             }
-            rows.push(Row {
+            let row = Row {
                 cells,
                 stable_id: screen.visible_row_to_stable_row(y as i64) as i64,
-            });
+                soft_wrapped: line.last_cell_was_wrapped(),
+            };
+            postcard::to_io(&row, &mut encoded_budget)?;
+            rows.push(row);
         }
         let live: BTreeSet<_> = self.terminal.live_image_keys().into_iter().collect();
         self.resources

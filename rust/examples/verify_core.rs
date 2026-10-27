@@ -67,6 +67,10 @@ fn main() -> Result<()> {
     {
         return verify_combining_transcript(&arguments[1..]);
     }
+    if arguments.first().is_some_and(|arg| arg == "--soft-wrap") {
+        return verify_soft_wrap_metadata();
+    }
+    verify_soft_wrap_metadata()?;
     verify_default_colors()?;
     verify_terminal_boundaries()?;
     verify_png_metadata()?;
@@ -115,9 +119,32 @@ fn main() -> Result<()> {
         prediction: screen.prediction,
         resources: Vec::new(),
     };
+    let rows_bytes = frame
+        .rows
+        .iter()
+        .map(|patch| postcard::to_io(&patch.row, CountBytes::default()).map(|count| count.0))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
+    let legacy_rows_bytes = frame
+        .rows
+        .iter()
+        .map(|patch| {
+            postcard::to_io(
+                &(&patch.row.cells, patch.row.stable_id),
+                CountBytes::default(),
+            )
+            .map(|count| count.0)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
+    assert_eq!(rows_bytes - legacy_rows_bytes, 256);
     let bytes = postcard::to_io(&frame, CountBytes::default())?.0;
     assert!(bytes <= MAX_FRAME);
-    println!("maximum 512x256 full RGB text frame: {bytes} postcard bytes");
+    println!(
+        "maximum 512x256 full RGB text frame: {bytes} postcard bytes, {rows_bytes} Row bytes including 256 wrap metadata bytes"
+    );
     drop(frame);
     drop(large);
 
@@ -563,7 +590,9 @@ fn verify_terminal_boundaries() -> Result<()> {
             );
             let original = screen.rows.clone();
             let mut displays = [Graphics::Kitty, Graphics::Sixel].map(|graphics| {
-                let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+                let mut display =
+                    Display::new(Vec::new(), graphics, PredictionPolicy::Never, screen.size)
+                        .expect("display viewport");
                 display.set_epoch(1).expect("set display epoch");
                 display
             });
@@ -844,7 +873,12 @@ fn checked(model: &mut TerminalModel) -> Result<Screen> {
         format!("\x1b[{};{}R", screen.cursor.y + 1, screen.cursor.x + 1).as_bytes()
     );
     let frame = state::frame(1, 1, 0, &screen, None)?;
-    let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
+    let mut display = Display::new(
+        Vec::new(),
+        Graphics::None,
+        PredictionPolicy::Never,
+        screen.size,
+    )?;
     display.set_epoch(1)?;
     assert!(display.install(&frame, &screen.resources)?);
     Ok(screen)
@@ -939,7 +973,7 @@ fn verify_projection_regressions() -> Result<()> {
     assert_eq!(tiles.len(), 8);
     assert!(tiles.iter().all(|tile| tile.source == [0, 0, 1, 1]));
     for graphics in [Graphics::Kitty, Graphics::Sixel] {
-        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never, screen.size)?;
         display.set_epoch(1)?;
         display.install(&state::frame(1, 1, 0, &screen, None)?, &screen.resources)?;
     }
@@ -1409,5 +1443,134 @@ fn verify_scrollback_wrap() -> Result<()> {
     println!(
         "2048 scrolling lines with split combining text, snapshots, continuation and DSR passed"
     );
+    Ok(())
+}
+
+fn verify_soft_wrap_metadata() -> Result<()> {
+    #[derive(Debug)]
+    struct WrapConfig;
+    impl tattoy_wezterm_term::TerminalConfiguration for WrapConfig {
+        fn color_palette(&self) -> tattoy_wezterm_term::color::ColorPalette {
+            Default::default()
+        }
+    }
+    for cols in [4, 512] {
+        let mut core = tattoy_wezterm_term::Terminal::new(
+            tattoy_wezterm_term::TerminalSize {
+                cols,
+                rows: 4,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::new(WrapConfig),
+            "wrap-verification",
+            "0",
+            Box::new(std::io::sink()),
+        );
+        core.advance_bytes(format!(
+            "{}\r\x1b[2K\x1b[38;2;11;22;33m{}界",
+            "0".repeat(cols),
+            "a".repeat(cols - 2)
+        ));
+        let physical = core.screen().phys_row(0);
+        let before = core
+            .screen()
+            .lines_in_phys_range(physical..physical + 1)
+            .remove(0);
+        assert!(!before.last_cell_was_wrapped());
+        let seqno = before.current_seqno();
+        let style = before.visible_cells().last().unwrap().attrs().clone();
+        core.advance_bytes(b"Z");
+        let mut wrapped = core
+            .screen()
+            .lines_in_phys_range(physical..physical + 1)
+            .remove(0);
+        assert!(wrapped.current_seqno() > seqno);
+        assert!(wrapped.last_cell_was_wrapped());
+        let raw = wrapped.cells_mut_for_attr_changes_only();
+        assert!(raw[cols - 2].attrs().wrapped() && raw[cols - 1].attrs().wrapped());
+        assert_eq!(raw[cols - 2].attrs().foreground(), style.foreground());
+        let mut logical = tattoy_wezterm_term::Line::new(100);
+        for x in 0..cols - 2 {
+            logical.set_cell_grapheme(x, "a", 1, style.clone(), 100);
+        }
+        logical.set_cell_grapheme(cols - 2, "界", 2, style.clone(), 100);
+        let mut next = tattoy_wezterm_term::Line::new(100);
+        next.set_cell_grapheme(0, "Z", 1, style.clone(), 100);
+        logical.append_line(next, 101);
+        let lines = logical.wrap(cols, 102);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.last_cell_was_wrapped())
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert!(lines.iter().all(|line| line.current_seqno() >= 102));
+        assert_eq!(lines[0].visible_cells().last().unwrap().str(), "界");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.visible_cells())
+                .all(|cell| cell.attrs().foreground() == style.foreground())
+        );
+    }
+    for cols in [4, 512] {
+        let size = Size {
+            cols,
+            rows: 4,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        for overwritten in [false, true] {
+            let mut model = TerminalModel::new(size, false)?;
+            if overwritten {
+                model.advance(format!("{}\r\x1b[2K", "0".repeat(usize::from(cols))).as_bytes())?;
+            }
+            let prefix = "a".repeat(usize::from(cols) - 2);
+            model.advance(format!("{prefix}界").as_bytes())?;
+            let full = model.snapshot()?;
+            assert!(
+                !full.rows[0].soft_wrapped,
+                "pending wrap is not an outgoing connection"
+            );
+            model.advance(b"Z")?;
+            let wrapped = model.snapshot()?;
+            assert!(
+                wrapped.rows[0].soft_wrapped,
+                "wide leader must carry consumed wrap"
+            );
+            assert_eq!(wrapped.rows[0].cells.last().unwrap().text, "界");
+            assert_eq!(wrapped.rows[1].cells[0].text, "Z");
+            model.resize(Size {
+                cols: cols / 2,
+                ..size
+            })?;
+            let narrow = model.snapshot()?;
+            assert!(narrow.rows[0].soft_wrapped);
+            assert!(narrow.rows[1].soft_wrapped);
+            model.resize(size)?;
+            let restored = model.snapshot()?;
+            assert_eq!(restored.rows[0].cells, wrapped.rows[0].cells);
+            assert_eq!(restored.rows[1].cells[0].text, "Z");
+            assert!(restored.rows[0].soft_wrapped);
+            assert!(
+                !restored.rows[1].soft_wrapped,
+                "reflow must clear the old wide spacer flag"
+            );
+            println!(
+                "core soft-wrap cols={cols}, overwritten={overwritten}: pending, wide leader/spacer, narrow/wide reflow passed"
+            );
+        }
+    }
+    let mut old_row = serde_json::json!({"cells": [], "stable_id": 0});
+    assert!(
+        serde_json::from_value::<Row>(old_row.clone()).is_err(),
+        "v5 Row must not silently default metadata"
+    );
+    old_row["soft_wrapped"] = true.into();
+    assert!(serde_json::from_value::<Row>(old_row)?.soft_wrapped);
     Ok(())
 }

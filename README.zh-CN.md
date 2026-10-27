@@ -10,7 +10,7 @@
 本项目是 [Mosh](https://github.com/mobile-shell/mosh) 的 Rust 重写版本。
 客户端和服务端分别为 `mosh-rs` 与 `mosh-rs-server`。
 
-当前源码使用协议 v5，与原版 Mosh 协议和较早的 Rust 协议均不兼容。
+当前源码使用协议 v6，与原版 Mosh 协议和较早的 Rust 协议均不兼容。
 客户端和服务端请安装同一版本。
 
 ## 安装

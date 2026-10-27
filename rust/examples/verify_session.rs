@@ -183,9 +183,15 @@ struct View {
 }
 
 impl View {
-    fn new() -> Self {
+    fn new(viewport: Size) -> Self {
         Self {
-            display: Display::new(Vec::new(), Graphics::Kitty, PredictionPolicy::Never),
+            display: Display::new(
+                Vec::new(),
+                Graphics::Kitty,
+                PredictionPolicy::Never,
+                viewport,
+            )
+            .expect("display viewport"),
             resources: BTreeMap::new(),
             pending: None,
             effects: BTreeMap::new(),
@@ -496,7 +502,7 @@ async fn verify() -> Result<()> {
         task: Some(task),
     };
     let client = identity.endpoint(&grant)?;
-    let mut view = View::new();
+    let mut view = View::new(request.size);
     let mut attempt = 1;
     let mut peer = Peer::attach(&client, &grant, &mut view, attempt, None, 3).await?;
     view.wait_text(&mut peer, "LEGACY_READY").await?;
@@ -983,7 +989,7 @@ async fn verify_liveness() -> Result<()> {
         task: Some(task),
     };
     let client = identity.endpoint(&grant)?;
-    let mut view = View::new();
+    let mut view = View::new(request.size);
     view.ack_effects = true;
     let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 3).await?;
     view.wait_text(&mut peer, "CLOSE_READY").await?;
@@ -1189,8 +1195,8 @@ async fn verify_prepared() -> Result<()> {
         connection.close(0_u32.into(), b"invalid fixture complete");
     }
 
-    let mut first_view = View::new();
-    let mut view = View::new();
+    let mut first_view = View::new(request.size);
+    let mut view = View::new(request.size);
     view.ack_effects = true;
     let (first, second) = tokio::join!(
         Peer::attach(&client, &ipv4_grant, &mut first_view, 1, None, 3),
@@ -1211,7 +1217,7 @@ async fn verify_prepared() -> Result<()> {
         "competing first attachments started more than one command"
     );
     ensure!(
-        Peer::attach(&client, &grant, &mut View::new(), 1, None, 3)
+        Peer::attach(&client, &grant, &mut View::new(request.size), 1, None, 3)
             .await
             .is_err(),
         "obsolete attachment was accepted after command startup"
@@ -1296,7 +1302,7 @@ async fn verify_prepared() -> Result<()> {
         endpoint,
     };
     let client = identity.endpoint(&grant)?;
-    let failure = Peer::attach(&client, &grant, &mut View::new(), 1, None, 3).await;
+    let failure = Peer::attach(&client, &grant, &mut View::new(missing.size), 1, None, 3).await;
     let Err(error) = failure else {
         bail!("missing executable produced a successful attachment");
     };
@@ -1343,7 +1349,7 @@ async fn verify_locale() -> Result<()> {
     let actor = SessionActor::new(&request, grant.session.clone())?;
     let task = tokio::task::spawn_local(actor.run(endpoint.clone()));
     let client = identity.endpoint(&grant)?;
-    let mut view = View::new();
+    let mut view = View::new(request.size);
     let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 1).await?;
     view.wait_text(&mut peer, "LOCALE_READY").await?;
     let text = view.text();
@@ -1420,7 +1426,7 @@ async fn verify_close() -> Result<()> {
         endpoint,
     };
     let client = identity.endpoint(&grant)?;
-    let mut view = View::new();
+    let mut view = View::new(request.size);
     view.ack_effects = true;
     let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 3).await?;
     view.wait_text(&mut peer, "CLOSE_READY").await?;

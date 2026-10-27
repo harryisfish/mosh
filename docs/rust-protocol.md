@@ -3,9 +3,9 @@
 This is the implementation contract for the Rust client and server. The protocol
 is not compatible with the original Mosh wire protocol.
 
-The current Rust protocol is version 5, with ALPN `mosh-rs/5`. Both endpoints
-must use this version. Earlier Rust workers cannot resume with a version 5 client.
-Version 4 peers are rejected by bootstrap, grant, Attach, and ALPN validation.
+The current Rust protocol is version 6, with ALPN `mosh-rs/6`. Both endpoints
+must use this version. Earlier Rust workers cannot resume with a version 6 client.
+Version 5 peers are rejected by bootstrap, grant, Attach, and ALPN validation.
 
 ## Ownership and authentication
 
@@ -127,7 +127,7 @@ The deadline does not apply inside paste, OSC/DCS/APC strings, or an identified
 X10 mouse event's three payload bytes. These bodies cannot execute local escape
 commands. The captured input tail is processed before a clock-only expiry.
 Suspension does not refresh keyboard deadlines. Refusals allocate no input seq
-and cannot be replayed later. The wire remains version 5; Linux F1-F5,
+and cannot be replayed later. The wire uses version 6; Linux F1-F5,
 xterm F21-F24, Keypad Begin, and Keypad Equal use existing semantic keys.
 
 An extremely slow reply beginning with bare `ESC [` is indistinguishable from
@@ -221,6 +221,28 @@ frame. Server input encoding uses its current keyboard, mouse, focus, and paste
 modes. Key press, repeat, release, alternate key codes, and associated text remain
 distinct semantic fields. Paste is UTF-8 text, with nested paste markers removed.
 
+Each row carries `soft_wrapped`, its outgoing connection to the next physical row.
+A full last column alone does not set this flag. The core sets it when a subsequent
+printable character consumes pending wrap. Deltas compare the complete row,
+including this flag. Version 6 requires the field and rejects version 5 peers.
+
+The display retains the canonical rows and the last observed local viewport.
+It redraws complete connected groups across the old and new row boundaries,
+including gaps and trailing blanks. An ASCII space consumes each visible soft
+wrap before the next row is overwritten, so adjacent regional indicators cannot
+combine across that boundary. Automatic wrapping is disabled outside these draws.
+The bottom row never consumes pending wrap. Different source and local column
+counts, a hidden successor, or a status overlay on row zero temporarily produce
+hard boundaries. Clearing the overlay or restoring matching dimensions rebuilds
+the connections without changing the canonical flags. Prediction is disabled
+when the column counts differ or the cursor row is outside the local viewport.
+
+Verification compares actual renderer output through the terminal core for cells,
+styles, cursor, and connections. Native terminal selection and clipboard copying
+remain unverified. Cells and the row flag cannot distinguish padding before an
+early wide-character wrap from spaces typed by the user, so they do not reconstruct
+the original input byte stream.
+
 Static Kitty direct-data, SIXEL, and inline image data are decoded under limits
 before display projection. Files and shared memory are never forwarded or read.
 Parser accumulation, decompression, decoding, unplaced uploads, live resources,
@@ -244,6 +266,9 @@ Windows are at most 512 columns by 256 rows. A control message is at most 512 Ki
 a decoded or compressed frame is at most 16 MiB. An image is at most 16 MiB RGBA.
 Each cell contains at most 4096 image tiles, and a screen at most 262144 tiles.
 The frame byte budget can require a smaller tile limit.
+Snapshot encoding counts each complete row, including its metadata, against
+the 16 MiB frame limit with 1 MiB reserved for the frame envelope. Text and
+hyperlinks retain their separate 4 MiB snapshot budget.
 Each current screen, the core's decoded image store, and the adapter's exported
 cache have separate 64 MiB limits. The actor retains at most 128 MiB of unique
 resources across display roots plus two independent resource transfers. A client

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CELL_IMAGES: usize = 4096;
@@ -290,6 +290,7 @@ pub struct Cell {
 pub struct Row {
     pub cells: Vec<Cell>,
     pub stable_id: i64,
+    pub soft_wrapped: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

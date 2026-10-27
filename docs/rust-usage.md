@@ -308,6 +308,7 @@ python3 scripts/verify-rust-cli.py --saturated-input
 python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
 python3 scripts/verify-rust-cli.py --redraw --evidence-dir /tmp/mosh-rs-redraw
 python3 scripts/verify-rust-cli.py --combining --evidence-dir /tmp/mosh-rs-combining
+python3 scripts/verify-rust-cli.py --soft-wrap --evidence-dir /tmp/mosh-rs-soft-wrap
 python3 scripts/verify-rust-cli.py --liveness --evidence-dir /tmp/mosh-rs-liveness
 ```
 
@@ -341,13 +342,19 @@ erase/newline boundaries, byte-split UTF-8, repeated marks, normal bases,
 format filtering and trailing selectors. It saves remote raw chunks, TTY
 transcripts and process IDs, then checks exact cell text, widths and cursor
 positions by replaying the CLI output through the terminal core.
+`--network` also runs `--soft-wrap`. This case checks soft and hard URL rows,
+wide characters, regional indicators, cached Ctrl-L, resize, and SIGCONT mode
+restoration over a real PTY and UDP relay. Its evidence includes source chunks,
+TTY output, process IDs, and replayed cells, styles, cursor, and wrap flags.
+Reported frame and row metadata sizes come from reconstructed snapshots and
+postcard encoding. They are not captured server frames or encrypted wire sizes.
 These transcript checks do not verify native terminal visuals or selection.
 They do not establish other-platform or comprehensive performance acceptance.
 
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
-Both Rust endpoints must use protocol version 5. Earlier Rust workers
+Both Rust endpoints must use protocol version 6. Earlier Rust workers
 cannot resume with the new client. No compatibility with the old Mosh wire
 protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client

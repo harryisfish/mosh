@@ -23,7 +23,7 @@ use crate::model::{
     validate_locale_candidates,
 };
 
-const ALPN: &[u8] = b"mosh-rs/5";
+const ALPN: &[u8] = b"mosh-rs/6";
 const FRAME_STREAM: u8 = 1;
 const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;

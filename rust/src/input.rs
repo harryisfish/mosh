@@ -1020,7 +1020,7 @@ impl LocalTerminal {
             tty,
             saved: Some(saved),
         };
-        if let Err(error) = guard.tty.write_all(b"\x1b[22;0t\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1006h\x1b[>31u\x1b[?25l").and_then(|_| guard.tty.flush()) {
+        if let Err(error) = guard.tty.write_all(b"\x1b[22;0t\x1b[?1049h\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1006h\x1b[>31u\x1b[?25l").and_then(|_| guard.tty.flush()) {
             drop(guard);
             return Err(error).context("enable terminal input modes");
         }
@@ -1037,7 +1037,7 @@ impl LocalTerminal {
             io::Error::last_os_error()
         );
         self.tty.write_all(
-            b"\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1006h\x1b[=31u\x1b[?25l",
+            b"\x1b[?1049h\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1006h\x1b[=31u\x1b[?25l",
         )?;
         self.tty.flush()?;
         Ok(())
@@ -1049,7 +1049,7 @@ impl LocalTerminal {
         }
         require_foreground()?;
         let saved = self.saved.take().expect("owned terminal modes");
-        let output = self.tty.write_all(b"\x1b[?2026l\x1b_Ga=d,d=A,q=2\x1b\\\x1b[<u\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b]8;;\x1b\\\x1b[0m\x1b[?5l\x1b[?25h\x1b[?7h\x1b[?1049l\x1b[23;0t")
+        let output = self.tty.write_all(b"\x1b[?2026l\x1b_Ga=d,d=A,q=2\x1b\\\x1b[<u\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b]8;;\x1b\\\x1b[0m\x1b[?5l\x1b[?25h\x1b[?6l\x1b[?69l\x1b[r\x1b[?7h\x1b[?1049l\x1b[23;0t")
             .and_then(|_| self.tty.flush());
         let restored = unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &saved) };
         output?;

@@ -46,6 +46,19 @@ pub struct Screen {
     pub(crate) saved_cursor: Option<SavedCursor>,
 }
 
+pub(crate) fn set_line_wrapped(line: &mut Line, wrapped: bool, seqno: SequenceNo) {
+    line.set_last_cell_was_wrapped(wrapped, seqno);
+    let last = line.visible_cells().last().map(|cell| (cell.cell_index(), cell.width()));
+    if let Some((index, width)) = last {
+        if width > 1 {
+            // The surface getter reads the wide leader; its Vec setter writes the spacer.
+            for cell in &mut line.cells_mut_for_attr_changes_only()[index..] {
+                cell.attrs_mut().set_wrapped(wrapped);
+            }
+        }
+    }
+}
+
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
     if allow_scrollback {
         config.scrollback_size()
@@ -115,7 +128,7 @@ impl Screen {
             let was_wrapped = line.last_cell_was_wrapped();
 
             if was_wrapped {
-                line.set_last_cell_was_wrapped(false, seqno);
+                set_line_wrapped(&mut line, false, seqno);
             }
 
             let line = match logical_line.take() {

@@ -202,7 +202,7 @@ impl<'a> Performer<'a> {
                         let y = self.cursor.y;
                         self.screen_mut().set_cell_grapheme(x, y, " ", 1, attrs.clone(), seqno);
                         let row = self.screen().phys_row(y);
-                        self.screen_mut().line_mut(row).set_last_cell_was_wrapped(true, seqno);
+                        crate::screen::set_line_wrapped(self.screen_mut().line_mut(row), true, seqno);
                         self.new_line(true);
                         x = self.cursor.x;
                     }
@@ -284,7 +284,7 @@ impl<'a> Performer<'a> {
                             .map(|cell| makes_sense_to_wrap(cell.str()))
                             .unwrap_or(false);
                     if should_mark_wrapped {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+                        crate::screen::set_line_wrapped(screen.line_mut(y), true, seqno);
                     }
                 }
                 self.new_line(true);
