@@ -44,15 +44,56 @@ pub enum PredictionPolicy {
     Adaptive,
 }
 
-#[derive(Clone, Debug)]
-struct Guess {
-    seq: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PredictionStamp {
     generation: u64,
+    echo_enabled: bool,
+    eligible: bool,
+    alternate_screen: bool,
+}
+
+impl From<PredictionContext> for PredictionStamp {
+    fn from(context: PredictionContext) -> Self {
+        Self {
+            generation: context.generation,
+            echo_enabled: context.echo_enabled,
+            eligible: context.eligible,
+            alternate_screen: context.alternate_screen,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PredictionToken {
+    seq: u64,
+    local_epoch: u64,
+    remote: PredictionStamp,
     x: u16,
     y: u16,
-    text: char,
+    glyph: char,
+    original: Option<Cell>,
     shown: bool,
     expires: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PredictionLedger {
+    local_epoch: u64,
+    remote: Option<PredictionStamp>,
+    tokens: VecDeque<PredictionToken>,
+    confidence: u8,
+}
+
+impl PredictionLedger {
+    fn clear(&mut self) {
+        self.tokens.clear();
+        self.confidence = 0;
+    }
+
+    fn bump_epoch(&mut self) {
+        self.local_epoch = self.local_epoch.saturating_add(1);
+        self.clear();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,8 +117,7 @@ pub struct Display<W> {
     screen: Option<Screen>,
     graphics: Graphics,
     policy: PredictionPolicy,
-    guesses: VecDeque<Guess>,
-    confidence: u8,
+    predictions: PredictionLedger,
     image_ids: BTreeMap<Digest, u32>,
     placements: Vec<Placement>,
     next_image_id: u32,
@@ -97,8 +137,7 @@ impl<W> Display<W> {
                 screen: self.screen,
                 graphics: self.graphics,
                 policy: self.policy,
-                guesses: self.guesses,
-                confidence: self.confidence,
+                predictions: self.predictions,
                 image_ids: self.image_ids,
                 placements: self.placements,
                 next_image_id: self.next_image_id,
@@ -127,8 +166,7 @@ impl<W: Write> Display<W> {
             screen: None,
             graphics,
             policy: prediction,
-            guesses: VecDeque::new(),
-            confidence: 0,
+            predictions: PredictionLedger::default(),
             image_ids: BTreeMap::new(),
             placements: Vec::new(),
             next_image_id: 1,
@@ -138,12 +176,15 @@ impl<W: Write> Display<W> {
         }
     }
 
-    pub fn set_epoch(&mut self, epoch: u64) {
+    pub fn set_epoch(&mut self, epoch: u64) -> Result<()> {
         if epoch != self.epoch {
+            self.clear_guesses()?;
             self.epoch = epoch;
             self.checkpoint_required = true;
-            self.confidence = 0;
+            self.predictions.bump_epoch();
+            self.predictions.remote = None;
         }
+        Ok(())
     }
 
     pub fn epoch(&self) -> u64 {
@@ -166,8 +207,7 @@ impl<W: Write> Display<W> {
     }
 
     pub fn into_cached(mut self) -> (Display<()>, W) {
-        self.guesses.clear();
-        self.confidence = 0;
+        self.predictions.clear();
         self.image_ids.clear();
         self.placements.clear();
         self.with_writer(())
@@ -198,36 +238,43 @@ impl<W: Write> Display<W> {
         }
         let mut screen = self.assemble(frame, resources)?;
         let graphics = prepare_graphics(&screen, self.graphics)?;
-        let mode_changed = self.screen.as_ref().is_none_or(|old| {
-            old.prediction.generation != screen.prediction.generation
-                || old.prediction.echo_enabled != screen.prediction.echo_enabled
-        });
+        let stamp = PredictionStamp::from(screen.prediction);
+        let mode_changed = self.predictions.remote.is_some_and(|old| old != stamp);
         let mut repaint = BTreeSet::new();
-        for guess in &self.guesses {
-            if guess.shown {
-                repaint.insert(guess.y);
+        for token in &self.predictions.tokens {
+            if token.shown {
+                repaint.insert(token.y);
             }
         }
         if mode_changed {
-            self.guesses.clear();
-            self.confidence = 0;
+            self.predictions.bump_epoch();
         } else {
             while self
-                .guesses
+                .predictions
+                .tokens
                 .front()
-                .is_some_and(|guess| guess.seq <= frame.echo_through)
+                .is_some_and(|token| token.seq <= frame.echo_through)
             {
-                let guess = self.guesses.pop_front().unwrap();
-                if char_at(&screen, guess.x, guess.y) == Some(guess.text) {
-                    self.confidence = self.confidence.saturating_add(1).min(8);
-                } else {
-                    self.confidence = 0;
-                    self.guesses.clear();
+                let token = self.predictions.tokens.pop_front().unwrap();
+                let new_glyph = char_at(&screen, token.x, token.y);
+                let original_glyph = token.original.as_ref().and_then(cell_glyph);
+                if token.local_epoch == self.predictions.local_epoch
+                    && new_glyph == Some(token.glyph)
+                    && original_glyph != Some(token.glyph)
+                {
+                    self.predictions.confidence =
+                        self.predictions.confidence.saturating_add(1).min(8);
+                } else if new_glyph != Some(token.glyph) {
+                    self.predictions.confidence = 0;
+                    self.predictions.tokens.clear();
                     break;
                 }
             }
-            self.guesses.retain(|guess| guess.expires > Instant::now());
+            self.predictions
+                .tokens
+                .retain(|token| token.expires > Instant::now());
         }
+        self.predictions.remote = Some(stamp);
         let checkpoint = frame.base.is_none()
             || self
                 .screen
@@ -242,12 +289,12 @@ impl<W: Write> Display<W> {
             repaint.insert(0);
         }
         if self
-            .guesses
+            .predictions
+            .tokens
             .iter()
-            .any(|guess| guess.generation != screen.prediction.generation)
+            .any(|token| token.remote != stamp)
         {
-            self.guesses.clear();
-            self.confidence = 0;
+            self.predictions.clear();
         }
         self.writer.write_all(b"\x1b[?2026h\x1b[?25l")?;
         if checkpoint || self.graphics == Graphics::Sixel {
@@ -263,7 +310,12 @@ impl<W: Write> Display<W> {
         }
         self.render_graphics(&graphics)?;
         self.render_metadata(&screen)?;
-        render_guesses(&mut self.writer, &self.guesses, &screen)?;
+        render_guesses(
+            &mut self.writer,
+            &self.predictions.tokens,
+            self.predictions.local_epoch,
+            &screen,
+        )?;
         if !self.status.is_empty() {
             render_status(&mut self.writer, &screen, &self.status)?;
         }
@@ -423,6 +475,25 @@ impl<W: Write> Display<W> {
     }
 
     pub fn predict(&mut self, seq: u64, event: &InputEvent) -> Result<()> {
+        let InputEvent::Key(key) = event else {
+            self.invalidate_predictions()?;
+            return Ok(());
+        };
+        if key.phase == KeyPhase::Release {
+            return Ok(());
+        }
+        let KeyCode::Char(text) = key.code else {
+            self.invalidate_predictions()?;
+            return Ok(());
+        };
+        if !text.is_ascii()
+            || text.is_ascii_control()
+            || key.modifiers & !1 != 0
+            || key.text.as_ref().is_some_and(|s| s != &text.to_string())
+        {
+            self.invalidate_predictions()?;
+            return Ok(());
+        }
         if self.policy == PredictionPolicy::Never {
             return Ok(());
         }
@@ -431,30 +502,16 @@ impl<W: Write> Display<W> {
         };
         if !screen.prediction.eligible {
             return Ok(());
-        }
-        let InputEvent::Key(key) = event else {
-            return self.clear_guesses();
         };
-        if key.phase == KeyPhase::Release {
+        if self.predictions.tokens.len() >= 256 {
+            self.clear_guesses()?;
             return Ok(());
         }
-        let KeyCode::Char(text) = key.code else {
-            return self.clear_guesses();
-        };
-        if !text.is_ascii()
-            || text.is_ascii_control()
-            || key.modifiers & !1 != 0
-            || key.text.as_ref().is_some_and(|s| s != &text.to_string())
-        {
-            return self.clear_guesses();
-        }
-        if self.guesses.len() >= 256 {
-            return self.clear_guesses();
-        }
         let (x, y) = self
-            .guesses
+            .predictions
+            .tokens
             .back()
-            .map(|guess| (guess.x + 1, guess.y))
+            .map(|token| (token.x + 1, token.y))
             .unwrap_or((screen.cursor.x, screen.cursor.y));
         if x >= screen.size.cols.saturating_sub(1) {
             return Ok(());
@@ -467,20 +524,27 @@ impl<W: Write> Display<W> {
             return Ok(());
         }
         let shown = screen.prediction.echo_enabled
-            || (self.policy == PredictionPolicy::Adaptive && self.confidence >= 3);
-        let guess = Guess {
+            || (self.policy == PredictionPolicy::Adaptive && self.predictions.confidence >= 3);
+        let token = PredictionToken {
             seq,
-            generation: screen.prediction.generation,
+            local_epoch: self.predictions.local_epoch,
+            remote: PredictionStamp::from(screen.prediction),
             x,
             y,
-            text,
+            glyph: text,
+            original: cell_at(screen, x, y).cloned(),
             shown,
             expires: Instant::now() + Duration::from_millis(750),
         };
-        self.guesses.push_back(guess);
+        self.predictions.tokens.push_back(token);
         if shown {
             self.writer.write_all(b"\x1b[?2026h")?;
-            render_guesses(&mut self.writer, &self.guesses, screen)?;
+            render_guesses(
+                &mut self.writer,
+                &self.predictions.tokens,
+                self.predictions.local_epoch,
+                screen,
+            )?;
             let cursor = self.overlay_cursor(screen);
             render_cursor(&mut self.writer, screen, cursor)?;
             self.writer.write_all(b"\x1b[?2026l")?;
@@ -491,9 +555,10 @@ impl<W: Write> Display<W> {
 
     pub fn tick(&mut self) -> Result<()> {
         if self
-            .guesses
+            .predictions
+            .tokens
             .iter()
-            .any(|guess| guess.expires <= Instant::now())
+            .any(|token| token.expires <= Instant::now())
         {
             self.clear_guesses()?;
         }
@@ -502,12 +567,13 @@ impl<W: Write> Display<W> {
 
     fn clear_guesses(&mut self) -> Result<()> {
         let rows: BTreeSet<_> = self
-            .guesses
+            .predictions
+            .tokens
             .iter()
-            .filter(|guess| guess.shown)
-            .map(|guess| guess.y)
+            .filter(|token| token.shown)
+            .map(|token| token.y)
             .collect();
-        self.guesses.clear();
+        self.predictions.clear();
         if !rows.is_empty()
             && let Some(screen) = self.screen.clone()
         {
@@ -531,12 +597,19 @@ impl<W: Write> Display<W> {
         Ok(())
     }
 
+    fn invalidate_predictions(&mut self) -> Result<()> {
+        self.clear_guesses()?;
+        self.predictions.bump_epoch();
+        Ok(())
+    }
+
     fn overlay_cursor(&self, screen: &Screen) -> (u16, u16) {
-        self.guesses
+        self.predictions
+            .tokens
             .iter()
             .rev()
-            .find(|guess| guess.shown)
-            .map(|guess| (guess.x + 1, guess.y))
+            .find(|token| token.shown)
+            .map(|token| (token.x + 1, token.y))
             .unwrap_or((screen.cursor.x, screen.cursor.y))
     }
 
@@ -546,7 +619,6 @@ impl<W: Write> Display<W> {
             "invalid connection status"
         );
         self.clear_guesses()?;
-        self.confidence = 0;
         self.status = text.into();
         if let Some(screen) = self.screen.clone() {
             let graphics = prepare_graphics(&screen, self.graphics)?;
@@ -577,8 +649,7 @@ impl<W: Write> Display<W> {
         let Some(mut screen) = self.screen.clone() else {
             return self.write_status(&self.status.clone());
         };
-        self.guesses.clear();
-        self.confidence = 0;
+        self.predictions.clear();
         self.image_ids.clear();
         self.placements.clear();
         screen.size.cols = screen.size.cols.min(size.cols);
@@ -803,12 +874,19 @@ fn validate_selection(selection: &str) -> Result<()> {
 }
 
 fn char_at(screen: &Screen, x: u16, y: u16) -> Option<char> {
-    let cell = screen
+    cell_at(screen, x, y).and_then(cell_glyph)
+}
+
+fn cell_at(screen: &Screen, x: u16, y: u16) -> Option<&Cell> {
+    screen
         .rows
         .get(usize::from(y))?
         .cells
         .iter()
-        .find(|cell| cell.x == x && cell.width == 1)?;
+        .find(|cell| cell.x == x && cell.width == 1)
+}
+
+fn cell_glyph(cell: &Cell) -> Option<char> {
     let mut chars = cell.text.chars();
     let ch = chars.next()?;
     chars.next().is_none().then_some(ch)
@@ -1100,16 +1178,18 @@ fn write_sixel(writer: &mut impl Write, image: &Resource) -> Result<()> {
 
 fn render_guesses(
     writer: &mut impl Write,
-    guesses: &VecDeque<Guess>,
+    tokens: &VecDeque<PredictionToken>,
+    local_epoch: u64,
     screen: &Screen,
 ) -> Result<()> {
-    for guess in guesses {
-        if !guess.shown || guess.generation != screen.prediction.generation {
+    let stamp = PredictionStamp::from(screen.prediction);
+    for token in tokens {
+        if !token.shown || token.local_epoch != local_epoch || token.remote != stamp {
             continue;
         }
-        cup(writer, guess.x, guess.y)?;
+        cup(writer, token.x, token.y)?;
         writer.write_all(b"\x1b]8;;\x1b\\\x1b[0;4m")?;
-        write!(writer, "{}", guess.text)?;
+        write!(writer, "{}", token.glyph)?;
     }
     writer.write_all(b"\x1b[0m")?;
     Ok(())

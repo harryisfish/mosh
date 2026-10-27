@@ -73,7 +73,7 @@ impl Peer {
             "invalid attachment commit"
         );
         view.committed = committed;
-        view.display.set_epoch(epoch);
+        view.display.set_epoch(epoch)?;
         view.display.set_effect_floor(effect_floor);
         view.pending = None;
         view.resources.clear();
