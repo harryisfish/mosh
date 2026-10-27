@@ -1,12 +1,13 @@
-use std::io::Cursor;
+use std::io::{Cursor, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mosh_rs::model::{
     Attach, BootstrapRequest, ClientMessage, Cursor as ScreenCursor, Effect, EffectKind, Frame,
-    InputEvent, InputRecord, Key, KeyCode, KeyPhase, MAX_CONTROL, MAX_EFFECTS, MAX_FRAME, Mouse,
-    MouseKind, PROTOCOL_VERSION, PredictionContext, Resource, ResourceMeta, Row, RowPatch,
+    Grant, InputEvent, InputRecord, Key, KeyCode, KeyPhase, MAX_CONTROL, MAX_EFFECTS, MAX_FRAME,
+    Mouse, MouseKind, PROTOCOL_VERSION, PredictionContext, Resource, ResourceMeta, Row, RowPatch,
     ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
@@ -360,11 +361,264 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("bootstrap") => return spawn_worker().await,
         Some("worker") => return worker().await,
+        Some("bootstrap-fixture") => {
+            return bootstrap_fixture(&std::env::args().nth(2).context("missing fixture mode")?);
+        }
+        Some("bootstrap-probe") => {
+            return bootstrap_probe(&std::env::args().nth(2).context("missing probe mode")?).await;
+        }
         _ => (),
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, protocol v2, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v3, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+    );
+    Ok(())
+}
+
+const GRANT_CANARY: &str = "grant-private-canary.invalid";
+const LITERAL_ARGV: &str = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line";
+
+fn bootstrap_fixture(mode: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    if mode == "concurrent" {
+        stdout.write_all(&vec![b'b'; 48 * 1024])?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    }
+    let request = read_request(std::io::stdin().lock())?;
+    ensure!(
+        request.command.first().map(String::as_str) == Some(LITERAL_ARGV)
+            && request.command.get(1).is_some_and(|arg| {
+                arg.len() == if mode == "concurrent" { 120 * 1024 } else { 16 }
+                    && arg.bytes().all(|byte| byte == b'x')
+            }),
+        "bootstrap changed structured argv"
+    );
+    let grant = Grant {
+        version: PROTOCOL_VERSION,
+        session: "a1".repeat(32),
+        server_cert: vec![1, 2, 3],
+        port: 12345,
+        address: GRANT_CANARY.into(),
+    };
+    let mut framed = Vec::new();
+    write_grant(&mut framed, &grant)?;
+    match mode {
+        "banner" | "fragmented" | "unterminated-banner" => {
+            eprintln!("fixture stderr diagnostic");
+            stdout.write_all(b"{\"diagnostic\":\"ordinary JSON\"}\nleading bootstrap banner")?;
+            if mode != "unterminated-banner" {
+                stdout.write_all(b"\n")?;
+            }
+            if mode == "fragmented" {
+                for byte in &framed {
+                    stdout.write_all(&[*byte])?;
+                    stdout.flush()?;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                stdout.write_all(&framed)?;
+            }
+            stdout.write_all(&vec![b't'; 40 * 1024])?;
+            stdout.write_all(b"\ntrailing bootstrap banner\n")?;
+        }
+        "concurrent" => stdout.write_all(&framed)?,
+        "diagnostic-limit" => {
+            stdout.write_all(&vec![b'b'; 64 * 1024 - 1])?;
+            stdout.write_all(b"\n")?;
+            stdout.write_all(&framed)?;
+        }
+        "eof" => (),
+        "missing" => stdout.write_all(b"banner without a grant\n")?,
+        "oversize-banner" => stdout.write_all(&vec![b'b'; 64 * 1024 + 64])?,
+        "trailing-oversize" => {
+            stdout.write_all(&framed)?;
+            stdout.write_all(&vec![b'b'; 64 * 1024 + 64])?;
+        }
+        "duplicate" => {
+            stdout.write_all(&framed)?;
+            stdout.write_all(&framed)?;
+        }
+        "unframed" => {
+            serde_json::to_writer(&mut stdout, &grant)?;
+            stdout.write_all(b"\n")?;
+        }
+        "malformed-unframed" => {
+            writeln!(stdout, "{{\"session\":\"{GRANT_CANARY}\",broken}}")?;
+        }
+        "invalid-json" => {
+            writeln!(
+                stdout,
+                "\x1eMOSH-RS-GRANT\n{{\"address\":\"{GRANT_CANARY}\",broken}}\n\x1eMOSH-RS-GRANT-END"
+            )?;
+        }
+        "invalid-grant" => {
+            let mut old = grant;
+            old.version = 2;
+            stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
+            serde_json::to_writer(&mut stdout, &old)?;
+            stdout.write_all(b"\n\x1eMOSH-RS-GRANT-END\n")?;
+        }
+        "truncated-body" => {
+            stdout.write_all(b"\x1eMOSH-RS-GRANT\n{\"version\":")?;
+        }
+        "missing-end" => {
+            stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
+            serde_json::to_writer(&mut stdout, &grant)?;
+            stdout.write_all(b"\n")?;
+        }
+        "wrong-end" => {
+            stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
+            serde_json::to_writer(&mut stdout, &grant)?;
+            stdout.write_all(b"\nunexpected\n")?;
+        }
+        "unexpected-end" => stdout.write_all(b"\x1eMOSH-RS-GRANT-END\n")?,
+        "oversize-body" => {
+            stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
+            stdout.write_all(&vec![b'x'; MAX_CONTROL + 1])?;
+        }
+        "nonzero" => {
+            stdout.write_all(&framed)?;
+            stdout.flush()?;
+            std::process::exit(23);
+        }
+        "timeout" => std::thread::sleep(Duration::from_secs(130)),
+        _ => anyhow::bail!("unknown bootstrap fixture mode"),
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+async fn bootstrap_probe(mode: &str) -> Result<()> {
+    let expected_error = match mode {
+        "banner" | "fragmented" | "unterminated-banner" | "concurrent" | "diagnostic-limit" => None,
+        "eof" | "missing" => Some("without a grant frame"),
+        "oversize-banner" | "trailing-oversize" | "oversize-body" => {
+            Some("output line exceeds limit")
+        }
+        "duplicate" => Some("duplicate bootstrap grant frame"),
+        "unframed" | "malformed-unframed" => Some("unframed bootstrap grant"),
+        "invalid-json" => Some("invalid bootstrap grant JSON"),
+        "invalid-grant" => Some("unsupported server protocol version"),
+        "truncated-body" => Some("grant body is incomplete"),
+        "missing-end" => Some("grant frame is incomplete"),
+        "wrong-end" => Some("invalid bootstrap grant frame end"),
+        "unexpected-end" => Some("unexpected bootstrap grant frame end"),
+        "nonzero" => Some("session bootstrap exited with"),
+        "timeout" => Some("session bootstrap timed out"),
+        _ => anyhow::bail!("unknown bootstrap probe mode"),
+    };
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let wrapper = std::env::temp_dir().join(format!(
+        "mosh-rs-bootstrap-probe-{}-{stamp}",
+        std::process::id()
+    ));
+    let executable = std::env::current_exe()?;
+    let quoted_executable = executable.to_string_lossy().replace('\'', "'\\''");
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o700)
+        .open(&wrapper)?;
+    writeln!(
+        file,
+        "#!/bin/sh\nexec '{quoted_executable}' bootstrap-fixture '{mode}' \"$@\""
+    )?;
+    drop(file);
+    let identity = ClientIdentity::generate()?;
+    let mut request = request(&identity);
+    request.command = vec![
+        LITERAL_ARGV.into(),
+        "x".repeat(if mode == "concurrent" { 120 * 1024 } else { 16 }),
+    ];
+    let result = bootstrap_local(&identity, &wrapper, request).await;
+    std::fs::remove_file(&wrapper)?;
+    if let Some(expected) = expected_error {
+        let Err(error) = result else {
+            anyhow::bail!("invalid bootstrap fixture was accepted");
+        };
+        ensure!(
+            format!("{error:#}").contains(expected),
+            "unexpected bootstrap failure: {error:#}"
+        );
+        eprintln!("bootstrap {mode} rejected: {error:#}");
+    } else {
+        let grant = result?;
+        ensure!(
+            grant.version == PROTOCOL_VERSION && grant.address == GRANT_CANARY,
+            "bootstrap fixture grant changed"
+        );
+    }
+    Ok(())
+}
+
+async fn verify_bootstrap_framing() -> Result<()> {
+    for mode in [
+        "banner",
+        "fragmented",
+        "unterminated-banner",
+        "concurrent",
+        "diagnostic-limit",
+        "eof",
+        "missing",
+        "oversize-banner",
+        "trailing-oversize",
+        "duplicate",
+        "unframed",
+        "malformed-unframed",
+        "invalid-json",
+        "invalid-grant",
+        "truncated-body",
+        "missing-end",
+        "wrong-end",
+        "unexpected-end",
+        "oversize-body",
+        "nonzero",
+    ] {
+        let output = tokio::process::Command::new(std::env::current_exe()?)
+            .args(["bootstrap-probe", mode])
+            .output()
+            .await?;
+        ensure!(
+            !output
+                .stdout
+                .windows(GRANT_CANARY.len())
+                .any(|part| part == GRANT_CANARY.as_bytes())
+                && !output
+                    .stderr
+                    .windows(GRANT_CANARY.len())
+                    .any(|part| part == GRANT_CANARY.as_bytes())
+                && !output
+                    .stderr
+                    .windows(32)
+                    .any(|part| part == b"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"),
+            "bootstrap diagnostics leaked a grant"
+        );
+        ensure!(
+            output.status.success(),
+            "bootstrap {mode} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if matches!(mode, "banner" | "fragmented" | "unterminated-banner") {
+            for expected in [
+                b"leading bootstrap banner".as_slice(),
+                b"ordinary JSON".as_slice(),
+                b"trailing bootstrap banner".as_slice(),
+                b"fixture stderr diagnostic".as_slice(),
+            ] {
+                ensure!(
+                    output
+                        .stderr
+                        .windows(expected.len())
+                        .any(|part| part == expected),
+                    "bootstrap lost a diagnostic"
+                );
+            }
+        }
+    }
+    println!(
+        "bootstrap grant envelopes preserve banners and stderr, handle fragmented output and concurrent stdin, reject malformed/oversized/duplicate/old grants, and hide credentials"
     );
     Ok(())
 }
@@ -395,31 +649,32 @@ async fn worker() -> Result<()> {
 }
 
 async fn verify() -> Result<()> {
+    verify_bootstrap_framing().await?;
     let identity = ClientIdentity::generate()?;
     let request = request(&identity);
     let mut legacy_request = request.clone();
-    legacy_request.version = 1;
+    legacy_request.version = 2;
     let mut legacy_json = serde_json::to_vec(&legacy_request)?;
     legacy_json.push(b'\n');
     ensure!(
         read_request(Cursor::new(legacy_json)).is_err(),
-        "v1 bootstrap request was accepted"
+        "v2 bootstrap request was accepted"
     );
     ensure!(
         listen(&legacy_request).is_err(),
-        "v1 listener request was accepted"
+        "v2 listener request was accepted"
     );
     let (server, grant) = listen(&request)?;
     let client = identity.endpoint(&grant)?;
     let mut legacy_grant = grant.clone();
-    legacy_grant.version = 1;
+    legacy_grant.version = 2;
     ensure!(
         identity.endpoint(&legacy_grant).is_err(),
-        "v1 server grant was accepted"
+        "v2 server grant was accepted"
     );
     ensure!(
         connect(&client, &legacy_grant).await.is_err(),
-        "v1 connection grant was accepted"
+        "v2 connection grant was accepted"
     );
     let mut hostname_grant = grant.clone();
     hostname_grant.address = "localhost".into();
@@ -439,7 +694,7 @@ async fn verify() -> Result<()> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
     ensure!(
-        handshake.protocol.as_deref() == Some(&b"mosh-rs/2"[..]),
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/3"[..]),
         "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");

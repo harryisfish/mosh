@@ -3,8 +3,8 @@
 This is the implementation contract for the Rust client and server. The protocol
 is not compatible with the original Mosh wire protocol.
 
-The current Rust protocol is version 2, with ALPN `mosh-rs/2`. Both endpoints
-must use this version. Version 1 workers cannot resume with a version 2 client.
+The current Rust protocol is version 3, with ALPN `mosh-rs/3`. Both endpoints
+must use this version. Version 1 and 2 workers cannot resume with a version 3 client.
 
 ## Ownership and authentication
 
@@ -37,10 +37,31 @@ it. Images have immutable content hashes and separate low-priority streams.
 Control messages use a four-byte big-endian length followed by bounded postcard
 encoding. The receiver rejects trailing bytes and checks resource-request and
 effect collection limits during decoding. Enum variant order and struct field
-order are part of the versioned wire format. SSH bootstrap remains newline JSON.
+order are part of the versioned wire format. SSH bootstrap requests remain newline JSON.
 Frames use bounded postcard encoding and zstd compression. Image keys hash their
 dimensions followed by their RGBA bytes. A cache miss explicitly requests the
 missing resources. A base mismatch requests a checkpoint. Application exit has its own final acknowledgement.
+
+## Bootstrap grant framing
+
+The SSH and local bootstrap stdout streams carry exactly one grant envelope.
+Its first line is the ASCII record separator byte `0x1e`, followed by
+`MOSH-RS-GRANT` and a newline. A single newline-terminated JSON `Grant` follows.
+The last line is `0x1e` followed by `MOSH-RS-GRANT-END` and a newline.
+The JSON body, including its newline, is at most 512 KiB. The detached worker
+uses the same envelope for its parent bootstrap process.
+
+The client copies at most 64 KiB of stdout diagnostics outside the envelope to
+stderr. It keeps SSH stderr separate so authentication prompts remain visible.
+It rejects missing, incomplete, duplicate, oversized, and unframed grants.
+Grant bodies and JSON decoding details never become diagnostic output. The
+client drains stdout through EOF and requires a successful bootstrap exit.
+The parent bootstrap process reads only through the worker's complete envelope,
+because the worker stays alive for the session. Request writes and grant reads
+run concurrently. Bootstrap failure or timeout kills and reaps the local child.
+
+Version 3 changes this required bootstrap framing. Its JSON fields and postcard
+messages otherwise retain version 2's shape. Update both endpoints together.
 
 Local suspension retains the client input queue, display revision, cached screen,
 and effect acknowledgements. Foreground recovery redraws cached state without

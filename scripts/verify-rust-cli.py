@@ -23,6 +23,22 @@ import tty
 
 
 RAW_NETWORK_INPUT = b"impaired-" + b"x" * 8192 + b"\r"
+GRANT_BEGIN = b"\x1eMOSH-RS-GRANT\n"
+GRANT_END = b"\x1eMOSH-RS-GRANT-END\n"
+SSH_LITERAL_ARG = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line"
+
+
+def decode_grant(output):
+    assert len(output) <= 512 * 1024 + 64 * 1024 + len(GRANT_BEGIN) + len(GRANT_END)
+    assert output.count(GRANT_BEGIN) == output.count(GRANT_END) == 1, "missing or duplicate grant frame"
+    _, framed = output.split(GRANT_BEGIN)
+    body, _ = framed.split(GRANT_END)
+    assert body.endswith(b"\n") and body.count(b"\n") == 1 and len(body) <= 512 * 1024
+    return json.loads(body)
+
+
+def encode_grant(grant):
+    return GRANT_BEGIN + json.dumps(grant).encode() + b"\n" + GRANT_END
 
 
 def exact(data, timeout=5):
@@ -51,7 +67,9 @@ def remote_fixture(mode, state):
         exact(b"\r")
         os.write(1, b"\r\nPREDICTION_DONE")
         return 0
-    if mode == "wait":
+    if mode in ["wait", "ssh-argv"]:
+        if mode == "ssh-argv":
+            assert sys.argv[4] == SSH_LITERAL_ARG, "SSH changed structured argv"
         os.write(1, b"\x1b[2J\x1b[HWAIT_READY")
         while os.read(0, 1):
             pass
@@ -110,7 +128,7 @@ def proxy_bootstrap(server, state):
     request["bind"] = "127.0.0.1"
     request = (json.dumps(request) + "\n").encode()
     result = subprocess.run([server, "bootstrap"], input=request, stdout=subprocess.PIPE, check=True)
-    grant = json.loads(result.stdout)
+    grant = decode_grant(result.stdout)
     front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     front.bind(("127.0.0.1", 0))
     back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -182,7 +200,8 @@ def proxy_bootstrap(server, state):
                     queued_bytes += len(packet)
                     stats["duplicated"] += copy
     Path(state + ".proxy").write_text(str(pid))
-    print(json.dumps(grant), flush=True)
+    sys.stdout.buffer.write(encode_grant(grant))
+    sys.stdout.buffer.flush()
 
 
 class TerminalProcess:
@@ -450,22 +469,42 @@ def verify(bin_dir, network):
         print("CLI default colors, explicit black, arrow phases, modern input, clipboard, literal argv, resize, exit code, and termios restoration passed", flush=True)
 
         shim = Path(temporary) / "ssh"
-        shim.write_text(f"#!{sys.executable}\nimport os,sys\nif '-G' in sys.argv:\n    print('hostname ::1')\nelse:\n    os.execl('/bin/sh','sh','-c',sys.argv[-1])\n")
+        shim.write_text(f"""#!{sys.executable}
+import subprocess,sys,time
+if '-G' in sys.argv:
+    print('hostname ::1')
+else:
+    print('SSH bootstrap welcome banner', flush=True)
+    print('SSH stderr diagnostic', file=sys.stderr, flush=True)
+    child = subprocess.Popen(['/bin/sh', '-c', sys.argv[-1]], stdin=sys.stdin.buffer, stdout=subprocess.PIPE)
+    while True:
+        chunk = child.stdout.read(7)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        time.sleep(0.001)
+    print('SSH bootstrap trailing banner', flush=True)
+    sys.exit(child.wait())
+""")
         shim.chmod(0o700)
         state = str(Path(temporary) / "ssh-bind.json")
         process = TerminalProcess(
             [client, "--server", server, "--bind", "127.0.0.1", "fixture", "--",
-             sys.executable, script, "--remote", "wait", state],
+             sys.executable, script, "--remote", "ssh-argv", state, SSH_LITERAL_ARG],
             {"PATH": temporary + os.pathsep + os.environ["PATH"],
              "SSH_CONNECTION": "192.0.2.1 40000 ::1 22"})
         try:
             process.until(b"WAIT_READY")
+            for diagnostic in [b"SSH bootstrap welcome banner", b"SSH stderr diagnostic",
+                               b"SSH bootstrap trailing banner"]:
+                assert diagnostic in process.output, "SSH lost a bootstrap diagnostic"
             process.send(b"\x1e.")
             process.finish(0)
         finally:
             process.close()
             cleanup(state)
-        print("CLI explicit bind survives conflicting SSH metadata through a local SSH shim", flush=True)
+        print("CLI explicit bind, fragmented grant, SSH banners/stderr, and literal multiline argv passed through a local SSH shim", flush=True)
 
         for suffix, prefix_bytes in [("legacy", b"\x1e"), ("kitty", b"\x1b[94;5u\x1b[94;5:3u")]:
             state = str(Path(temporary) / f"detach-{suffix}.json")
@@ -568,6 +607,7 @@ def verify_prediction(bin_dir, temporary):
             process.send(b"\r")
             process.until(b"PREDICTION_DONE")
             process.finish(0)
+            assert b"\x1b[0;4mS" not in process.output[start:], "hidden prediction appeared in drained terminal output"
         finally:
             process.close()
             cleanup(state)
