@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
@@ -445,6 +445,8 @@ async fn main() -> Result<()> {
             tokio::time::timeout(Duration::from_secs(180), async {
                 if mode.as_deref() == Some("--verify-close") {
                     verify_close().await
+                } else if mode.as_deref() == Some("--verify-prepared") {
+                    verify_prepared().await
                 } else {
                     verify().await
                 }
@@ -456,6 +458,7 @@ async fn main() -> Result<()> {
 }
 
 async fn verify() -> Result<()> {
+    verify_prepared().await?;
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {
         version: PROTOCOL_VERSION,
@@ -909,6 +912,172 @@ async fn verify() -> Result<()> {
     Ok(())
 }
 
+async fn verify_prepared() -> Result<()> {
+    let identity = ClientIdentity::generate()?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let marker =
+        std::env::temp_dir().join(format!("mosh-rs-prepared-{}-{stamp}", std::process::id()));
+    let request = BootstrapRequest {
+        version: PROTOCOL_VERSION,
+        client_cert: identity.certificate(),
+        size: size(80, 12),
+        command: vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            "--close-fixture".into(),
+            marker.to_string_lossy().into_owned(),
+        ],
+        bind: Some("127.0.0.1".into()),
+        port: None,
+        idle_seconds: 60,
+        clipboard_read: false,
+    };
+    let (endpoint, grant) = transport::listen(&request)?;
+    let actor = SessionActor::new(&request, grant.session.clone())?;
+    let mut grant_bytes = Vec::new();
+    transport::write_grant(&mut grant_bytes, &grant)?;
+    let mut running = Running {
+        task: Some(tokio::task::spawn_local(actor.run(endpoint.clone()))),
+        endpoint,
+    };
+    let client = identity.endpoint(&grant)?;
+    let handshake = transport::connect(&client, &grant).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ensure!(
+        !marker.exists(),
+        "grant or TLS handshake started the user command before attach"
+    );
+    handshake.close(0_u32.into(), b"no attachment");
+
+    for invalid in 0..6 {
+        let connection = transport::connect(&client, &grant).await?;
+        let (mut send, mut receive) = connection.open_bi().await?;
+        let mut attach = Attach {
+            version: PROTOCOL_VERSION,
+            session: grant.session.clone(),
+            attempt: 1,
+            committed: 0,
+            rendered: 0,
+            effects: 0,
+        };
+        match invalid {
+            0 => attach.version -= 1,
+            1 => attach.session = "invalid-session".into(),
+            2 => attach.attempt = 0,
+            3 => attach.committed = 1,
+            4 => attach.effects = 1,
+            _ => (),
+        }
+        let message = if invalid == 5 {
+            ClientMessage::Close { epoch: 0 }
+        } else {
+            ClientMessage::Attach(attach)
+        };
+        transport::send_message(&mut send, &message).await?;
+        let reply =
+            tokio::time::timeout(WAIT, transport::recv_message::<ServerMessage>(&mut receive))
+                .await
+                .context("invalid first attachment was not rejected")?;
+        ensure!(
+            matches!(
+                reply,
+                Err(_) | Ok(None) | Ok(Some(ServerMessage::Error { .. }))
+            ),
+            "invalid first attachment was accepted"
+        );
+        ensure!(!marker.exists(), "invalid attach started the user command");
+        connection.close(0_u32.into(), b"invalid fixture complete");
+    }
+
+    let mut first_view = View::new();
+    let mut view = View::new();
+    view.ack_effects = true;
+    let (first, second) = tokio::join!(
+        Peer::attach(&client, &grant, &mut first_view, 1, None, 3),
+        Peer::attach(&client, &grant, &mut view, 2, None, 3),
+    );
+    let (mut peer, mut view) = match (first, second) {
+        (Ok(first), Ok(second)) if first.epoch > second.epoch => (first, first_view),
+        (Ok(_), Ok(second)) | (Err(_), Ok(second)) => (second, view),
+        (Ok(first), Err(_)) => (first, first_view),
+        (Err(first), Err(second)) => {
+            bail!("both first attachments failed: {first:#}; {second:#}")
+        }
+    };
+    view.wait_text(&mut peer, "CLOSE_READY").await?;
+    let pid = extract_pid(&view.text())?;
+    ensure!(
+        std::fs::read_to_string(&marker)? == format!("{pid}\n"),
+        "competing first attachments started more than one command"
+    );
+    ensure!(
+        Peer::attach(&client, &grant, &mut View::new(), 1, None, 3)
+            .await
+            .is_err(),
+        "obsolete attachment was accepted after command startup"
+    );
+    drop(peer);
+    let mut peer = Peer::attach(&client, &grant, &mut view, 3, None, 3).await?;
+    view.wait_text(&mut peer, "CLOSE_READY").await?;
+    ensure!(
+        extract_pid(&view.text())? == pid
+            && std::fs::read_to_string(&marker)? == format!("{pid}\n"),
+        "reattachment restarted the user command"
+    );
+    peer.send(ClientMessage::Close { epoch: peer.epoch })
+        .await?;
+    while view.exit.is_none() {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    peer.send(ClientMessage::ExitAck { epoch: peer.epoch })
+        .await?;
+    tokio::time::timeout(
+        WAIT,
+        running.task.take().context("prepared actor task missing")?,
+    )
+    .await???;
+    std::fs::remove_file(&marker)?;
+
+    let mut missing = request;
+    missing.command = vec![
+        marker
+            .join("missing-program")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let (endpoint, grant) = transport::listen(&missing)?;
+    let actor = SessionActor::new(&missing, grant.session.clone())?;
+    let mut running = Running {
+        task: Some(tokio::task::spawn_local(actor.run(endpoint.clone()))),
+        endpoint,
+    };
+    let client = identity.endpoint(&grant)?;
+    let failure = Peer::attach(&client, &grant, &mut View::new(), 1, None, 3).await;
+    let Err(error) = failure else {
+        bail!("missing executable produced a successful attachment");
+    };
+    ensure!(
+        format!("{error:#}").contains("remote command startup failed"),
+        "spawn failure did not reach the client: {error:#}"
+    );
+    let result = tokio::time::timeout(
+        WAIT,
+        running
+            .task
+            .take()
+            .context("failed startup actor task missing")?,
+    )
+    .await??;
+    ensure!(
+        result.is_err(),
+        "spawn failure returned to Prepared instead of ending"
+    );
+    println!(
+        "verified grant/TLS/invalid attaches have no command side effects, competing first attaches spawn once, reconnect keeps the PID, and spawn failure ends the actor"
+    );
+    Ok(())
+}
+
 async fn verify_close() -> Result<()> {
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {
@@ -1078,6 +1247,13 @@ fn extract_pid(text: &str) -> Result<u32> {
 }
 
 fn close_fixture() -> Result<()> {
+    if let Some(marker) = std::env::args().nth(2) {
+        let mut marker = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(marker)?;
+        writeln!(marker, "{}", std::process::id())?;
+    }
     ensure!(
         unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } != libc::SIG_ERR,
         "cannot ignore SIGHUP in close fixture"
