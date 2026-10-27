@@ -1315,6 +1315,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "signal-hook",
  "socket2",
  "tattoy-wezterm-term",
  "tokio",

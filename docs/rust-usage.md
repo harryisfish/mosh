@@ -206,6 +206,19 @@ Closing or crashing that process does not provide a resumable session file.
 An abandoned worker expires after `--idle-seconds`, which defaults to 86400.
 The server also retains unconfirmed final output within this lifetime.
 
+The client probes the session actor during otherwise quiet sessions. After six
+seconds without a confirmed application reply, its status shows `Reply
+unconfirmed`, reply age, and traffic age. Screen output and QUIC acknowledgements
+cannot clear that warning. `accepted inputs waiting` reports inputs accepted
+locally that still lack a PTY commit. An application reply does not clear those
+inputs or prove that the remote command consumed them. A fresh timely reply
+shows `Application replies resumed` for two seconds. Normal idle sessions have
+no recurring status redraw.
+
+Suspension and SIGCONT begin a new observation window, so the suspended interval
+does not immediately trigger a warning. Queued old replies cannot confirm
+recovery. Local close and input-refusal notices keep their priority.
+
 ## Terminal capabilities
 
 | Capability | Behavior |
@@ -259,6 +272,7 @@ target/debug/examples/verify_display
 target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
 python3 scripts/verify-rust-cli.py --saturated-input
+python3 scripts/verify-rust-cli.py --liveness --evidence-dir /tmp/mosh-rs-liveness
 ```
 
 These tools drive real core, QUIC, renderer, and PTY paths. The CLI tool creates
@@ -266,11 +280,18 @@ only its own local sessions. Its network option places an actual UDP relay
 between the binaries, injects delay, jitter, loss, duplication, and reordering,
 and verifies 8192 raw keys byte-for-byte. It also temporarily drops all packets
 and checks the original command survives and queued input is applied once.
+`--network` also runs the liveness cases. `--liveness` runs only healthy idle,
+separate upstream and downstream loss, input confirmation, and SIGCONT cases.
+The relay checks `drop_up` and `drop_down` on both packet enqueue and dequeue.
+Its per-direction counters describe encrypted UDP traffic, not actor replies.
+`--evidence-dir` saves raw TTY output and relay observations for these cases.
+`verify_session --verify-liveness` separately pauses only actor polling while
+Quinn continues, then records raw probe replies and QUIC ACK counts.
 
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
-Both Rust endpoints must use protocol version 4. Earlier Rust version 1, 2, and 3 workers
+Both Rust endpoints must use protocol version 5. Earlier Rust workers
 cannot resume with the new client. No compatibility with the old Mosh wire
 protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client

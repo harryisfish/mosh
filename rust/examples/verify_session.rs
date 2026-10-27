@@ -11,7 +11,7 @@ use mosh_rs::model::*;
 use mosh_rs::session::SessionActor;
 use mosh_rs::transport::{self, ClientEndpoints, ClientIdentity, Incoming, ServerListeners};
 use quinn::{Connection, RecvStream, SendStream, VarInt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 const BULK_BYTES: usize = 120_000;
@@ -179,6 +179,7 @@ struct View {
     ack_effects: bool,
     exit: Option<(i32, u64, u64)>,
     frames: usize,
+    probe_replies: Vec<(u64, Instant)>,
 }
 
 impl View {
@@ -196,6 +197,7 @@ impl View {
             ack_effects: false,
             exit: None,
             frames: 0,
+            probe_replies: Vec::new(),
         }
     }
 
@@ -318,6 +320,10 @@ impl View {
                 }
                 ServerMessage::Error { message } => bail!("session actor reported {message}"),
                 ServerMessage::Attached { .. } => bail!("duplicate attachment response"),
+                ServerMessage::ProbeReply { epoch, nonce } => {
+                    ensure!(epoch == peer.epoch, "stale probe reply epoch");
+                    self.probe_replies.push((nonce, Instant::now()));
+                }
             },
             Wire::Display(Incoming::Resource(resource)) => {
                 resource.validate()?;
@@ -451,6 +457,8 @@ async fn main() -> Result<()> {
                     verify_prepared().await
                 } else if mode.as_deref() == Some("--verify-locale") {
                     verify_locale().await
+                } else if mode.as_deref() == Some("--verify-liveness") {
+                    verify_liveness().await
                 } else {
                     verify().await
                 }
@@ -464,6 +472,7 @@ async fn main() -> Result<()> {
 async fn verify() -> Result<()> {
     verify_prepared().await?;
     verify_locale().await?;
+    verify_liveness().await?;
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {
         version: PROTOCOL_VERSION,
@@ -597,6 +606,23 @@ async fn verify() -> Result<()> {
     ensure!(
         view.committed < bulk.seq,
         "bulk event committed before blocked PTY consumed it"
+    );
+    peer.send(ClientMessage::Probe {
+        epoch: peer.epoch,
+        nonce: 1,
+    })
+    .await?;
+    while view.probe_replies.is_empty() {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    ensure!(
+        view.probe_replies[0].0 == 1 && view.committed < bulk.seq,
+        "actor reply committed input still blocked at the PTY"
+    );
+    println!(
+        "verified raw ProbeReply nonce=1 while bulk seq={} remains uncommitted at {}",
+        bulk.seq, view.committed
     );
     peer.send(ClientMessage::Resize {
         epoch: peer.epoch,
@@ -914,6 +940,165 @@ async fn verify() -> Result<()> {
     println!(
         "session verification passed: {} installed frames; raw PTY input modes, partial writes, reconnect deduplication, fencing, resize, graphics, late resources, effects, queries, flood convergence, final exit barriers, explicit close and child reaping",
         view.frames
+    );
+    Ok(())
+}
+
+async fn verify_liveness() -> Result<()> {
+    let identity = ClientIdentity::generate()?;
+    let request = BootstrapRequest {
+        version: PROTOCOL_VERSION,
+        client_cert: identity.certificate(),
+        size: size(80, 12),
+        command: vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            "--close-fixture".into(),
+        ],
+        bind: Some("127.0.0.1".into()),
+        port: None,
+        idle_seconds: 60,
+        clipboard_read: false,
+        locale_candidates: Vec::new(),
+    };
+    let (endpoint, grant) = transport::listen(&request)?;
+    let actor = SessionActor::new(&request, grant.session.clone())?;
+    let (poll_actor, mut enabled) = watch::channel(true);
+    let (polling, mut observed) = watch::channel(true);
+    let listeners = endpoint.clone();
+    let task = tokio::task::spawn_local(async move {
+        let actor = actor.run(listeners);
+        tokio::pin!(actor);
+        loop {
+            let active = *enabled.borrow_and_update();
+            polling.send_replace(active);
+            tokio::select! {
+                biased;
+                changed = enabled.changed() => changed.context("actor poll control ended")?,
+                result = &mut actor, if active => return result,
+            }
+        }
+    });
+    let _running = Running {
+        endpoint,
+        task: Some(task),
+    };
+    let client = identity.endpoint(&grant)?;
+    let mut view = View::new();
+    view.ack_effects = true;
+    let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 3).await?;
+    view.wait_text(&mut peer, "CLOSE_READY").await?;
+    let quiet_until = Instant::now() + Duration::from_millis(250);
+    while let Ok(Some(event)) =
+        tokio::time::timeout_at(quiet_until.into(), peer.receive.recv()).await
+    {
+        view.process(&mut peer, event).await?;
+    }
+    let progress = (
+        view.committed,
+        view.display.revision(),
+        view.display.installed_echo_through(),
+    );
+    poll_actor.send(false)?;
+    observed.wait_for(|polling| !*polling).await?;
+    let before = peer.connection.stats();
+    let queued_at = Instant::now();
+    peer.send(ClientMessage::Probe {
+        epoch: peer.epoch,
+        nonce: 1,
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while peer.connection.stats().frame_rx.acks <= before.frame_rx.acks {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("Quinn did not acknowledge the paused actor probe")?;
+    let acknowledged = peer.connection.stats();
+    ensure!(
+        acknowledged.frame_tx.stream > before.frame_tx.stream,
+        "probe was not transmitted while actor polling was paused"
+    );
+    let paused_until = queued_at + Duration::from_millis(6200);
+    while let Ok(Some(event)) =
+        tokio::time::timeout_at(paused_until.into(), peer.receive.recv()).await
+    {
+        ensure!(
+            !matches!(event, Wire::Control(ServerMessage::ProbeReply { .. })),
+            "transport reader replied while the actor was not polled"
+        );
+        view.process(&mut peer, event).await?;
+    }
+    ensure!(
+        peer.connection.close_reason().is_none(),
+        "transport closed while only actor polling was paused"
+    );
+    let resumed_at = Instant::now();
+    poll_actor.send(true)?;
+    observed.wait_for(|polling| *polling).await?;
+    while view.probe_replies.is_empty() {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    ensure!(
+        view.probe_replies[0].0 == 1
+            && view.probe_replies[0].1.duration_since(queued_at) >= Duration::from_secs(6),
+        "actor did not return the original delayed nonce"
+    );
+    ensure!(
+        progress
+            == (
+                view.committed,
+                view.display.revision(),
+                view.display.installed_echo_through()
+            ),
+        "probe reply changed input or display progress"
+    );
+    let first_reply_at = view.probe_replies[0].1;
+    for nonce in [1, 0, 2, 2, 1] {
+        peer.send(ClientMessage::Probe {
+            epoch: peer.epoch,
+            nonce,
+        })
+        .await?;
+    }
+    while view.probe_replies.len() < 2 {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    ensure!(
+        view.probe_replies[1].0 == 2
+            && view.probe_replies[1].1.duration_since(first_reply_at)
+                >= Duration::from_millis(1950),
+        "duplicate or rapid probes bypassed the bounded reply interval"
+    );
+    peer.send(ClientMessage::Probe {
+        epoch: peer.epoch + 1,
+        nonce: 3,
+    })
+    .await?;
+    peer.wait_for_rejection().await?;
+    peer = Peer::attach(&client, &grant, &mut view, 2, None, 3).await?;
+    peer.send(ClientMessage::Probe {
+        epoch: peer.epoch,
+        nonce: 4,
+    })
+    .await?;
+    while view.probe_replies.len() < 3 {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    ensure!(
+        view.probe_replies[2].0 == 4,
+        "new attachment reused the obsolete reply"
+    );
+    println!(
+        "actor probe verification passed: polling paused for {}ms, QUIC ACK frames {} -> {}, stream frames {} -> {}, no ProbeReply before actor resume; raw nonces [1, 2, 4], duplicate suppression, 2s reply interval, wrong-epoch rejection and independent committed/revision/installed echo",
+        resumed_at.duration_since(queued_at).as_millis(),
+        before.frame_rx.acks,
+        acknowledged.frame_rx.acks,
+        before.frame_tx.stream,
+        acknowledged.frame_tx.stream
     );
     Ok(())
 }

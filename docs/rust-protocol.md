@@ -3,8 +3,9 @@
 This is the implementation contract for the Rust client and server. The protocol
 is not compatible with the original Mosh wire protocol.
 
-The current Rust protocol is version 4, with ALPN `mosh-rs/4`. Both endpoints
-must use this version. Version 1, 2, and 3 workers cannot resume with a version 4 client.
+The current Rust protocol is version 5, with ALPN `mosh-rs/5`. Both endpoints
+must use this version. Earlier Rust workers cannot resume with a version 5 client.
+Version 4 peers are rejected by bootstrap, grant, Attach, and ALPN validation.
 
 ## Ownership and authentication
 
@@ -12,7 +13,7 @@ The session actor owns one PTY and one terminal core. The network tasks never
 write the PTY. A disconnected connection cannot cancel accepted PTY input.
 Each connection has a strictly increasing attach attempt. The actor accepts
 only a larger attempt, assigns a new epoch, and checks that epoch when executing
-every input, resize, acknowledgement, detach, and close message.
+every input, resize, acknowledgement, detach, close, and probe message.
 
 System OpenSSH authenticates a structured bootstrap request. Commands travel as
 JSON argv, never shell interpolation. The client generates a session client
@@ -31,7 +32,7 @@ or a missing hostname ends bootstrap; neither the grant address nor the original
 SSH target supplies a fallback. Reconnection resolves the same authorized
 hostname again. Certificate validation remains required at that destination.
 Local bootstrap trusts the executable explicitly selected by the caller,
-including controlled local relays. The wire format remains version 4.
+including controlled local relays.
 
 Default server listening uses one dual-stack UDP socket where it can own both
 address families, explicitly disabling and verifying `IPV6_V6ONLY`. On macOS,
@@ -56,12 +57,11 @@ must bind the same OS-assigned or fixed port before the grant is published.
 
 ## UTF-8 locale and PTY startup
 
-Version 4 appends the required `locale_candidates` field to `BootstrapRequest`.
+Since version 4, `BootstrapRequest` requires the `locale_candidates` field.
 It contains at most eight locale names, each 1 to 128 ASCII bytes from
 `[A-Za-z0-9_.@-]`. The decoder rejects invalid names and excess entries. The
 client reads `LC_ALL`, `LC_CTYPE`, and `LANG` in that order, skips invalid or empty
-values, and removes duplicates. Version 3 requests, grants, and ALPN handshakes
-are rejected. Grant framing and postcard messages keep their version 3 shape.
+values, and removes duplicates. The grant envelope retains version 3 framing.
 
 The worker waits for the first authenticated, valid Attach before selecting a
 locale or starting the command. It tries the client's candidates, the server's
@@ -112,6 +112,50 @@ order are part of the versioned wire format. SSH bootstrap requests remain newli
 Frames use bounded postcard encoding and zstd compression. Image keys hash their
 dimensions followed by their RGBA bytes. A cache miss explicitly requests the
 missing resources. A base mismatch requests a checkpoint. Application exit has its own final acknowledgement.
+
+## Actor application confirmation
+
+Version 5 appends `Probe { epoch, nonce }` and `ProbeReply { epoch, nonce }` to
+the control enums. The actor checks both the connection epoch and the message
+epoch before scheduling a reply. The transport reader never replies itself.
+The reply does not change PTY input, `Committed`, `echo_through`, display revision,
+or effects. A QUIC ACK only confirms transport receipt.
+
+The client keeps one unfinished nonce per active attachment. It queues the next
+probe no earlier than two seconds after a timely reply. A full local output
+queue does not create a flight, and another attempt waits two seconds. A flight
+remains until its matching reply retires it or the link ends. A reply processed
+six seconds after its probe was queued only retires that flight. Unknown,
+duplicate, obsolete-epoch, or pre-resume replies cannot confirm recovery.
+Recovery requires a new, timely nonce.
+
+The actor retains one pending reply and the highest nonce seen. Repeated or
+decreasing nonces do not generate another reply. A successful reply queue entry
+waits at least two seconds before another. A full output queue retains the
+pending reply and retries no more than once per second. Required commit and
+exit messages run first. A closed queue disconnects the attachment.
+
+The client records traffic receipt immediately after decoding, before waiting
+for its UI event channel. Valid traffic can update last contact, but only a
+timely, matching reply updates last reply. Accepted input timestamps stay in the
+existing pending-input ledger. Only `Committed` or a validated `Attached` releases
+those entries. Successfully installed frames separately record `echo_through`
+and revision. Received resources and uninstalled frames cannot advance them.
+
+Six seconds without an application reply shows an unconfirmed status, even if
+screen traffic continues. Accepted inputs waiting six seconds show their count
+and age independently. Continuing status updates occur at most once per second.
+Recovery appears for two seconds. Healthy idle sessions produce no periodic TTY
+redraw. The status cannot identify a failed network direction or prove that the
+remote command consumed input.
+
+Foreground recovery and SIGCONT restart the observation window. Existing flights
+remain bounded and lose eligibility to confirm health. Their replies only retire
+them before a fresh nonce can confirm recovery. Events decoded before the new
+window cannot become new contact. Input waiting time uses the later of its
+acceptance time and the new observation start. Closing retains its committed,
+final display, and effects barriers. Once Close is queued in the current epoch,
+the client stops sending new probes.
 
 ## Bootstrap grant framing
 

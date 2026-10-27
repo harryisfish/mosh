@@ -96,6 +96,9 @@ struct Attachment {
     effects_sent: u64,
     floor_sent: u64,
     exit_sent: bool,
+    probe_seen: u64,
+    probe_reply: Option<u64>,
+    probe_ready_at: Instant,
 }
 
 impl Attachment {
@@ -123,6 +126,9 @@ impl Attachment {
             effects_sent: effects_ack,
             floor_sent: 0,
             exit_sent: false,
+            probe_seen: 0,
+            probe_reply: None,
+            probe_ready_at: Instant::now(),
         }
     }
 }
@@ -679,6 +685,17 @@ impl RunningSession {
                 );
                 self.exit_acknowledged = true;
             }
+            ClientMessage::Probe {
+                epoch: message_epoch,
+                nonce,
+            } => {
+                ensure!(message_epoch == epoch, "probe epoch mismatch");
+                let attachment = self.attachment.as_mut().expect("active attachment");
+                if nonce > attachment.probe_seen {
+                    attachment.probe_seen = nonce;
+                    attachment.probe_reply = Some(nonce);
+                }
+            }
             ClientMessage::Attach(_) => bail!("attachment must be the first message"),
         }
         Ok(())
@@ -826,6 +843,32 @@ impl RunningSession {
         self.disconnected_at = Instant::now();
     }
 
+    fn flush_probe_reply(&mut self) {
+        let Some(attachment) = self.attachment.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let Some(nonce) = attachment.probe_reply else {
+            return;
+        };
+        if now < attachment.probe_ready_at {
+            return;
+        }
+        match attachment.output.try_send(ServerMessage::ProbeReply {
+            epoch: attachment.epoch,
+            nonce,
+        }) {
+            Ok(()) => {
+                attachment.probe_reply = None;
+                attachment.probe_ready_at = now + Duration::from_secs(2);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                attachment.probe_ready_at = now + Duration::from_secs(1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => self.disconnect(),
+        }
+    }
+
     fn tick(&mut self) -> Result<bool> {
         self.publish_allowed = self.terminal.publish_allowed();
         if let Some((epoch, generation, after, size)) = self.resize
@@ -907,6 +950,7 @@ impl RunningSession {
         if self.attachment.is_none() && self.disconnected_at.elapsed() >= self.idle {
             return Ok(true);
         }
+        self.flush_probe_reply();
         Ok(false)
     }
 

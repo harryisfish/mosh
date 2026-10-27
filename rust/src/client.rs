@@ -4,6 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -30,10 +32,12 @@ enum NetworkEvent {
     Message {
         attempt: u64,
         message: ServerMessage,
+        received_at: Instant,
     },
     Display {
         attempt: u64,
         incoming: Incoming,
+        received_at: Instant,
     },
     Lost {
         attempt: u64,
@@ -59,6 +63,181 @@ struct Link {
     effects_ack: u64,
     resize_sent: u64,
     start: watch::Sender<bool>,
+    probe: ProbeMonitor,
+}
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const CONFIRMATION_LIMIT: Duration = Duration::from_secs(6);
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const RECOVERY_NOTICE: Duration = Duration::from_secs(2);
+
+struct PendingProbe {
+    nonce: u64,
+    queued_at: Instant,
+    eligible: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeNotice {
+    Quiet,
+    Unconfirmed,
+    AwaitingInput,
+    Recovered,
+}
+
+struct ProbeMonitor {
+    observing_since: Instant,
+    last_contact: Option<Instant>,
+    last_reply: Option<Instant>,
+    pending: Option<PendingProbe>,
+    next_attempt_at: Instant,
+    needs_recovery_notice: bool,
+    recovered_until: Option<Instant>,
+    notice: ProbeNotice,
+    status: String,
+    next_status_at: Instant,
+}
+
+impl ProbeMonitor {
+    fn new(now: Instant) -> Self {
+        Self {
+            observing_since: now,
+            last_contact: None,
+            last_reply: None,
+            pending: None,
+            next_attempt_at: now,
+            needs_recovery_notice: false,
+            recovered_until: None,
+            notice: ProbeNotice::Quiet,
+            status: String::new(),
+            next_status_at: now,
+        }
+    }
+
+    fn unconfirmed(&self, now: Instant) -> bool {
+        now.duration_since(self.last_reply.unwrap_or(self.observing_since)) >= CONFIRMATION_LIMIT
+    }
+
+    fn restart(&mut self, now: Instant) {
+        self.observing_since = now;
+        self.last_contact = None;
+        self.last_reply = None;
+        self.recovered_until = None;
+        self.next_attempt_at = now;
+        self.next_status_at = now;
+        self.pause();
+    }
+
+    fn pause(&mut self) {
+        if let Some(probe) = &mut self.pending {
+            probe.eligible = false;
+        }
+    }
+
+    fn contact(&mut self, received_at: Instant) {
+        if received_at >= self.observing_since {
+            self.last_contact = Some(
+                self.last_contact
+                    .map_or(received_at, |old| old.max(received_at)),
+            );
+        }
+    }
+
+    fn reply(&mut self, nonce: u64, received_at: Instant, now: Instant) -> bool {
+        let Some(probe) = &self.pending else {
+            return false;
+        };
+        if probe.nonce != nonce {
+            return false;
+        }
+        let timely = probe.eligible
+            && received_at >= self.observing_since
+            && received_at >= probe.queued_at
+            && now.duration_since(probe.queued_at) < CONFIRMATION_LIMIT;
+        self.pending = None;
+        if !timely {
+            return false;
+        }
+        self.needs_recovery_notice |= self.unconfirmed(now);
+        self.contact(received_at);
+        self.last_reply = Some(received_at);
+        self.next_attempt_at = now + PROBE_INTERVAL;
+        if self.needs_recovery_notice {
+            self.recovered_until = Some(now + RECOVERY_NOTICE);
+            self.needs_recovery_notice = false;
+        }
+        true
+    }
+
+    fn tick(
+        &mut self,
+        now: Instant,
+        epoch: u64,
+        output: &mpsc::Sender<ClientMessage>,
+        nonce: &mut u64,
+    ) -> Result<()> {
+        self.needs_recovery_notice |= self.unconfirmed(now);
+        if self.pending.is_some() || now < self.next_attempt_at {
+            return Ok(());
+        }
+        let next = nonce.checked_add(1).context("probe nonce exhausted")?;
+        self.next_attempt_at = now + PROBE_INTERVAL;
+        if output
+            .try_send(ClientMessage::Probe { epoch, nonce: next })
+            .is_ok()
+        {
+            *nonce = next;
+            self.pending = Some(PendingProbe {
+                nonce: next,
+                queued_at: now,
+                eligible: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn status(&mut self, now: Instant, pending: &PendingInput) -> &str {
+        let unconfirmed = self.unconfirmed(now);
+        self.needs_recovery_notice |= unconfirmed;
+        let waiting = pending.records.first_key_value().and_then(|(_, input)| {
+            let age = now.duration_since(input.accepted_at.max(self.observing_since));
+            (age >= CONFIRMATION_LIMIT).then_some(age.as_secs())
+        });
+        let recovered = self.recovered_until.is_some_and(|until| now < until);
+        let notice = if unconfirmed {
+            ProbeNotice::Unconfirmed
+        } else if recovered {
+            ProbeNotice::Recovered
+        } else if waiting.is_some() {
+            ProbeNotice::AwaitingInput
+        } else {
+            ProbeNotice::Quiet
+        };
+        if notice != self.notice || now >= self.next_status_at {
+            self.notice = notice;
+            self.next_status_at = now + STATUS_INTERVAL;
+            let mut parts = Vec::new();
+            if unconfirmed {
+                let reply_age = now
+                    .duration_since(self.last_reply.unwrap_or(self.observing_since))
+                    .as_secs();
+                let traffic = self.last_contact.map_or("no traffic".into(), |at| {
+                    format!("traffic {}s ago", now.duration_since(at).as_secs())
+                });
+                parts.push(format!("Reply unconfirmed {reply_age}s; {traffic}."));
+            } else if recovered {
+                parts.push("Application replies resumed.".into());
+            }
+            if let Some(age) = waiting {
+                parts.push(format!(
+                    "{} accepted inputs waiting {age}s.",
+                    pending.records.len()
+                ));
+            }
+            self.status = parts.join(" ");
+        }
+        &self.status
+    }
 }
 
 struct Connecting(JoinHandle<()>);
@@ -153,8 +332,13 @@ async fn open_link(
         }
         let result = async {
             while let Some(message) = transport::recv_message(&mut input).await? {
+                let received_at = Instant::now();
                 notify
-                    .send(NetworkEvent::Message { attempt, message })
+                    .send(NetworkEvent::Message {
+                        attempt,
+                        message,
+                        received_at,
+                    })
                     .await?;
             }
             Result::<()>::Ok(())
@@ -183,8 +367,13 @@ async fn open_link(
             loop {
                 match transport::receive_uni(&receiving).await {
                     Ok(incoming) => {
+                        let received_at = Instant::now();
                         if notify
-                            .send(NetworkEvent::Display { attempt, incoming })
+                            .send(NetworkEvent::Display {
+                                attempt,
+                                incoming,
+                                received_at,
+                            })
                             .await
                             .is_err()
                         {
@@ -218,11 +407,49 @@ async fn open_link(
         effects_ack: 0,
         resize_sent: 0,
         start,
+        probe: ProbeMonitor::new(Instant::now()),
     })
 }
 
 fn fatal_close(connection: &Connection) -> bool {
     matches!(connection.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(reason)) if reason.error_code == 1u32.into())
+}
+
+// Tokio's forwarded signal can arrive after an already-ready timer.
+struct ContinueFlag {
+    pending: Arc<AtomicBool>,
+    registration: signal_hook::SigId,
+}
+
+impl ContinueFlag {
+    fn new() -> Result<Self> {
+        let pending = Arc::new(AtomicBool::new(false));
+        let registration = signal_hook::flag::register(libc::SIGCONT, pending.clone())?;
+        Ok(Self {
+            pending,
+            registration,
+        })
+    }
+
+    fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
+
+    fn restart_observation(&self, link: &mut Option<Link>) -> bool {
+        if !self.take() {
+            return false;
+        }
+        if let Some(active) = link {
+            active.probe.restart(Instant::now());
+        }
+        true
+    }
+}
+
+impl Drop for ContinueFlag {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.registration);
+    }
 }
 
 pub struct ClientOptions {
@@ -435,10 +662,16 @@ enum InputNotice {
     Ready,
 }
 
+struct AcceptedInput {
+    record: InputRecord,
+    bytes: usize,
+    accepted_at: Instant,
+}
+
 #[derive(Default)]
 struct PendingInput {
     sequence: u64,
-    records: BTreeMap<u64, (InputRecord, usize)>,
+    records: BTreeMap<u64, AcceptedInput>,
     bytes: usize,
     paused: bool,
     notice: Option<InputNotice>,
@@ -469,9 +702,9 @@ impl PendingInput {
     }
 
     fn committed(&mut self, through: u64) {
-        self.records.retain(|seq, (_, bytes)| {
+        self.records.retain(|seq, input| {
             if *seq <= through {
-                self.bytes -= *bytes;
+                self.bytes -= input.bytes;
                 false
             } else {
                 true
@@ -517,17 +750,19 @@ impl PendingInput {
             .checked_add(events.len() as u64)
             .context("input sequence exhausted")?;
         let first = self.sequence + 1;
+        let accepted_at = Instant::now();
         for (event, bytes) in events.into_iter().zip(costs) {
             self.sequence += 1;
             self.records.insert(
                 self.sequence,
-                (
-                    InputRecord {
+                AcceptedInput {
+                    record: InputRecord {
                         seq: self.sequence,
                         event,
                     },
                     bytes,
-                ),
+                    accepted_at,
+                },
             );
         }
         self.bytes += bytes;
@@ -535,12 +770,12 @@ impl PendingInput {
             self.notice = None;
         }
         for seq in first..=through {
-            display.predict(seq, &self.records[&seq].0.event)?;
+            display.predict(seq, &self.records[&seq].record.event)?;
         }
         Ok(true)
     }
 
-    fn status(&self, help: bool, connection: &str) -> String {
+    fn status(&self, help: bool, connection: &str, application: &str) -> String {
         let mut parts = Vec::new();
         if self.is_closing() {
             parts.push(if help {
@@ -574,6 +809,9 @@ impl PendingInput {
         if !connection.is_empty() {
             parts.push(connection);
         }
+        if !self.is_closing() && !application.is_empty() {
+            parts.push(application);
+        }
         parts.join(" ")
     }
 }
@@ -585,6 +823,25 @@ fn connection_notice(prefix: &str, reason: &str) -> String {
         .take(256)
         .collect();
     format!("Ctrl-^ . to detach. {prefix} {reason}")
+}
+
+fn refresh_status(
+    display: &mut Display<TtyOutput>,
+    pending: &PendingInput,
+    link: &mut Option<Link>,
+    help: bool,
+    connection: &str,
+    shown: &mut String,
+) -> Result<()> {
+    let application = link
+        .as_mut()
+        .map_or("", |active| active.probe.status(Instant::now(), pending));
+    let status = pending.status(help, connection, application);
+    if status != *shown {
+        display.write_status(&status)?;
+        *shown = status;
+    }
+    Ok(())
 }
 
 fn read_size(size: &mut Size, generation: &mut u64) -> Result<()> {
@@ -604,6 +861,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut continued = signal(SignalKind::from_raw(libc::SIGCONT))?;
+    let continue_flag = ContinueFlag::new()?;
     let mut display = Display::new(io::sink(), options.graphics, options.prediction);
     display.write_status("Connecting.")?;
     let mut ui = LocalUi::Parked {
@@ -620,6 +878,8 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut retry_at = Instant::now();
     let mut failures = 0u32;
     let mut committed = 0;
+    let mut probe_nonce = 0;
+    let mut recovery_needed = false;
     let mut pending = PendingInput::default();
     let mut captured = VecDeque::<LocalEvent>::new();
     let mut escape = EscapeSequence::new();
@@ -653,23 +913,33 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
         else {
             if was_foreground {
                 resync_pending = true;
+                if let Some(active) = &mut link {
+                    active.probe.pause();
+                }
             }
             tokio::select! {
                 biased;
                 _ = terminate.recv() => break,
                 _ = interrupt.recv() => break,
                 _ = hangup.recv() => break,
-                _ = continued.recv() => (),
+                _ = continued.recv() => { continue_flag.take(); },
                 _ = resize_signal.recv() => (),
                 _ = timer.tick() => (),
             }
             continue;
         };
         let result: Result<SessionAction> = async {
-            if !was_foreground {
+            let resumed = continue_flag.restart_observation(&mut link);
+            if !was_foreground || resumed {
+                if !was_foreground && !resumed && let Some(active) = &mut link {
+                    active.probe.restart(Instant::now());
+                }
+                if resumed { terminal.reassert_owned_modes()?; }
                 read_size(&mut size, &mut resize_generation)?;
+                refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
                 display.redraw_cached(size)?;
             }
+            let mut resumed = false;
             if !captured.is_empty() {
                 tokio::select! {
                     biased;
@@ -687,22 +957,23 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                     read_size(&mut size, &mut resize_generation)?;
                 }
                 _ = continued.recv() => {
-                    terminal.reassert_owned_modes()?;
-                    read_size(&mut size, &mut resize_generation)?;
-                    display.redraw_cached(size)?;
+                    resumed |= continue_flag.restart_observation(&mut link);
                 }
                 event = receive.recv() => {
+                    resumed |= continue_flag.restart_observation(&mut link);
                     match event.context("network tasks ended")? {
                         NetworkEvent::Opened { attempt: incoming_attempt, result } if incoming_attempt == attempt => {
                             connecting.take();
                             match result {
-                                Ok(new_link) => {
+                                Ok(mut new_link) => {
                                     ensure!(new_link.committed >= committed && new_link.committed <= pending.sequence, "server input commit is inconsistent");
                                     committed = new_link.committed;
                                     pending.committed(committed);
                                     display.set_epoch(new_link.epoch)?;
                                     display.set_effect_floor(new_link.effect_floor);
                                     effects.retain(|id, _| *id > new_link.effect_floor);
+                                    new_link.probe.restart(Instant::now());
+                                    new_link.probe.needs_recovery_notice = recovery_needed;
                                     let _ = new_link.start.send(true);
                                     link = Some(new_link);
                                     resync_pending = false;
@@ -718,13 +989,14 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                 }
                             }
                         }
-                        NetworkEvent::Message { attempt: incoming_attempt, message } if incoming_attempt == attempt && link.is_some() => {
-                            let active = link.as_ref().expect("active link");
+                        NetworkEvent::Message { attempt: incoming_attempt, message, received_at } if incoming_attempt == attempt && link.is_some() => {
+                            let active = link.as_mut().expect("active link");
                             match message {
                                 ServerMessage::Committed { epoch, through } if epoch == active.epoch => {
                                     ensure!(through >= committed && through <= pending.sequence, "invalid server input commit");
                                     committed = through;
                                     pending.committed(committed);
+                                    active.probe.contact(received_at);
                                 }
                                 ServerMessage::Effects { epoch, floor, items } if epoch == active.epoch => {
                                     display.set_effect_floor(floor);
@@ -733,18 +1005,24 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                         if effect.id > display.effects_applied() { effects.entry(effect.id).or_insert(effect); }
                                     }
                                     ensure!(effects.len() <= MAX_EFFECTS, "pending effects exceed limit");
+                                    active.probe.contact(received_at);
                                 }
                                 ServerMessage::Exit { epoch, code, revision, effects: through } if epoch == active.epoch => {
                                     remote_exit = Some((code, revision, through));
+                                    active.probe.contact(received_at);
+                                }
+                                ServerMessage::ProbeReply { epoch, nonce } if epoch == active.epoch => {
+                                    if active.probe.reply(nonce, received_at, Instant::now()) { recovery_needed = false; }
                                 }
                                 ServerMessage::Error { message } => anyhow::bail!("server: {message}"),
                                 _ => (),
                             }
                         }
-                        NetworkEvent::Display { attempt: incoming_attempt, incoming } if incoming_attempt == attempt && link.is_some() => {
+                        NetworkEvent::Display { attempt: incoming_attempt, incoming, received_at } if incoming_attempt == attempt && link.is_some() => {
                             match incoming {
                                 Incoming::Frame(frame) => {
-                                    let active = link.as_ref().expect("active link");
+                                    let active = link.as_mut().expect("active link");
+                                    if frame.epoch == active.epoch { active.probe.contact(received_at); }
                                     if frame.epoch == active.epoch && frame.revision > display.revision()
                                         && pending_frame.as_ref().is_none_or(|pending| frame.revision > pending.revision) {
                                         if frame.base.is_some_and(|base| base != display.revision()) {
@@ -754,6 +1032,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                 }
                                 Incoming::Resource(resource) => {
                                     resource.validate()?;
+                                    link.as_mut().expect("active link").probe.contact(received_at);
                                     let desired: BTreeSet<_> = pending_frame.as_ref().into_iter().flat_map(|frame| frame.resources.iter().map(|meta| meta.digest)).collect();
                                     let total = resources.values().map(|resource| resource.rgba.len()).sum::<usize>();
                                     if total + resource.rgba.len() > MAX_RESOURCES {
@@ -769,6 +1048,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                         NetworkEvent::Lost { attempt: incoming_attempt, reason, fatal } if incoming_attempt == attempt && link.is_some() => {
                             if fatal { anyhow::bail!("remote session ended: {reason}"); }
                             link.take();
+                            recovery_needed = true;
                             pending_frame = None;
                             resources.clear();
                             retry_at = Instant::now();
@@ -894,11 +1174,14 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
             {
                 return Ok(SessionAction::Exit(code));
             }
-            let status = pending.status(help_visible, &connection_status);
-            if status != shown_status {
-                display.write_status(&status)?;
-                shown_status = status;
+            resumed |= continue_flag.restart_observation(&mut link);
+            if resumed {
+                terminal.reassert_owned_modes()?;
+                read_size(&mut size, &mut resize_generation)?;
+                refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
+                display.redraw_cached(size)?;
             }
+            refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
             pending.notice_presented = true;
             if let Some(active) = link.as_mut() {
                 if let CloseState::Requested { after_sequence, queued_epoch } = &mut pending.close
@@ -963,7 +1246,11 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 {
                     active.effects_ack = display.effects_applied();
                 }
-                for (_, (record, _)) in pending.records.range((std::ops::Bound::Excluded(active.sent_through), std::ops::Bound::Unbounded)).take(8) {
+                if !matches!(pending.close, CloseState::Requested { queued_epoch: Some(epoch), .. } if epoch == active.epoch) {
+                    active.probe.tick(Instant::now(), active.epoch, &active.output, &mut probe_nonce)?;
+                }
+                for (_, input) in pending.records.range((std::ops::Bound::Excluded(active.sent_through), std::ops::Bound::Unbounded)).take(8) {
+                    let record = &input.record;
                     if active.output.try_send(ClientMessage::Input { epoch: active.epoch, record: record.clone() }).is_err() { break; }
                     active.sent_through = record.seq;
                 }
@@ -1006,6 +1293,9 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
         match result {
             Ok(SessionAction::Continue) => (),
             Ok(SessionAction::Suspend) => {
+                if let Some(active) = &mut link {
+                    active.probe.pause();
+                }
                 let suspended;
                 (ui, suspended) = ui.suspend();
                 if let Err(error) = suspended {
@@ -1032,6 +1322,9 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 return Ok(code);
             }
             Err(error) if foreground_lost(&error) => {
+                if let Some(active) = &mut link {
+                    active.probe.pause();
+                }
                 ui = ui.park();
                 resync_pending = true;
             }
