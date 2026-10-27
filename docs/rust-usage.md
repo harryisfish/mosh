@@ -315,6 +315,10 @@ separate upstream and downstream loss, input confirmation, and SIGCONT cases.
 The relay checks `drop_up` and `drop_down` on both packet enqueue and dequeue.
 Its per-direction counters describe encrypted UDP traffic, not actor replies.
 `--evidence-dir` saves raw TTY output and relay observations for these cases.
+The SIGCONT case checks a fresh six-second warning window. It retains the
+original eight-second recovery result and separately observes recovery for up
+to 30 seconds from restoring the relay. This cap only bounds the fixture
+observation.
 `verify_session --verify-liveness` separately pauses only actor polling while
 Quinn continues, then records raw probe replies and QUIC ACK counts.
 `--network` also runs the legacy-input cases. `--legacy-input` checks real PTY
