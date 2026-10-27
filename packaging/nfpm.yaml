@@ -1,0 +1,49 @@
+name: mosh-rs
+arch: ${MOSH_RS_PACKAGE_ARCH}
+platform: linux
+version: ${MOSH_RS_PACKAGE_VERSION}
+release: "1"
+section: net
+priority: optional
+maintainer: harryisfish <harryisfish@users.noreply.github.com>
+description: |
+  Resumable remote terminal with local input prediction.
+  Includes the mosh-rs client and mosh-rs-server for protocol v2.
+homepage: https://github.com/harryisfish/mosh
+license: GPL-3.0-or-later
+contents:
+  - src: ${MOSH_RS_BIN_DIR}/mosh-rs
+    dst: /usr/bin/mosh-rs
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ${MOSH_RS_BIN_DIR}/mosh-rs-server
+    dst: /usr/bin/mosh-rs-server
+    expand: true
+    file_info:
+      mode: 0755
+  - src: README.md
+    dst: /usr/share/doc/mosh-rs/README.md
+  - src: README.zh-CN.md
+    dst: /usr/share/doc/mosh-rs/README.zh-CN.md
+  - src: COPYING
+    dst: /usr/share/doc/mosh-rs/copyright
+    type: license
+  - src: AUTHORS
+    dst: /usr/share/doc/mosh-rs/AUTHORS
+  - src: THANKS
+    dst: /usr/share/doc/mosh-rs/THANKS
+  - src: docs/rust-usage.md
+    dst: /usr/share/doc/mosh-rs/rust-usage.md
+  - src: rust/vendor/wezterm-term/LICENSE.md
+    dst: /usr/share/doc/mosh-rs/wezterm-copyright
+    type: license
+  - src: rust/vendor/wezterm-term/MOSH_PATCHES.md
+    dst: /usr/share/doc/mosh-rs/wezterm-patches.md
+overrides:
+  deb:
+    depends:
+      - openssh-client
+  rpm:
+    depends:
+      - /usr/bin/ssh

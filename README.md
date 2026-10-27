@@ -17,67 +17,95 @@ protocol or Rust protocol v1. Install both endpoints from the same release.
 
 ## Install
 
-Download the archive for each host from
-[GitHub Releases](https://github.com/harryisfish/mosh/releases). Each archive
-contains `bin/mosh-rs` and `bin/mosh-rs-server`.
-
-| Host | Archive target |
-| --- | --- |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux arm64 | `aarch64-unknown-linux-gnu` |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-| macOS Intel | `x86_64-apple-darwin` |
-
-To install the latest release into `~/.local/bin`, run:
+Install the latest release into `~/.local/bin`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | bash
 ```
 
-To install a specific release, pass its version to the script:
+The script selects the host's OS, CPU, and Linux libc, then verifies the release
+checksum before installing both binaries. Use `--version 0.1.2` to pin a release
+or `--install-dir DIRECTORY` to choose another directory. See the
+[usage guide](docs/rust-usage.md#install-a-release) to review the script before running it.
+
+Install `mosh-rs` on your machine and `mosh-rs-server` on the remote host.
+Both endpoints must use the same release. Put the server in the remote SSH
+environment's `PATH`, or pass its absolute path with `--server`.
+
+### Homebrew
+
+Use this repository as a tap on macOS or Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | \
-	bash -s -- --version 0.1.1
+brew tap harryisfish/mosh https://github.com/harryisfish/mosh
+brew install harryisfish/mosh/mosh-rs
 ```
 
-The script checks the release checksum before it installs either binary. To
-review the script first, download it and run `bash install.sh`:
+The formula installs both binaries from a pinned release with SHA-256 checksums.
+
+### Debian, Ubuntu, Fedora, and openSUSE
+
+Download your package and `SHA256SUMS` from
+[GitHub Releases](https://github.com/harryisfish/mosh/releases), then verify it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
-cat install.sh
-bash install.sh
+sha256sum --ignore-missing -c SHA256SUMS
 ```
 
-Use `--install-dir DIRECTORY` to choose another directory.
+For Debian or Ubuntu on x86_64:
+
+```sh
+sudo apt install ./mosh-rs_0.1.2-1_amd64.deb
+```
+
+For Fedora on x86_64:
+
+```sh
+sudo dnf install ./mosh-rs-0.1.2-1.x86_64.rpm
+```
+
+For openSUSE on x86_64:
+
+```sh
+sudo zypper install --allow-unsigned-rpm ./mosh-rs-0.1.2-1.x86_64.rpm
+```
+
+On arm64, use the `arm64.deb` or `aarch64.rpm` asset instead.
+These packages include both binaries and install the OpenSSH client dependency.
+They use static musl builds. There is no project apt or RPM repository.
+
+### Archives
+
+Each archive in [GitHub Releases](https://github.com/harryisfish/mosh/releases)
+contains `bin/mosh-rs` and `bin/mosh-rs-server`.
+
+| Host | Archive target |
+| --- | --- |
+| Linux x86_64, glibc | `x86_64-unknown-linux-gnu` |
+| Linux arm64, glibc | `aarch64-unknown-linux-gnu` |
+| Linux x86_64, musl or glibc | `x86_64-unknown-linux-musl` |
+| Linux arm64, musl or glibc | `aarch64-unknown-linux-musl` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
 
 Download `SHA256SUMS` beside the archive. Verify it before extracting:
 
 - macOS: `shasum -a 256 --ignore-missing -c SHA256SUMS`
 - Linux: `sha256sum --ignore-missing -c SHA256SUMS`
 
-For example, install version 0.1.1 on an Apple Silicon Mac:
+For example, install version 0.1.2 on an Apple Silicon Mac:
 
 ```sh
-tar -xzf mosh-rs-0.1.1-aarch64-apple-darwin.tar.gz
+tar -xzf mosh-rs-0.1.2-aarch64-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 755 mosh-rs-0.1.1-aarch64-apple-darwin/bin/mosh-rs \
-	mosh-rs-0.1.1-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
+install -m 755 mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs \
+	mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Install `mosh-rs` on your machine and `mosh-rs-server` on the remote host, using
-each host's archive. Put the server in the remote SSH environment's `PATH`, or
-pass its absolute path with `--server`.
-
-Run the installer on the client and the remote host. Each host selects its own
-target. Both endpoints must use the same release. This Rust version does not
-speak the original Mosh wire protocol.
-
-Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64,
-and require glibc. Build from source on musl systems or older systems. The macOS
-binaries are unsigned.
+GNU Linux archives are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for
+arm64, and require glibc. Static musl archives also run on Alpine and Linux hosts
+with older glibc. The macOS binaries are unsigned.
 
 ## Connect
 
@@ -171,6 +199,7 @@ Further documentation:
 - [Usage and verification commands](docs/rust-usage.md)
 - [Rust protocol reference](docs/rust-protocol.md)
 - [Mac mini acceptance report](docs/rust-macmini-verification.md)
+- [Release maintenance](docs/rust-release.md)
 
 ## Origin and license
 

@@ -15,63 +15,92 @@ Rust 版使用协议 v2，与原版 Mosh 协议和 Rust 协议 v1 均不兼容�
 
 ## 安装
 
-在 [GitHub Releases](https://github.com/harryisfish/mosh/releases) 下载各台主机对应的压缩包。
-每个包都包含 `bin/mosh-rs` 和 `bin/mosh-rs-server`。
-
-| 主机 | 压缩包目标平台 |
-| --- | --- |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux arm64 | `aarch64-unknown-linux-gnu` |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-| macOS Intel | `x86_64-apple-darwin` |
-
 安装最新版本到 `~/.local/bin`：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | bash
 ```
 
-安装指定版本：
+脚本会识别操作系统、CPU 和 Linux libc，校验 release 的 checksum 后再安装两个二进制文件。
+使用 `--version 0.1.2` 指定版本，或用 `--install-dir DIRECTORY` 指定安装目录。
+需要先审阅脚本时，参考[使用指南](docs/rust-usage.md#install-a-release)。
+
+在本机安装 `mosh-rs`，在远程主机安装 `mosh-rs-server`，两端必须使用同一版本。
+将服务端放入远程 SSH 环境的 `PATH`，或用 `--server` 指定它的绝对路径。
+
+### Homebrew
+
+macOS 和 Linux 均可直接使用本仓库作为 tap：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | \
-	bash -s -- --version 0.1.1
+brew tap harryisfish/mosh https://github.com/harryisfish/mosh
+brew install harryisfish/mosh/mosh-rs
 ```
 
-脚本会先校验 release 的 checksum，再安装两个二进制文件。需要先审阅脚本时，
-先下载并查看它，再运行：
+Formula 固定已发布版本及其 SHA-256，同时安装客户端和服务端。
+
+### Debian、Ubuntu、Fedora 和 openSUSE
+
+从 [GitHub Releases](https://github.com/harryisfish/mosh/releases)
+下载对应安装包和 `SHA256SUMS`，先执行校验：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
-cat install.sh
-bash install.sh
+sha256sum --ignore-missing -c SHA256SUMS
 ```
 
-使用 `--install-dir DIRECTORY` 可以指定其他安装目录。
+Debian 或 Ubuntu 的 x86_64 主机：
+
+```sh
+sudo apt install ./mosh-rs_0.1.2-1_amd64.deb
+```
+
+Fedora 的 x86_64 主机：
+
+```sh
+sudo dnf install ./mosh-rs-0.1.2-1.x86_64.rpm
+```
+
+openSUSE 的 x86_64 主机：
+
+```sh
+sudo zypper install --allow-unsigned-rpm ./mosh-rs-0.1.2-1.x86_64.rpm
+```
+
+arm64 主机改用文件名以 `arm64.deb` 或 `aarch64.rpm` 结尾的安装包。
+每个包都包含客户端和服务端，并通过包管理器安装 OpenSSH 客户端依赖。
+安装包使用静态 musl 构建；本项目暂未提供 apt 或 RPM 软件源。
+
+### 压缩包
+
+[GitHub Releases](https://github.com/harryisfish/mosh/releases) 中的每个压缩包
+都包含 `bin/mosh-rs` 和 `bin/mosh-rs-server`。
+
+| 主机 | 压缩包目标平台 |
+| --- | --- |
+| Linux x86_64，glibc | `x86_64-unknown-linux-gnu` |
+| Linux arm64，glibc | `aarch64-unknown-linux-gnu` |
+| Linux x86_64，musl 或 glibc | `x86_64-unknown-linux-musl` |
+| Linux arm64，musl 或 glibc | `aarch64-unknown-linux-musl` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
 
 将 `SHA256SUMS` 下载到压缩包所在目录，解压前执行校验：
 
 - macOS：`shasum -a 256 --ignore-missing -c SHA256SUMS`
 - Linux：`sha256sum --ignore-missing -c SHA256SUMS`
 
-例如，在 Apple Silicon Mac 上安装 0.1.1：
+例如，在 Apple Silicon Mac 上安装 0.1.2：
 
 ```sh
-tar -xzf mosh-rs-0.1.1-aarch64-apple-darwin.tar.gz
+tar -xzf mosh-rs-0.1.2-aarch64-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 755 mosh-rs-0.1.1-aarch64-apple-darwin/bin/mosh-rs \
-	mosh-rs-0.1.1-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
+install -m 755 mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs \
+	mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-在本机安装 `mosh-rs`，在远程主机安装 `mosh-rs-server`，分别使用对应平台的压缩包。
-将服务端放入远程 SSH 环境的 `PATH`，或用 `--server` 指定它的绝对路径。
-
-请在客户端和远端主机分别运行安装脚本。每台主机会选择自己的目标平台。
-两端必须使用同一版本。Rust 版不兼容原版 Mosh 协议。
-
-Linux x86_64 包在 Ubuntu 22.04 上构建，arm64 包在 Ubuntu 24.04 上构建，
-并需要 glibc。musl 系统或更旧的系统请从源码构建。macOS 二进制文件未签名。
+GNU Linux 压缩包在 Ubuntu 22.04 x86_64 和 Ubuntu 24.04 arm64 上构建，并需要 glibc。
+静态 musl 压缩包也适用于 Alpine 和 glibc 较旧的 Linux 主机。macOS 二进制文件未签名。
 
 ## 连接
 
@@ -157,6 +186,7 @@ target/release/mosh-rs --local
 - [使用指南与验证命令](docs/rust-usage.md)
 - [Rust 协议参考](docs/rust-protocol.md)
 - [Mac mini 验收报告](docs/rust-macmini-verification.md)
+- [版本发布维护](docs/rust-release.md)
 
 ## 来源与许可
 

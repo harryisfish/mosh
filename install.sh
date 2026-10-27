@@ -16,7 +16,7 @@ Usage:
   install.sh [--version VERSION] [--install-dir DIRECTORY]
 
 Options:
-  --version VERSION       Install a release such as 0.1.1. Defaults to latest.
+  --version VERSION       Install a release such as 0.1.2. Defaults to latest.
   --install-dir DIRECTORY Install into DIRECTORY. Defaults to $HOME/.local/bin.
   -h, --help              Show this help.
 
@@ -60,10 +60,15 @@ resolve_target() {
 
 is_musl_linux() {
 	local ldd_output
+	if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+		return 1
+	fi
 	if command -v ldd >/dev/null 2>&1; then
 		ldd_output=$(ldd --version 2>&1 || true)
-		[[ "$ldd_output" == *musl* ]] && return 0
-		return 1
+		case "$ldd_output" in
+			*musl*) return 0 ;;
+			*GLIBC*|*"GNU libc"*|*"GNU C Library"*) return 1 ;;
+		esac
 	fi
 	for loader in /lib/ld-musl-*.so.1 /lib64/ld-musl-*.so.1; do
 		[[ -e "$loader" ]] && return 0
@@ -138,12 +143,10 @@ esac
 
 os=$(uname -s)
 arch=$(uname -m)
-if [[ "$os" == Linux ]]; then
-	if is_musl_linux; then
-		die "musl Linux is not supported by this release; build mosh-rs from source"
-	fi
-fi
 target=$(resolve_target "$os" "$arch")
+if [[ "$os" == Linux ]] && is_musl_linux; then
+	target="${target%-gnu}-musl"
+fi
 if [[ "$version" == latest ]]; then
 	version=$(resolve_latest_version)
 else
@@ -159,7 +162,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 archive_path="$tmpdir/$archive"
 checksums_path="$tmpdir/SHA256SUMS"
 download "$release_url/$archive" "$archive_path" \
-	|| die "failed to download $archive"
+	|| die "failed to download $archive; check that $tag publishes $target"
 download "$release_url/SHA256SUMS" "$checksums_path" \
 	|| die "failed to download SHA256SUMS for $tag"
 
