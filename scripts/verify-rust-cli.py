@@ -73,8 +73,27 @@ def exact(data, timeout=5):
 
 
 def remote_fixture(mode, state):
-    tty.setraw(0)
+    tty.setraw(0, termios.TCSANOW if mode == "redraw" else termios.TCSAFLUSH)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "redraw":
+        received = Path(state + ".received")
+        received.write_bytes(b"")
+        os.write(1, b"\x1b[2J\x1b[4;1H\x1b[38;2;11;22;33;48;2;44;55;66mREDRAW_BASE\x1b[0m"
+                    b"\x1b[6;3H\x1b_Ga=T,f=32,s=1,v=1,i=9,c=1,r=1,C=1,q=2;/wAA/w==\x1b\\"
+                    b"\x1b]2;REDRAW_TITLE\x1b\\\x1b]7;file:///tmp/mosh-redraw\x1b\\"
+                    b"\x1b]133;A\x1b\\\x07\x1b]52;c;cmVkcmF3\x1b\\"
+                    b"\x1b]9;redraw once\x1b\\\x1b[9;6H")
+        kitty_enabled = False
+        while True:
+            if not kitty_enabled and Path(state + ".kitty").exists():
+                os.write(1, b"\x1b[>31u\x1b[10;1HREDRAW_KITTY\x1b[9;6H")
+                kitty_enabled = True
+            if select.select([0], [], [], 0.02)[0]:
+                chunk = os.read(0, 65536)
+                if not chunk:
+                    return 0
+                with received.open("ab") as output:
+                    output.write(chunk)
     if mode == "legacy-input":
         received = Path(state + ".received")
         received.write_bytes(b"")
@@ -880,6 +899,218 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
+def verify_redraw(bin_dir, temporary, evidence_dir=None):
+    script = str(Path(__file__).resolve())
+    client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
+    replay = bin_dir / "examples" / "verify_display"
+    assert replay.is_file(), "build the verify_display example before CLI redraw verification"
+
+    def session(name, before_attach=False):
+        state = str(Path(temporary) / ("redraw-" + name + ".json"))
+        wrapper = Path(temporary) / ("redraw-proxy-" + name)
+        wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+        wrapper.chmod(0o700)
+        if before_attach:
+            Path(state + ".drop").touch()
+        process = TerminalProcess([client, "--local", "--server", str(wrapper), "--predict", "never",
+                                   "--graphics", "kitty", "--", sys.executable, script, "--remote", "redraw", state])
+        return process, state
+
+    def pump_for(process, duration):
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            process.pump(min(0.01, max(0, deadline - time.monotonic())))
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+
+    def ready(process):
+        for marker in [b"REDRAW_BASE", b"\x1b]52;c;cmVkcmF3", b"\x1b]777;notify;;redraw once", b"\x1b]133;"]:
+            process.until(marker)
+        pump_for(process, 0.1)
+
+    def inspect(process, run, name, fixed, resized=None):
+        transcript = run / (name + ".tty")
+        transcript.write_bytes(process.output)
+        command = [str(replay), "--redraw-transcript", str(transcript), "fixed" if fixed else "broken"]
+        if resized is not None:
+            command.extend(map(str, resized))
+        result = subprocess.run(command, text=True, capture_output=True)
+        (run / (name + ".replay.log")).write_text(result.stdout + result.stderr)
+        assert result.returncode == 0, (name, result.stdout, result.stderr)
+
+    def damage(process):
+        start = len(process.output)
+        os.write(process.slave, b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[4;1H\x1b[0;38;2;99;88;77mBROKEN!!!!!\x1b[0m\x1b[9;6H")
+        process.until(b"BROKEN!!!!!", start=start)
+
+    def local_action(process, run, facts, name, payload, redraws, resized=None):
+        damage(process)
+        inspect(process, run, name + "-damaged", False, resized)
+        start = len(process.output)
+        process.send(payload)
+        if redraws:
+            deadline = time.monotonic() + 5
+            while bytes(process.output[start:]).count(b"\x1b[2J") < redraws:
+                process.pump(0.01)
+                assert process.process.poll() is None, bytes(process.output[-4000:])
+                assert time.monotonic() < deadline, (name, "local redraw did not occur")
+        pump_for(process, 0.1)
+        delta = bytes(process.output[start:])
+        assert delta.count(b"\x1b[2J") == redraws, (name, delta)
+        for effect in [b"\x07", b"\x1b]52;", b"\x1b]777;", b"\x1b]133;"]:
+            assert effect not in delta, (name, "redraw repeated effect", effect)
+        if redraws:
+            assert b"\x1b]2;REDRAW_TITLE" in delta and b"\x1b]7;file:///tmp/mosh-redraw" in delta
+        inspect(process, run, name, bool(redraws), resized)
+        facts.append({"case": name, "offset": start, "end": len(process.output), "tty_bytes": len(delta),
+                      "full_redraws": redraws, "input_hex": payload.hex(), "effects_replayed": 0})
+
+    def received(process, state, expected):
+        path = Path(state + ".received")
+        deadline = time.monotonic() + 15
+        while not path.exists() or path.read_bytes() != expected:
+            process.pump(0.01)
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+            actual = path.read_bytes() if path.exists() else b""
+            assert expected.startswith(actual), ("unexpected remote redraw input", actual, expected)
+            assert time.monotonic() < deadline, ("remote redraw input timed out", actual, expected)
+        pump_for(process, 0.1)
+        assert path.read_bytes() == expected, "redraw input arrived more than once"
+
+    def finish_evidence(process, state, run, facts):
+        (run / "complete.tty").write_bytes(process.output)
+        (run / "cases.json").write_text(json.dumps(facts, indent=2) + "\n")
+        for suffix in [".received", ".stats"]:
+            path = Path(state + suffix)
+            if path.exists():
+                (run / ("received.bin" if suffix == ".received" else "relay.json")).write_bytes(path.read_bytes())
+        process.close()
+        cleanup(state)
+
+    output = evidence_dir / "redraw" if evidence_dir is not None else Path(temporary) / "redraw-evidence"
+    output.mkdir(parents=True, exist_ok=True)
+    run = output / "identity"
+    run.mkdir(exist_ok=True)
+    process, state = session("identity")
+    facts = []
+    try:
+        ready(process)
+        original = json.loads(Path(state).read_text())
+        inspect(process, run, "initial", True)
+        Path(state + ".drop").touch()
+        pump_for(process, 0.1)
+        relay_before = json.loads(Path(state + ".stats").read_text())
+        local_action(process, run, facts, "legacy", b"\x0c", 1)
+        assert Path(state + ".received").read_bytes() == b""
+        relay_after = json.loads(Path(state + ".stats").read_text())
+        assert relay_after["forwarded"] == relay_before["forwarded"]
+        assert relay_after["dropped"] > relay_before["dropped"]
+        Path(state + ".drop").unlink()
+        received(process, state, b"\x0c")
+        Path(state + ".kitty").touch()
+        process.until(b"REDRAW_KITTY")
+        pump_for(process, 0.1)
+        Path(state + ".drop").touch()
+        pump_for(process, 0.1)
+        expected = bytearray(b"\x0c")
+        cases = [
+            ("press", b"\x1b[108;5:1u", 1, b"\x1b[108;5:1u"),
+            ("repeat", b"\x1b[108;5:2u", 1, b"\x1b[108;5:2u"),
+            ("release", b"\x1b[108;5:3u", 0, b"\x1b[108;5:3u"),
+            ("uppercase", b"\x1b[76;5u", 1, b"\x1b[76;5:1u"),
+            ("shift", b"\x1b[108;6u", 1, b"\x1b[108;6:1u"),
+            ("caps", b"\x1b[108;69u", 1, b"\x1b[108;69:1u"),
+            ("num", b"\x1b[108;133u", 1, b"\x1b[108;133:1u"),
+            ("shift-locks", b"\x1b[108;198u", 1, b"\x1b[108;198:1u"),
+            ("alt", b"\x1b[108;7u", 0, b"\x1b[108;7:1u"),
+            ("super", b"\x1b[108;13u", 0, b"\x1b[108;13:1u"),
+            ("hyper", b"\x1b[108;21u", 0, b"\x1b[108;21:1u"),
+            ("meta", b"\x1b[108;37u", 0, b"\x1b[108;37:1u"),
+            ("plain", b"\x1b[108;1u", 0, b"\x1b[108;1:1u"),
+            ("base-only", b"\x1b[120::108;5u", 0, b"\x1b[120::108;5:1u"),
+            ("primary-and-text", b"\x1b[108:76:120;5;12:65u", 1, b"\x1b[108:76:120;5:1;12:65u"),
+            ("shifted-only", b"\x1b[120:108;5u", 0, b"\x1b[120:108;5:1u"),
+            ("text-only", b"\x1b[120;5;12u", 0, b"\x1b[120;5:1;12u"),
+            ("paste", b"\x1b[200~\x0c\x1b[201~", 0, b"\x0c"),
+            ("unknown-suffix", b"\x1e\x0c", 1, b"\x1b[94;5:1u\x1b[108;5:1u"),
+            ("independent", b"\x1b[108;5:1u\x1b[108;5:2u", 2, b"\x1b[108;5:1u\x1b[108;5:2u"),
+            ("same-group", b"\x1b[94::108;5u\x1b[108::108;5:2u\x1b[108::108;5:2u\x1b[120;1u", 1,
+             b"\x1b[94::108;5:1u\x1b[108::108;5:2u\x1b[108::108;5:2u\x1b[120;1:1u"),
+            ("help-empty", b"\x1e?\x1b[94;5:3u\x1b[63;1:3u", 0, b""),
+        ]
+        for name, payload, redraws, remote in cases:
+            local_action(process, run, facts, name, payload, redraws)
+            expected.extend(remote)
+            assert Path(state + ".received").read_bytes() == b"\x0c", "input crossed blocked UDP relay"
+        resize_offset = len(process.output)
+        fcntl.ioctl(process.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 64, 640, 240))
+        local_action(process, run, facts, "resize", b"\x0c", 1, (64, 12, resize_offset))
+        expected.extend(b"\x1b[108;5:1u")
+        Path(state + ".drop").unlink()
+        received(process, state, bytes(expected))
+        assert json.loads(Path(state).read_text()) == original, "redraw replaced the remote process"
+        process.send(b"\x1e.")
+        process.finish(0)
+        print("CLI redraw identity, phase, group count, paste, resize, cached text/style/cursor/image and effects passed "
+              + json.dumps({"cases": facts, "received_bytes": len(expected), "pids": original}, sort_keys=True), flush=True)
+    finally:
+        finish_evidence(process, state, run, facts)
+
+    for name in ["saturated", "closing"]:
+        run = output / name
+        run.mkdir(exist_ok=True)
+        process, state = session(name)
+        facts = []
+        try:
+            ready(process)
+            original = json.loads(Path(state).read_text())
+            Path(state + ".drop").touch()
+            if name == "saturated":
+                for glyph in [b"A", b"B"]:
+                    process.send(b"\x1b[200~" + glyph * (128 * 1024) + b"\x1b[201~")
+                process.until(b"Input not accepted")
+            else:
+                process.send(b"\x1eq")
+                process.until(b"Close unconfirmed")
+            local_action(process, run, facts, name, b"\x0c", 1)
+            assert Path(state + ".received").read_bytes() == b""
+            Path(state + ".drop").unlink()
+            if name == "saturated":
+                received(process, state, b"A" * (128 * 1024))
+                process.until(b"Input ready", timeout=15)
+                process.send(b"\x1e.")
+                process.finish(0)
+            else:
+                process.finish(129)
+                assert Path(state + ".received").read_bytes() == b"", "closing redraw was sent remotely"
+            assert json.loads(Path(state).read_text()) == original
+            print(f"CLI redraw {name}: local repair passed and refused Ctrl-L was never sent", flush=True)
+        finally:
+            finish_evidence(process, state, run, facts)
+
+    run = output / "no-frame"
+    run.mkdir(exist_ok=True)
+    process, state = session("no-frame", before_attach=True)
+    facts = []
+    try:
+        process.until(b"Connecting.")
+        assert not Path(state).exists(), "blocked Attach started the command"
+        start = len(process.output)
+        process.send(b"\x0c")
+        pump_for(process, 0.15)
+        delta = bytes(process.output[start:])
+        assert b"\x1b[2K" in delta and b"\x1b[2J" not in delta, "no-frame redraw did not retain status-only behavior"
+        assert not Path(state).exists()
+        facts.append({"case": "no-frame", "offset": start, "tty_bytes": len(delta), "full_redraws": 0})
+        Path(state + ".drop").unlink()
+        ready(process)
+        received(process, state, b"\x0c")
+        process.send(b"\x1e.")
+        process.finish(0)
+        print("CLI redraw before first frame preserved status and delivered the admitted key once after Attach", flush=True)
+    finally:
+        finish_evidence(process, state, run, facts)
+
+
 def verify_liveness(bin_dir, temporary, evidence_dir=None):
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
     script = str(Path(__file__).resolve())
@@ -1099,6 +1330,7 @@ else:
 
         if network:
             verify_legacy_input(bin_dir, temporary, evidence_dir)
+            verify_redraw(bin_dir, temporary, evidence_dir)
             state = str(Path(temporary) / "network.json")
             wrapper = Path(temporary) / "bootstrap-proxy"
             wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
@@ -1529,10 +1761,14 @@ if __name__ == "__main__":
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
     parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
+    parser.add_argument("--redraw", action="store_true", help="exercise cached Ctrl-L redraw, key identity, images, effects and rejected input")
     parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     arguments = parser.parse_args()
-    if arguments.liveness:
+    if arguments.redraw:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-redraw-") as temporary:
+            verify_redraw(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
+    elif arguments.liveness:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-liveness-") as temporary:
             verify_liveness(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
     elif arguments.legacy_input:

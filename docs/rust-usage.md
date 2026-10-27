@@ -209,6 +209,15 @@ ending the remote command. Run `fg` to restore the session, including its cached
 text and images. Ordinary Ctrl-Z goes to the remote program. A client resumed
 with `bg` waits for `fg` before reading or drawing on the terminal.
 
+Press Ctrl-L to redraw the cached remote screen immediately, even during a
+network outage or input refusal. This clears local predictions and restores
+cached text, images, title, and directory without repeating bells, clipboard
+writes, notifications, or shell markers. The original key still follows normal
+input admission; a refused key is never sent later. Kitty press and repeat
+events with primary `l` or `L` and Ctrl trigger redraw. Shift and Caps/Num lock
+are allowed; other modifiers and release events do not trigger it. Paste text
+does not trigger redraw.
+
 `Ctrl-^ q` stops accepting new remote input and requests closure after the server
 confirms the PTY writes for all previously accepted events. This does not
 confirm that the remote application has processed every event. The client keeps
@@ -292,6 +301,7 @@ target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
 python3 scripts/verify-rust-cli.py --saturated-input
 python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
+python3 scripts/verify-rust-cli.py --redraw --evidence-dir /tmp/mosh-rs-redraw
 python3 scripts/verify-rust-cli.py --liveness --evidence-dir /tmp/mosh-rs-liveness
 ```
 
@@ -311,6 +321,12 @@ Quinn continues, then records raw probe replies and QUIC ACK counts.
 bytes for prefix deadlines, function and keypad keys, late-tail refusal,
 management recovery, reply filters, UTF-8, Kitty phases, and SIGCONT.
 Its evidence directory contains the TTY transcript and exact received bytes.
+`--network` also runs the redraw cases. `--redraw` damages local cells and a
+cached Kitty image while UDP is blocked, then checks Ctrl-L restores cells,
+styles, cursor, and image through the terminal core. It checks key identity and
+phase, group counts, resize, input refusal, closing, and the first-frame boundary.
+It compares exact remote bytes and confirms one-time effects are not repeated.
+These transcript checks do not verify native terminal visuals or selection.
 
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
