@@ -456,7 +456,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                     failures = failures.saturating_add(1);
                                     let delay = Duration::from_millis((250u64 << failures.min(4)).min(5000));
                                     retry_at = Instant::now() + delay;
-                                    display.write_status(&format!("Connection unavailable, retrying. {error:#}"))?;
+                                    display.write_status(&format!("Ctrl-^ . to detach. Connection unavailable, retrying. {error:#}"))?;
                                 }
                             }
                         }
@@ -516,7 +516,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             pending_frame = None;
                             resources.clear();
                             retry_at = Instant::now();
-                            display.write_status(&format!("Connection interrupted, reconnecting. {reason}"))?;
+                            display.write_status(&format!("Ctrl-^ . to detach. Connection interrupted, reconnecting. {reason}"))?;
                         }
                         _ => (),
                     }
