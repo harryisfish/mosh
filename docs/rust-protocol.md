@@ -3,8 +3,8 @@
 This is the implementation contract for the Rust client and server. The protocol
 is not compatible with the original Mosh wire protocol.
 
-The current Rust protocol is version 3, with ALPN `mosh-rs/3`. Both endpoints
-must use this version. Version 1 and 2 workers cannot resume with a version 3 client.
+The current Rust protocol is version 4, with ALPN `mosh-rs/4`. Both endpoints
+must use this version. Version 1, 2, and 3 workers cannot resume with a version 4 client.
 
 ## Ownership and authentication
 
@@ -19,6 +19,43 @@ JSON argv, never shell interpolation. The client generates a session client
 certificate. The server trusts only that certificate. The client trusts only
 the server certificate returned over SSH. Both use normal rustls certificate
 validation, the `mosh.local` server name, and QUIC without early application data.
+
+## UTF-8 locale and PTY startup
+
+Version 4 appends the required `locale_candidates` field to `BootstrapRequest`.
+It contains at most eight locale names, each 1 to 128 ASCII bytes from
+`[A-Za-z0-9_.@-]`. The decoder rejects invalid names and excess entries. The
+client reads `LC_ALL`, `LC_CTYPE`, and `LANG` in that order, skips invalid or empty
+values, and removes duplicates. Version 3 requests, grants, and ALPN handshakes
+are rejected. Grant framing and postcard messages keep their version 3 shape.
+
+The worker waits for the first authenticated, valid Attach before selecting a
+locale or starting the command. It tries the client's candidates, the server's
+`LC_ALL`, `LC_CTYPE`, and `LANG`, then `C.UTF-8`, `C.utf8`, `UTF-8`,
+`en_US.UTF-8`, and `en_US.utf8`, skipping duplicate and invalid names. If these
+candidates fail, it runs `locale -a` once and probes the installed names.
+Discovery accepts at most 64 KiB and 1024 names and has a five-second deadline.
+On Linux and macOS,
+`newlocale(LC_CTYPE_MASK, ...)` and `nl_langinfo_l(CODESET, ...)` must confirm an
+actual UTF-8 codeset. A locale name alone is insufficient. Each probe frees its
+locale without changing process-global locale or environment state. Other
+platforms return an explicit unsupported-platform error.
+
+The child removes inherited `LC_ALL` and sets `LC_CTYPE` and `LANG` to the
+selected locale. Other explicit `LC_*` values remain inherited. On Linux and
+macOS, the worker reads the slave PTY's termios, ORs `IUTF8` into `c_iflag`, and
+applies the attributes with `TCSANOW`, preserving all other flags and control
+characters. The IUTF8 step is a no-op on other platforms.
+
+If no candidate is usable, the worker reports `no usable UTF-8 locale found`
+and asks the user to generate or install a server UTF-8 locale and
+set `LC_ALL`, `LC_CTYPE`, or `LANG`. The startup error reaches the client before
+the worker exits. The command does not start, the client treats the error as
+fatal, and the worker cannot return to its prepared state. Reattachment uses
+the running PTY and does not select a new locale.
+Missing locale utilities, failed discovery, excess output, and discovery
+timeouts have separate startup errors. A configured usable locale avoids the
+discovery process.
 
 ## Independent confirmation domains
 

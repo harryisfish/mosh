@@ -7,7 +7,7 @@ use clap::{Parser, ValueEnum};
 use mosh_rs::client::{self, ClientOptions};
 use mosh_rs::display::{Graphics, PredictionPolicy};
 use mosh_rs::input::LocalTerminal;
-use mosh_rs::model::{BootstrapRequest, PROTOCOL_VERSION};
+use mosh_rs::model::{BootstrapRequest, PROTOCOL_VERSION, valid_locale_name};
 use mosh_rs::transport::{self, ClientIdentity};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -92,6 +92,7 @@ async fn run() -> Result<i32> {
         port: args.port,
         idle_seconds: args.idle_seconds,
         clipboard_read: args.clipboard_read,
+        locale_candidates: locale_candidates(),
     };
     let grant = if args.local {
         let path = args.server.as_ref().map(PathBuf::from).unwrap_or_else(|| {
@@ -139,4 +140,17 @@ async fn run() -> Result<i32> {
 
 fn can_report() -> bool {
     !std::io::stderr().is_terminal() || LocalTerminal::foreground().unwrap_or(true)
+}
+
+fn locale_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        let Ok(name) = std::env::var(key) else {
+            continue;
+        };
+        if valid_locale_name(&name) && !candidates.contains(&name) {
+            candidates.push(name);
+        }
+    }
+    candidates
 }

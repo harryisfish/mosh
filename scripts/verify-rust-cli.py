@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import heapq
 import json
+import locale
 import os
 from pathlib import Path
 import pty
@@ -55,6 +56,14 @@ def exact(data, timeout=5):
 def remote_fixture(mode, state):
     tty.setraw(0)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "locale":
+        locale.setlocale(locale.LC_CTYPE, "")
+        observed = {key: os.environ.get(key) for key in ["LC_ALL", "LC_CTYPE", "LANG"]}
+        observed["codeset"] = locale.nl_langinfo(locale.CODESET)
+        Path(state + ".locale").write_text(json.dumps(observed))
+        os.write(1, "\x1b[2J\x1b[HLOCALE_CLI_READY 中文é".encode())
+        exact(b"finish\r")
+        return 0
     if mode == "startup":
         with Path(state + ".starts").open("a") as marker:
             marker.write(str(os.getpid()) + "\n")
@@ -451,6 +460,8 @@ def verify(bin_dir, network):
     with tempfile.TemporaryDirectory(prefix="mosh-rs-cli-") as temporary:
         verify_delayed_spawn(bin_dir, temporary)
         verify_failed_spawn(bin_dir, temporary)
+        verify_locale(bin_dir, temporary)
+        verify_failed_locale(bin_dir, temporary)
         verify_prediction(bin_dir, temporary)
         state = str(Path(temporary) / "session.json")
         prefix = [client, "--local", "--server", server, "--graphics", "kitty", "--clipboard-read", "--"]
@@ -640,6 +651,134 @@ def verify_failed_spawn(bin_dir, temporary):
     finally:
         process.close()
     print("CLI missing command exits with its startup error and never retries the dead session", flush=True)
+
+
+def verify_locale(bin_dir, temporary):
+    state = str(Path(temporary) / "locale.json")
+    wrapper = Path(temporary) / "locale-server"
+    server = str(bin_dir / "mosh-rs-server")
+    wrapper.write_text(f"""#!{sys.executable}
+import json,os,subprocess,sys
+request = json.loads(sys.stdin.buffer.readline())
+with open({state + '.candidates'!r}, 'w') as output:
+    json.dump(request['locale_candidates'], output)
+env = dict(os.environ, LC_ALL='C', LC_CTYPE='C', LANG='C')
+result = subprocess.run([{server!r}]+sys.argv[1:], input=(json.dumps(request)+'\\n').encode(), env=env)
+sys.exit(result.returncode)
+""")
+    wrapper.chmod(0o700)
+    requested = ["mosh_missing.UTF-8", "C", "en_US.UTF-8"]
+    process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server", str(wrapper),
+                               "--", sys.executable, str(Path(__file__).resolve()),
+                               "--remote", "locale", state],
+                              dict(zip(["LC_ALL", "LC_CTYPE", "LANG"], requested)))
+    try:
+        process.until(b"LOCALE_CLI_READY")
+        assert json.loads(Path(state + ".candidates").read_text()) == requested, "client changed locale candidate order"
+        observed = json.loads(Path(state + ".locale").read_text())
+        assert observed["LC_ALL"] is None, observed
+        assert observed["LC_CTYPE"] == observed["LANG"], observed
+        assert observed["codeset"].lower().replace("-", "") == "utf8", observed
+        process.send(b"finish\r")
+        process.finish(0)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI ordered client locales override a C server environment with a real UTF-8 child locale", flush=True)
+
+
+def verify_failed_locale(bin_dir, temporary):
+    if sys.platform not in ["darwin", "linux"]:
+        return
+    source = Path(temporary) / "no-locale.c"
+    library = Path(temporary) / "no-locale.so"
+    source.write_text("""#define _GNU_SOURCE
+#include <locale.h>
+#include <langinfo.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+static locale_t missing_locale(int mask, const char *name, locale_t base) {
+    (void)mask; (void)base;
+    const char *allowed = getenv("MOSH_RS_TEST_DISCOVERED");
+    if (allowed && strcmp(name, allowed) == 0) return duplocale(LC_GLOBAL_LOCALE);
+    errno = ENOENT;
+    return (locale_t)0;
+}
+static char *fixture_codeset(nl_item item, locale_t locale) {
+    (void)item; (void)locale;
+    return "UTF-8";
+}
+#ifdef __APPLE__
+extern char *nl_langinfo_l(nl_item, locale_t);
+__attribute__((used)) static const struct { const void *replacement; const void *original; }
+interpose[] __attribute__((section("__DATA,__interpose"))) = {
+    { (const void *)missing_locale, (const void *)newlocale },
+    { (const void *)fixture_codeset, (const void *)nl_langinfo_l }
+};
+#else
+locale_t newlocale(int mask, const char *name, locale_t base) {
+    return missing_locale(mask, name, base);
+}
+char *nl_langinfo_l(nl_item item, locale_t locale) {
+    return fixture_codeset(item, locale);
+}
+#endif
+""")
+    compiler_args = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
+    subprocess.run(["cc", *compiler_args, str(source), "-o", str(library)], check=True)
+    wrapper = Path(temporary) / "no-locale-server"
+    server = str(bin_dir / "mosh-rs-server")
+    variable = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+    wrapper.write_text(f"#!{sys.executable}\nimport os,sys\nenv=dict(os.environ)\nenv[{variable!r}]={str(library)!r}\nos.execve({server!r}, [{server!r}]+sys.argv[1:], env)\n")
+    wrapper.chmod(0o700)
+    state = str(Path(temporary) / "failed-locale.json")
+    process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server", str(wrapper),
+                               "--", sys.executable, str(Path(__file__).resolve()),
+                               "--remote", "startup", state])
+    try:
+        process.finish(1)
+        assert b"no usable UTF-8 locale" in process.output, "locale startup failure was not visible"
+        assert b"retrying" not in process.output, "fatal locale failure entered the retry loop"
+        assert not Path(state).exists(), "failed locale selection started the command"
+        assert not Path(state + ".starts").exists(), "failed locale selection created a command marker"
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI injected locale failure exits without a command marker or retry", flush=True)
+
+    discovery = Path(temporary) / "discovery-tools"
+    discovery.mkdir()
+    tool = discovery / "locale"
+    for mode, output, error in [
+        ("missing", None, b"cannot discover server locales"),
+        ("oversized", "sys.stdout.write('x' * (64 * 1024 + 1))", b"locale list exceeds"),
+        ("timeout", "time.sleep(6)", b"locale discovery timed out"),
+        ("discovered", "print('mosh_discovered.UTF-8')", None),
+    ]:
+        if output is not None:
+            tool.write_text(f"#!{sys.executable}\nimport sys,time\n{output}\n")
+            tool.chmod(0o700)
+        state = str(Path(temporary) / f"locale-{mode}.json")
+        environment = {"PATH": str(discovery), "MOSH_RS_TEST_DISCOVERED": "mosh_discovered.UTF-8"}
+        process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server", str(wrapper),
+                                   "--", sys.executable, str(Path(__file__).resolve()),
+                                   "--remote", "startup", state], environment)
+        try:
+            if error is None:
+                process.until(b"STARTUP_READY")
+                process.send(b"finish\r")
+                process.finish(0)
+                assert len(Path(state + ".starts").read_text().splitlines()) == 1
+            else:
+                process.finish(1)
+                assert error in process.output, (mode, bytes(process.output[-4000:]))
+                assert b"retrying" not in process.output
+                assert not Path(state).exists(), "locale discovery failure started a command"
+        finally:
+            process.close()
+            cleanup(state)
+    print("CLI injected locale discovery covers an extra locale, missing utility, bounded output and timeout", flush=True)
 
 
 def verify_prediction(bin_dir, temporary):

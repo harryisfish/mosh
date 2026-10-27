@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -438,6 +439,7 @@ async fn main() -> Result<()> {
     match mode.as_deref() {
         Some("--fixture") => return fixture(),
         Some("--close-fixture") => return close_fixture(),
+        Some("--locale-fixture") => return locale_fixture(),
         _ => (),
     }
     tokio::task::LocalSet::new()
@@ -447,6 +449,8 @@ async fn main() -> Result<()> {
                     verify_close().await
                 } else if mode.as_deref() == Some("--verify-prepared") {
                     verify_prepared().await
+                } else if mode.as_deref() == Some("--verify-locale") {
+                    verify_locale().await
                 } else {
                     verify().await
                 }
@@ -459,6 +463,7 @@ async fn main() -> Result<()> {
 
 async fn verify() -> Result<()> {
     verify_prepared().await?;
+    verify_locale().await?;
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {
         version: PROTOCOL_VERSION,
@@ -472,6 +477,7 @@ async fn verify() -> Result<()> {
         port: None,
         idle_seconds: 60,
         clipboard_read: true,
+        locale_candidates: Vec::new(),
     };
     let (endpoint, grant) = transport::listen(&request)?;
     let actor = SessionActor::new(&request, grant.session.clone())?;
@@ -930,6 +936,7 @@ async fn verify_prepared() -> Result<()> {
         port: None,
         idle_seconds: 60,
         clipboard_read: false,
+        locale_candidates: Vec::new(),
     };
     let (endpoint, grant) = transport::listen(&request)?;
     let actor = SessionActor::new(&request, grant.session.clone())?;
@@ -1078,6 +1085,81 @@ async fn verify_prepared() -> Result<()> {
     Ok(())
 }
 
+async fn verify_locale() -> Result<()> {
+    let original_environment = ["LC_ALL", "LC_CTYPE", "LANG"].map(std::env::var_os);
+    let identity = ClientIdentity::generate()?;
+    let request = BootstrapRequest {
+        version: PROTOCOL_VERSION,
+        client_cert: identity.certificate(),
+        size: size(80, 12),
+        command: vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            "--locale-fixture".into(),
+        ],
+        bind: Some("127.0.0.1".into()),
+        port: None,
+        idle_seconds: 60,
+        clipboard_read: false,
+        locale_candidates: vec!["mosh_missing.UTF-8".into(), "C".into()],
+    };
+    let (endpoint, grant) = transport::listen(&request)?;
+    let actor = SessionActor::new(&request, grant.session.clone())?;
+    let task = tokio::task::spawn_local(actor.run(endpoint.clone()));
+    let client = identity.endpoint(&grant)?;
+    let mut view = View::new();
+    let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 1).await?;
+    view.wait_text(&mut peer, "LOCALE_READY").await?;
+    let text = view.text();
+    ensure!(
+        text.contains("LC_ALL=<unset>"),
+        "child inherited LC_ALL: {text:?}"
+    );
+    ensure!(
+        text.contains("CODESET=UTF-8") || text.contains("CODESET=utf-8"),
+        "child did not use an actual UTF-8 codeset: {text:?}"
+    );
+    ensure!(
+        text.contains("中文é"),
+        "child did not emit UTF-8 fixture text: {text:?}"
+    );
+    let ctype = text
+        .lines()
+        .find_map(|line| line.strip_prefix("LC_CTYPE="))
+        .context("child LC_CTYPE missing")?
+        .trim();
+    let lang = text
+        .lines()
+        .find_map(|line| line.strip_prefix("LANG="))
+        .context("child LANG missing")?
+        .trim();
+    ensure!(
+        valid_locale_name(ctype) && ctype == lang,
+        "child locale variables disagree: {text:?}"
+    );
+    view.input(&mut peer, InputEvent::Paste("中文\u{7f}\n".into()))
+        .await?;
+    view.wait_text(&mut peer, "UTF8_ERASE_OK").await?;
+    peer.send(ClientMessage::Close { epoch: peer.epoch })
+        .await?;
+    while view.exit.is_none() {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    peer.send(ClientMessage::ExitAck { epoch: peer.epoch })
+        .await?;
+    let result = tokio::time::timeout(WAIT, task).await??;
+    ensure!(result.is_ok(), "locale fixture actor failed: {result:?}");
+    endpoint.close(0_u32.into(), b"locale fixture complete");
+    ensure!(
+        original_environment == ["LC_ALL", "LC_CTYPE", "LANG"].map(std::env::var_os),
+        "PTY startup changed parent locale environment"
+    );
+    println!(
+        "verified locale candidate fallback, child UTF-8 codeset, isolated parent environment, IUTF8 and canonical multi-byte erase"
+    );
+    Ok(())
+}
+
 async fn verify_close() -> Result<()> {
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {
@@ -1092,6 +1174,7 @@ async fn verify_close() -> Result<()> {
         port: None,
         idle_seconds: 60,
         clipboard_read: false,
+        locale_candidates: Vec::new(),
     };
     let (endpoint, grant) = transport::listen(&request)?;
     let actor = SessionActor::new(&request, grant.session.clone())?;
@@ -1259,6 +1342,52 @@ fn close_fixture() -> Result<()> {
         "cannot ignore SIGHUP in close fixture"
     );
     emit(format!("\x1b[2J\x1b[HCLOSE_READY pid={}\r\n", std::process::id()).as_bytes())?;
+    loop {
+        std::thread::park();
+    }
+}
+
+fn locale_fixture() -> Result<()> {
+    let empty = CString::new("")?;
+    ensure!(
+        !unsafe { libc::setlocale(libc::LC_CTYPE, empty.as_ptr()) }.is_null(),
+        "cannot initialize child locale"
+    );
+    let codeset = unsafe { libc::nl_langinfo(libc::CODESET) };
+    ensure!(!codeset.is_null(), "child codeset query returned null");
+    let codeset = unsafe { CStr::from_ptr(codeset) }.to_string_lossy();
+    let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
+    ensure!(
+        unsafe { libc::tcgetattr(0, attrs.as_mut_ptr()) } == 0,
+        "cannot read child PTY modes"
+    );
+    let attrs = unsafe { attrs.assume_init() };
+    ensure!(
+        attrs.c_lflag & libc::ICANON != 0,
+        "PTY startup disabled canonical input"
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ensure!(
+        attrs.c_iflag & libc::IUTF8 != 0,
+        "PTY startup did not enable IUTF8"
+    );
+    ensure!(
+        attrs.c_cc[libc::VERASE] == 0x7f,
+        "unexpected default erase byte"
+    );
+    let value = |key: &str| std::env::var(key).unwrap_or_else(|_| "<unset>".into());
+    emit(
+        format!(
+            "\x1b[2J\x1b[HLC_ALL={}\r\nLC_CTYPE={}\r\nLANG={}\r\nCODESET={}\r\n中文é\r\nLOCALE_READY\r\n",
+            value("LC_ALL"),
+            value("LC_CTYPE"),
+            value("LANG"),
+            codeset
+        )
+        .as_bytes(),
+    )?;
+    expect(&mut std::io::stdin().lock(), "中\n".as_bytes())?;
+    emit(b"\r\nUTF8_ERASE_OK\r\n")?;
     loop {
         std::thread::park();
     }

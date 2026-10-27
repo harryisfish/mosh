@@ -19,9 +19,10 @@ use tokio::process::Command;
 use crate::model::{
     BootstrapRequest, Frame, Grant, MAX_CELL_IMAGES, MAX_CONTROL, MAX_FRAME, MAX_IMAGE_TILES,
     MAX_RESOURCE, MAX_RESOURCES, PROTOCOL_VERSION, Resource, ResourceMeta,
+    validate_locale_candidates,
 };
 
-const ALPN: &[u8] = b"mosh-rs/3";
+const ALPN: &[u8] = b"mosh-rs/4";
 const FRAME_STREAM: u8 = 1;
 const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;
@@ -606,6 +607,7 @@ fn validate_request(request: &BootstrapRequest) -> Result<()> {
         "unsupported protocol version"
     );
     request.size.validate()?;
+    validate_locale_candidates(&request.locale_candidates)?;
     ensure!(
         !request.client_cert.is_empty() && request.client_cert.len() <= 16384,
         "invalid client certificate size"

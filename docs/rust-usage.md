@@ -135,6 +135,16 @@ to listen on and advertise; an explicit interface IP takes priority over SSH
 connection metadata and the SSH hostname.
 An SSH jump host alone does not provide a UDP route.
 
+The remote command requires a usable UTF-8 locale on the server. The client
+sends its `LC_ALL`, `LC_CTYPE`, and `LANG` values as candidates. The server checks
+their actual encoding, then tries its own environment and common UTF-8 locales.
+If those fail, it reads the server's installed names with `locale -a` under
+output and runtime limits.
+It removes `LC_ALL` from the command's environment and sets `LC_CTYPE` and `LANG`
+to the selected locale. If startup reports `no usable UTF-8 locale found`,
+use `locale -a` on the server to find an installed UTF-8 locale, or install or
+generate one, then set one of these variables before connecting again.
+
 To run both binaries locally:
 
 ```sh
@@ -223,7 +233,7 @@ and checks the original command survives and queued input is applied once.
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
-Both Rust endpoints must use protocol version 3. Earlier Rust version 1 and 2 workers
+Both Rust endpoints must use protocol version 4. Earlier Rust version 1, 2, and 3 workers
 cannot resume with the new client. No compatibility with the old Mosh wire
 protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client
