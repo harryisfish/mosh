@@ -1279,6 +1279,15 @@ def verify_redraw(bin_dir, temporary, evidence_dir=None):
             assert Path(state + ".received").read_bytes() == b"\x0c", "input crossed blocked UDP relay"
         resize_offset = len(process.output)
         fcntl.ioctl(process.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 64, 640, 240))
+        process.until(b"\x1b[?2026l", start=resize_offset)
+        pump_for(process, 0.1)
+        delta = bytes(process.output[resize_offset:])
+        assert delta.count(b"\x1b[2J") == 1, ("sigwinch", delta)
+        for effect in [b"\x07", b"\x1b]52;", b"\x1b]777;", b"\x1b]133;"]:
+            assert effect not in delta, ("sigwinch repeated effect", effect)
+        inspect(process, run, "sigwinch", True, (64, 12, resize_offset))
+        facts.append({"case": "sigwinch", "offset": resize_offset, "end": len(process.output),
+                      "tty_bytes": len(delta), "full_redraws": 1, "input_hex": "", "effects_replayed": 0})
         local_action(process, run, facts, "resize", b"\x0c", 1, (64, 12, resize_offset))
         expected.extend(b"\x1b[108;5:1u")
         Path(state + ".drop").unlink()
