@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -89,6 +89,28 @@ impl SshDestination {
 pub struct ClientIdentity {
     certificate: Vec<u8>,
     key: Vec<u8>,
+}
+
+pub struct WorkerTempDirGuard {
+    path: Option<PathBuf>,
+}
+
+impl WorkerTempDirGuard {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    pub fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for WorkerTempDirGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -678,20 +700,44 @@ pub fn write_grant<W: Write>(mut writer: W, grant: &Grant) -> Result<()> {
     Ok(())
 }
 
+fn worker_log_diagnostics(log: &mut std::fs::File) -> String {
+    const LIMIT: usize = 8 * 1024;
+    let mut bytes = Vec::new();
+    if std::io::Read::take(log, (LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return "unavailable".into();
+    }
+    let clipped = String::from_utf8_lossy(&bytes[..bytes.len().min(LIMIT)]);
+    let diagnostics = clipped.trim_end();
+    if diagnostics.is_empty() {
+        "empty".into()
+    } else if bytes.len() > LIMIT {
+        format!("{diagnostics}\n[truncated]")
+    } else {
+        diagnostics.into()
+    }
+}
+
 pub async fn spawn_worker() -> Result<()> {
     let request = read_request(std::io::stdin().lock())?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let directory = std::env::temp_dir().join(format!("mosh-rs-{}-{stamp}", std::process::id()));
     std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    let mut cleanup = WorkerTempDirGuard::new(directory.clone());
     let log_path = directory.join("server.log");
     let log = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&log_path)?;
+    let mut log_reader = std::fs::File::open(&log_path)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("worker")
+        .arg("--cleanup-dir")
+        .arg(&directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(log);
@@ -728,17 +774,21 @@ pub async fn spawn_worker() -> Result<()> {
             if delivered.is_err() {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+            } else {
+                cleanup.disarm();
             }
             delivered
         }
         result => {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            let diagnostics = worker_log_diagnostics(&mut log_reader);
             match result {
-                Ok(Err(error)) => Err(error)
-                    .with_context(|| format!("worker startup failed; log: {}", log_path.display())),
+                Ok(Err(error)) => Err(error).with_context(|| {
+                    format!("worker startup failed; log (captured): {diagnostics}")
+                }),
                 Err(error) => Err(error).with_context(|| {
-                    format!("worker startup timed out; log: {}", log_path.display())
+                    format!("worker startup timed out; log (captured): {diagnostics}")
                 }),
                 Ok(Ok(_)) => unreachable!(),
             }
