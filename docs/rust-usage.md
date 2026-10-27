@@ -132,7 +132,12 @@ the client. `--port` selects a fixed server port for firewall rules. Without it,
 the operating system selects a port, which the client prints before entering
 the terminal. `--ssh-port` changes the SSH port. `--bind` selects a server IP
 to listen on and advertise; an explicit interface IP takes priority over SSH
-connection metadata and the SSH hostname.
+connection metadata and the SSH hostname. The worker's returned IP must match
+that explicit bind, including equivalent IPv4-mapped addresses. Without a
+concrete bind, the client uses the effective hostname from local `ssh -G` for
+UDP and requires that query to succeed before starting the remote worker.
+It does not fall back to an address chosen by the worker. Reconnection resolves
+the same hostname again.
 An SSH jump host alone does not provide a UDP route.
 
 The remote command requires a usable UTF-8 locale on the server. The client

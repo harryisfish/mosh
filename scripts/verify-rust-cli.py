@@ -460,6 +460,7 @@ def verify(bin_dir, network):
     with tempfile.TemporaryDirectory(prefix="mosh-rs-cli-") as temporary:
         verify_delayed_spawn(bin_dir, temporary)
         verify_failed_spawn(bin_dir, temporary)
+        verify_ssh_destination(bin_dir, temporary)
         verify_locale(bin_dir, temporary)
         verify_failed_locale(bin_dir, temporary)
         verify_prediction(bin_dir, temporary)
@@ -651,6 +652,155 @@ def verify_failed_spawn(bin_dir, temporary):
     finally:
         process.close()
     print("CLI missing command exits with its startup error and never retries the dead session", flush=True)
+
+
+def verify_ssh_destination(bin_dir, temporary):
+    script = str(Path(__file__).resolve())
+    folder = Path(temporary) / "ssh-destination"
+    folder.mkdir()
+    shim = folder / "ssh"
+    shim.write_text(f"""#!{sys.executable}
+import json,os,runpy,subprocess,sys,time
+from pathlib import Path
+state = os.environ['MOSH_DESTINATION_STATE']
+assert sys.argv[sys.argv.index('-p') + 1] == '2222'
+assert sys.argv[sys.argv.index('--') + 1] == 'fixture-alias'
+with open(state + '.events', 'a') as events:
+    events.write('query\\n' if '-G' in sys.argv else 'bootstrap\\n')
+if '-G' in sys.argv:
+    Path(state + '.query').write_text(str(os.getpid()))
+    assert sys.stdin.buffer.read(1) == b''
+    mode = os.environ.get('MOSH_DESTINATION_QUERY', 'normal')
+    hostname = os.environ.get('MOSH_DESTINATION_HOSTNAME', '127.0.0.1')
+    if mode == 'failure': sys.exit(42)
+    if mode == 'missing':
+        print('user fixture')
+        sys.exit(0)
+    if mode == 'timeout': time.sleep(30)
+    if mode == 'invalid-utf8':
+        sys.stdout.buffer.write(b'\\xff')
+        sys.exit(0)
+    if mode == 'duplicate':
+        print('hostname ' + hostname)
+    if mode in ['limit', 'oversize']:
+        body = ('hostname ' + hostname + '\\n').encode()
+        sys.stdout.buffer.write(body + b'x' * (512 * 1024 - len(body) + (mode == 'oversize')))
+        sys.stdout.buffer.flush()
+        if mode == 'oversize': time.sleep(30)
+        sys.exit(0)
+    print('hostname ' + hostname)
+    print('hostname stderr-only.invalid', file=sys.stderr)
+    sys.exit(0)
+driver = runpy.run_path({script!r})
+request = json.loads(sys.stdin.buffer.readline())
+request['bind'] = os.environ.get('MOSH_DESTINATION_WORKER_BIND', '127.0.0.1')
+worker = subprocess.Popen([{str(bin_dir / 'mosh-rs-server')!r}, 'worker'],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          start_new_session=True)
+Path(state + '.worker').write_text(str(worker.pid))
+worker.stdin.write((json.dumps(request) + '\\n').encode())
+worker.stdin.close()
+framed = b''.join(worker.stdout.readline() for _ in range(3))
+worker.stdout.close()
+grant = driver['decode_grant'](framed)
+assert grant['server_cert'], 'fixture must use the real worker certificate'
+grant['address'] = os.environ.get('MOSH_DESTINATION_GRANT_ADDRESS', grant['address'])
+Path(state + '.grant').write_text(json.dumps({{'address': grant['address'], 'certificate_bytes': len(grant['server_cert'])}}))
+sys.stdout.buffer.write(driver['encode_grant'](grant))
+sys.stdout.buffer.flush()
+""")
+    shim.chmod(0o700)
+    cases = [
+        {"name": "alias", "hostname": "localhost", "grant_address": "192.0.2.20"},
+        {"name": "bracket", "hostname": "[::1]", "worker_bind": "::1"},
+        {"name": "bind", "bind": "127.0.0.1", "query": "failure", "expect_query": False},
+        {"name": "mapped-bind", "bind": "::ffff:127.0.0.1", "query": "failure", "expect_query": False},
+        {"name": "mapped-grant", "bind": "127.0.0.1", "grant_address": "::ffff:127.0.0.1", "expect_query": False},
+        {"name": "mapped-wildcard", "bind": "::ffff:0.0.0.0", "hostname": "localhost"},
+        {"name": "limit", "query": "limit"},
+        {"name": "bind-rewrite", "bind": "127.0.0.1", "worker_bind": "::1", "expect_query": False,
+         "error": b"server UDP address does not match --bind"},
+        {"name": "hostname-rewrite", "hostname": "127.0.0.1", "worker_bind": "::1", "blocked": True},
+    ]
+    for mode, error in [
+        ("failure", b"SSH configuration query exited with"),
+        ("missing", b"SSH configuration is missing hostname"),
+        ("timeout", b"SSH configuration query timed out"),
+        ("oversize", b"SSH configuration output exceeds limit"),
+        ("invalid-utf8", b"SSH configuration is not UTF-8"),
+        ("duplicate", b"SSH configuration contains duplicate hostname"),
+    ]:
+        cases.append({"name": mode, "query": mode, "error": error})
+    for name, hostname in [("empty", ""), ("whitespace", "127.0.0.1 extra"),
+                           ("control", "127.0.0.1\x01"), ("long", "x" * 1025),
+                           ("double-bracket", "[[::1]]"), ("unpaired-bracket", "[::1")]:
+        cases.append({"name": name, "hostname": hostname, "error": b"invalid SSH hostname"})
+    for case in cases:
+        state = str(folder / (case["name"] + ".json"))
+        environment = {"PATH": str(folder) + os.pathsep + os.environ["PATH"],
+                       "MOSH_DESTINATION_STATE": state}
+        for key in ["query", "hostname", "worker_bind", "grant_address"]:
+            if key in case:
+                environment["MOSH_DESTINATION_" + key.upper()] = case[key]
+        command = [str(bin_dir / "mosh-rs"), "--server", str(bin_dir / "mosh-rs-server"), "--ssh-port", "2222"]
+        if "bind" in case:
+            command += ["--bind", case["bind"]]
+        process = TerminalProcess(command + ["fixture-alias", "--", sys.executable, script,
+                                              "--remote", "startup", state], environment)
+        try:
+            if "error" in case:
+                process.send(b"finish\r")
+                deadline = time.monotonic() + 15
+                while process.process.poll() is None:
+                    process.pump()
+                    assert time.monotonic() < deadline, bytes(process.output[-4000:])
+                process.pump(0)
+                assert process.process.returncode == 1, bytes(process.output[-4000:])
+                assert case["error"] in process.output, bytes(process.output[-4000:])
+                assert termios.tcgetattr(process.master) == process.saved
+                assert not Path(state).exists(), "rejected destination started the command"
+                assert not Path(state + ".starts").exists(), "untrusted worker received application input"
+            elif case.get("blocked"):
+                process.until(b"mosh-rs: UDP 127.0.0.1:")
+                process.send(b"finish\r")
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    process.pump()
+                    assert process.process.poll() is None
+                assert not Path(state).exists(), "client attached to the worker-selected host"
+                assert not Path(state + ".starts").exists(), "untrusted worker received application input"
+                process.send(b"\x1e.")
+                process.finish(0)
+            else:
+                process.until(b"STARTUP_READY")
+                process.send(b"finish\r")
+                process.until(b"STARTUP_DONE")
+                process.finish(0)
+                assert Path(state + ".starts").read_text().count("\n") == 1
+            expected_events = ["query"] if case.get("expect_query", True) else []
+            if "error" not in case or not case.get("expect_query", True):
+                expected_events.append("bootstrap")
+                assert json.loads(Path(state + ".grant").read_text())["certificate_bytes"] > 0
+            assert Path(state + ".events").read_text().splitlines() == expected_events
+            query = Path(state + ".query")
+            if query.exists():
+                try:
+                    os.kill(int(query.read_text()), 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise AssertionError("SSH configuration query was not reaped")
+            print(f"CLI SSH destination {case['name']} passed; unauthorized application input=0", flush=True)
+        finally:
+            process.close()
+            cleanup(state)
+            for suffix in [".worker", ".query"]:
+                pid_file = Path(state + suffix)
+                if pid_file.exists():
+                    try:
+                        os.kill(int(pid_file.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
 
 
 def verify_locale(bin_dir, temporary):

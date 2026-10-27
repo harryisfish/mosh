@@ -20,6 +20,19 @@ certificate. The server trusts only that certificate. The client trusts only
 the server certificate returned over SSH. Both use normal rustls certificate
 validation, the `mosh.local` server name, and QUIC without early application data.
 
+For SSH sessions, only the client's explicit non-wildcard `--bind` IP or the
+effective hostname from local `ssh -G` authorizes the UDP destination. The client
+normalizes IPv4-mapped addresses before deciding whether a bind is a wildcard
+and comparing it with the worker's grant. A concrete bind must match the grant's
+exact IP. Without a concrete bind, the client requires a successful, bounded
+SSH configuration query with one valid hostname before starting the worker,
+then replaces the grant's address with that hostname. Query failure, timeout,
+or a missing hostname ends bootstrap; neither the grant address nor the original
+SSH target supplies a fallback. Reconnection resolves the same authorized
+hostname again. Certificate validation remains required at that destination.
+Local bootstrap trusts the executable explicitly selected by the caller,
+including controlled local relays. The wire format remains version 4.
+
 ## UTF-8 locale and PTY startup
 
 Version 4 appends the required `locale_candidates` field to `BootstrapRequest`.
