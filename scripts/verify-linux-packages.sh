@@ -29,7 +29,7 @@ for image in debian:bookworm-slim ubuntu:22.04; do
     test "$(mosh-rs --version)" = "$EXPECTED_VERSION"
     test "$(mosh-rs-server --version)" = "$EXPECTED_VERSION"
     test -f /usr/share/doc/mosh-rs/copyright
-    test -f /usr/share/doc/mosh-rs/wezterm-copyright
+    test -f /usr/share/doc/mosh-rs/wezterm/copyright
     test -x /usr/bin/ssh
   '
 done
@@ -38,7 +38,7 @@ docker run "${docker_args[@]}" fedora:44 sh -euxc '
   test "$(mosh-rs --version)" = "$EXPECTED_VERSION"
   test "$(mosh-rs-server --version)" = "$EXPECTED_VERSION"
   test -f /usr/share/doc/mosh-rs/copyright
-  test -f /usr/share/doc/mosh-rs/wezterm-copyright
+  test -f /usr/share/doc/mosh-rs/wezterm/copyright
   test -x /usr/bin/ssh
 '
 docker run "${docker_args[@]}" opensuse/leap:16.0 sh -euxc '
@@ -46,6 +46,6 @@ docker run "${docker_args[@]}" opensuse/leap:16.0 sh -euxc '
   test "$(mosh-rs --version)" = "$EXPECTED_VERSION"
   test "$(mosh-rs-server --version)" = "$EXPECTED_VERSION"
   test -f /usr/share/doc/mosh-rs/copyright
-  test -f /usr/share/doc/mosh-rs/wezterm-copyright
+  test -f /usr/share/doc/mosh-rs/wezterm/copyright
   test -x /usr/bin/ssh
 '
