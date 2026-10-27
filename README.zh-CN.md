@@ -25,6 +25,30 @@ Rust 版使用协议 v2，与原版 Mosh 协议和 Rust 协议 v1 均不兼容�
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | macOS Intel | `x86_64-apple-darwin` |
 
+安装最新版本到 `~/.local/bin`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | bash
+```
+
+安装指定版本：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | \
+	bash -s -- --version 0.1.1
+```
+
+脚本会先校验 release 的 checksum，再安装两个二进制文件。需要先审阅脚本时，
+先下载并查看它，再运行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
+cat install.sh
+bash install.sh
+```
+
+使用 `--install-dir DIRECTORY` 可以指定其他安装目录。
+
 将 `SHA256SUMS` 下载到压缩包所在目录，解压前执行校验：
 
 - macOS：`shasum -a 256 --ignore-missing -c SHA256SUMS`
@@ -43,8 +67,11 @@ export PATH="$HOME/.local/bin:$PATH"
 在本机安装 `mosh-rs`，在远程主机安装 `mosh-rs-server`，分别使用对应平台的压缩包。
 将服务端放入远程 SSH 环境的 `PATH`，或用 `--server` 指定它的绝对路径。
 
-Linux x86_64 包在 Ubuntu 22.04 上构建，arm64 包在 Ubuntu 24.04 上构建。
-更旧的系统请从源码构建。macOS 二进制文件未签名。
+请在客户端和远端主机分别运行安装脚本。每台主机会选择自己的目标平台。
+两端必须使用同一版本。Rust 版不兼容原版 Mosh 协议。
+
+Linux x86_64 包在 Ubuntu 22.04 上构建，arm64 包在 Ubuntu 24.04 上构建，
+并需要 glibc。musl 系统或更旧的系统请从源码构建。macOS 二进制文件未签名。
 
 ## 连接
 

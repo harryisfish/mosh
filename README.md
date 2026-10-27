@@ -28,6 +28,30 @@ contains `bin/mosh-rs` and `bin/mosh-rs-server`.
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | macOS Intel | `x86_64-apple-darwin` |
 
+To install the latest release into `~/.local/bin`, run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | bash
+```
+
+To install a specific release, pass its version to the script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh | \
+	bash -s -- --version 0.1.1
+```
+
+The script checks the release checksum before it installs either binary. To
+review the script first, download it and run `bash install.sh`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh -o install.sh
+cat install.sh
+bash install.sh
+```
+
+Use `--install-dir DIRECTORY` to choose another directory.
+
 Download `SHA256SUMS` beside the archive. Verify it before extracting:
 
 - macOS: `shasum -a 256 --ignore-missing -c SHA256SUMS`
@@ -47,8 +71,13 @@ Install `mosh-rs` on your machine and `mosh-rs-server` on the remote host, using
 each host's archive. Put the server in the remote SSH environment's `PATH`, or
 pass its absolute path with `--server`.
 
-Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64.
-Build from source for older systems. The macOS binaries are unsigned.
+Run the installer on the client and the remote host. Each host selects its own
+target. Both endpoints must use the same release. This Rust version does not
+speak the original Mosh wire protocol.
+
+Linux packages are built on Ubuntu 22.04 for x86_64 and Ubuntu 24.04 for arm64,
+and require glibc. Build from source on musl systems or older systems. The macOS
+binaries are unsigned.
 
 ## Connect
 
