@@ -24,6 +24,7 @@ import tty
 
 
 RAW_NETWORK_INPUT = b"impaired-" + b"x" * 8192 + b"\r"
+ATOMIC_SECOND_PASTE_BYTES = 128 * 1024 - 24 - 98
 GRANT_BEGIN = b"\x1eMOSH-RS-GRANT\n"
 GRANT_END = b"\x1eMOSH-RS-GRANT-END\n"
 SSH_LITERAL_ARG = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line"
@@ -104,11 +105,46 @@ def remote_fixture(mode, state):
         os.write(1, b"\x1b[2J\x1b[HNETWORK_READY\r\n")
         exact(b"baseline\r")
         os.write(1, b"NETWORK_BASELINE_OK\r\n")
-        exact(RAW_NETWORK_INPUT, timeout=60)
+        for index, offset in enumerate(range(0, len(RAW_NETWORK_INPUT), 256)):
+            exact(RAW_NETWORK_INPUT[offset:offset + 256], timeout=60)
+            os.write(1, f"NETWORK_CHUNK_{index}_OK\r\n".encode())
         os.write(1, b"NETWORK_BURST_OK\r\n")
         exact(b"resume-once\r", timeout=60)
         os.write(1, b"\r\nNETWORK_ONCE_OK\r\n")
         return 9
+    if mode in ["saturation", "atomic-admission", "paste-refusal"]:
+        os.write(1, b"\x1b[2J\x1b[HSATURATION_READY\r\n")
+        if mode in ["saturation", "atomic-admission"]:
+            exact(b"A" * (128 * 1024), timeout=60)
+            if mode == "atomic-admission":
+                exact(b"D" * ATOMIC_SECOND_PASTE_BYTES, timeout=60)
+            Path(state + ".accepted").write_text(str(128 * 1024))
+            os.write(1, b"\r\nSATURATION_ACCEPTED_ONCE\r\n")
+        else:
+            exact(b"v", timeout=60)
+            Path(state + ".tail").write_text("v")
+            os.write(1, b"\r\nPASTE_TAIL_OK\r\n")
+        exact(b"finish\r", timeout=60)
+        assert not select.select([0], [], [], 0.2)[0], "refused input was sent later"
+        os.write(1, b"\r\nSATURATION_DONE\r\n")
+        return 9
+    if mode == "close-after-input":
+        os.write(1, b"\x1b[2J\x1b[HCLOSE_INPUT_READY\r\n")
+        deadline = time.monotonic() + 30
+        while not Path(state + ".read").exists():
+            assert time.monotonic() < deadline, "close fixture was not released"
+            time.sleep(0.01)
+        count = 0
+        while count < 128 * 1024:
+            chunk = os.read(0, min(4096, 128 * 1024 - count))
+            assert chunk and chunk == b"A" * len(chunk), "accepted close input was changed"
+            count += len(chunk)
+            progress = Path(state + ".progress.new")
+            progress.write_text(str(count))
+            progress.replace(state + ".progress")
+            time.sleep(0.005)
+        while True:
+            time.sleep(0.01)
     assert sys.argv[4] == "literal ' quotes $HOME $(printf unsafe) ; &"
     os.write(1, b"\x1b[2J\x1b[HDEFAULT_COLOR_CLI\x1b[40mBLACK_COLOR_CLI\x1b[49mRESTORED_COLOR_CLI\r\n"
                 b"\x1b[?1h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[>31u\x1b[38;2;12;34;56mREADY_CLI\x1b[0m " + "e\u0301中文".encode())
@@ -318,6 +354,200 @@ def cleanup(state):
             os.kill(int(Path(state + ".proxy").read_text()), signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+
+def verify_saturated_input(bin_dir, temporary):
+    script = str(Path(__file__).resolve())
+    client = str(bin_dir / "mosh-rs")
+    server = str(bin_dir / "mosh-rs-server")
+
+    def session(name, mode="wait", proxy=True):
+        state = str(Path(temporary) / (name + ".json"))
+        target = server
+        if proxy:
+            wrapper = Path(temporary) / ("proxy-" + name)
+            wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+            wrapper.chmod(0o700)
+            target = str(wrapper)
+        process = TerminalProcess([client, "--local", "--server", target, "--predict", "never", "--",
+                                   sys.executable, script, "--remote", mode, state])
+        return process, state
+
+    def saturate(process, state):
+        Path(state + ".drop").touch()
+        for glyph in [b"A", b"B"]:
+            process.send(b"\x1b[200~" + glyph * (128 * 1024) + b"\x1b[201~")
+        process.until(b"Input not accepted")
+
+    def reclaimed(process, remote):
+        deadline = time.monotonic() + 5
+        while True:
+            living = []
+            for pid in remote.values():
+                try:
+                    os.kill(pid, 0)
+                    living.append(pid)
+                except ProcessLookupError:
+                    pass
+            if not living:
+                return
+            process.pump(0.02)
+            assert time.monotonic() < deadline, ("healthy q left a remote process", living)
+
+    for action in ["help", "detach", "suspend", "close", "signal"]:
+        process, state = session(action)
+        try:
+            process.until(b"WAIT_READY")
+            saturate(process, state)
+            start = len(process.output)
+            if action == "help":
+                process.send(b"\x1e?")
+                process.until(b"q close", start=start)
+                assert b"Input not accepted" in process.output[start:], "help hid the refusal"
+            elif action == "suspend":
+                process.send(b"\x1e\x1a")
+                deadline = time.monotonic() + 5
+                while True:
+                    status = subprocess.run(["ps", "-o", "stat=", "-p", str(process.process.pid)],
+                                            text=True, capture_output=True).stdout
+                    if "T" in status:
+                        break
+                    process.pump(0.01)
+                    assert time.monotonic() < deadline, "saturated client did not suspend"
+                modes = termios.tcgetattr(process.master)
+                saved = process.saved.copy()
+                modes[3] &= ~getattr(termios, "PENDIN", 0)
+                saved[3] &= ~getattr(termios, "PENDIN", 0)
+                assert modes == saved, (modes, saved)
+                os.kill(process.process.pid, signal.SIGCONT)
+            elif action in ["close", "signal"]:
+                process.send(b"\x1eq")
+                process.until(b"Close unconfirmed", start=start)
+                assert process.process.poll() is None, "q must preserve the writer until remote confirmation"
+            if action == "signal":
+                os.kill(process.process.pid, signal.SIGTERM)
+            else:
+                process.send(b"\x1e.")
+            process.finish(0)
+            os.kill(json.loads(Path(state).read_text())["command"], 0)
+            if action in ["close", "signal"]:
+                restored = process.output.rfind(b"\x1b[?1049l")
+                assert b"remote close is unconfirmed" in process.output[restored:], "missing main-screen close warning"
+        finally:
+            try:
+                os.kill(process.process.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            process.close()
+            cleanup(state)
+        print(f"CLI saturated input: {action} preserved local control", flush=True)
+
+    process, state = session("admission", "saturation")
+    try:
+        process.until(b"SATURATION_READY")
+        original = json.loads(Path(state).read_text())
+        saturate(process, state)
+        process.send(b"REJECTED_CANARY\r\x1e?")
+        process.until(b"q close")
+        Path(state + ".drop").unlink()
+        process.until(b"Input ready", timeout=30)
+        process.until(b"SATURATION_ACCEPTED_ONCE", timeout=30)
+        assert Path(state + ".accepted").read_text() == str(128 * 1024)
+        process.send(b"finish\r")
+        process.until(b"SATURATION_DONE")
+        process.finish(9)
+        assert json.loads(Path(state).read_text()) == original, "recovery replaced the remote process"
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI admission: accepted A arrived exactly once; B/canary were refused and never replayed; low-water resume required fresh finish input", flush=True)
+
+    process, state = session("atomic", "atomic-admission")
+    try:
+        process.until(b"SATURATION_READY")
+        Path(state + ".drop").touch()
+        process.send(b"\x1b[200~" + b"A" * (128 * 1024) + b"\x1b[201~")
+        process.send(b"\x1b[200~" + b"D" * ATOMIC_SECOND_PASTE_BYTES + b"\x1b[201~")
+        process.send(b"\x1ez")
+        process.until(b"Input not accepted")
+        Path(state + ".drop").unlink()
+        process.until(b"Input ready", timeout=30)
+        process.until(b"SATURATION_ACCEPTED_ONCE", timeout=30)
+        process.send(b"finish\r")
+        process.until(b"SATURATION_DONE")
+        process.finish(9)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI atomic escape admission: neither prefix nor unknown suffix reached the remote at a one-key budget boundary", flush=True)
+
+    process, state = session("paste", "paste-refusal", proxy=False)
+    try:
+        process.until(b"SATURATION_READY")
+        process.send(b"\x1b[200~" + b"a" * (128 * 1024) + b"\x1e.\x1eq\x1e\x1a\x1b[201~")
+        process.until(b"Input not accepted: too large")
+        process.send(b"\x1b[200~\xff\x1b[201~v")
+        process.until(b"Paste not accepted: invalid UTF-8")
+        process.until(b"PASTE_TAIL_OK")
+        assert Path(state + ".tail").read_text() == "v"
+        start = len(process.output)
+        process.send(b"\x1b[200~" + b"\x00" * (128 * 1024) + b"\x1b[201~")
+        process.until(b"Input not accepted: too large", start=start)
+        process.send(b"finish\r")
+        process.until(b"SATURATION_DONE")
+        process.finish(9)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI paste: oversized, invalid UTF-8 and JSON-expanded paste refused without body controls; same-send valid tail arrived and rejection remained visible", flush=True)
+
+    process, state = session("unfinished-paste", proxy=False)
+    try:
+        process.until(b"WAIT_READY")
+        process.send(b"\x1b[200~" + b"a" * (128 * 1024 + 1) + b"\x1e.\x1eq")
+        process.until(b"Input not accepted: too large")
+        assert process.process.poll() is None
+        os.kill(process.process.pid, signal.SIGTERM)
+        process.finish(0)
+        os.kill(json.loads(Path(state).read_text())["command"], 0)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI unfinished oversized paste ignored body escapes and remained locally interruptible by TERM", flush=True)
+
+    process, state = session("healthy-close", proxy=False)
+    try:
+        process.until(b"WAIT_READY")
+        remote = json.loads(Path(state).read_text())
+        process.send(b"\x1eq")
+        process.finish(129)
+        assert b"remote close is unconfirmed" not in process.output
+        reclaimed(process, remote)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI healthy q confirmed Exit, restored the terminal, and reclaimed worker/command", flush=True)
+
+    process, state = session("close-after-input", "close-after-input", proxy=False)
+    try:
+        process.until(b"CLOSE_INPUT_READY")
+        remote = json.loads(Path(state).read_text())
+        process.send(b"\x1b[200~" + b"A" * (128 * 1024) + b"\x1b[201~\x1eq")
+        process.until(b"Close unconfirmed")
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            process.pump(0.02)
+            assert process.process.poll() is None, "q closed before accepted PTY writes could commit"
+            os.kill(remote["command"], 0)
+        assert not Path(state + ".progress").exists()
+        Path(state + ".read").touch()
+        process.finish(129)
+        assert int(Path(state + ".progress").read_text()) >= 64 * 1024
+        reclaimed(process, remote)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI q waited for accepted input's PTY commit before confirming Exit and reclaiming worker/command", flush=True)
 
 
 def verify_job_control(command, state, inspect_session=None, cleanup_session=cleanup):
@@ -579,12 +809,14 @@ else:
                 process.send(b"baseline\r")
                 process.until(b"NETWORK_BASELINE_OK")
                 set_profile({"delay_ms": 65, "jitter_ms": 55, "loss": 0.12, "duplicate": 0.10})
-                process.send(RAW_NETWORK_INPUT)
+                for index, offset in enumerate(range(0, len(RAW_NETWORK_INPUT), 256)):
+                    process.send(RAW_NETWORK_INPUT[offset:offset + 256])
+                    process.until(f"NETWORK_CHUNK_{index}_OK".encode(), timeout=30)
                 process.until(b"NETWORK_BURST_OK", timeout=45)
                 stats = set_profile({})
                 assert stats["dropped"] > 0 and stats["duplicated"] > 0 and stats["reordered"] > 0, stats
                 assert stats["overflow"] == 0, stats
-                print("CLI raw 8192-key input arrived byte-for-byte through UDP delay, jitter, loss, duplication, and reordering", flush=True)
+                print("CLI paced raw 8192-key input arrived byte-for-byte through UDP delay, jitter, loss, duplication, and reordering", flush=True)
                 Path(state + ".drop").touch()
                 process.send(b"resume-once\r")
                 deadline = time.monotonic() + 22
@@ -599,6 +831,7 @@ else:
                 process.close()
                 cleanup(state)
             print("CLI recovered through a UDP outage with queued input applied once and the original command still running", flush=True)
+            verify_saturated_input(bin_dir, temporary)
 
 
 def verify_delayed_spawn(bin_dir, temporary):
@@ -977,5 +1210,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
+    parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     arguments = parser.parse_args()
-    verify(arguments.bin_dir.resolve(), arguments.network)
+    if arguments.saturated_input:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-saturated-") as temporary:
+            verify_saturated_input(arguments.bin_dir.resolve(), temporary)
+    else:
+        verify(arguments.bin_dir.resolve(), arguments.network)

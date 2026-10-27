@@ -16,8 +16,8 @@ use tokio::task::JoinHandle;
 
 use crate::display::{Display, Graphics, PredictionPolicy};
 use crate::input::{
-    EscapeAction, EscapeSequence, InputDecoder, LocalEvent, LocalTerminal, TtyOutput,
-    foreground_lost,
+    EscapeAction, EscapeSequence, InputDecoder, InputRejection, LocalEvent, LocalTerminal,
+    MAX_INPUT_CHUNK, PasteAdmission, TtyOutput, foreground_lost,
 };
 use crate::model::*;
 use crate::transport::{self, ClientEndpoints, Incoming};
@@ -262,6 +262,32 @@ enum LocalUi {
 }
 
 impl LocalUi {
+    fn finish(self, notice: Option<&str>) -> Result<()> {
+        let result = match self {
+            Self::Foreground {
+                mut display,
+                input,
+                terminal,
+            } => {
+                let flushed = display.flush();
+                let (_, writer) = display.into_cached();
+                drop(writer);
+                drop(input);
+                let restored = terminal.finish(notice);
+                restored.and(flushed)
+            }
+            Self::Parked {
+                interrupted: Some(terminal),
+                ..
+            } => terminal.finish(notice),
+            Self::Parked { .. } => Ok(()),
+        };
+        match result {
+            Err(error) if foreground_lost(&error) => Ok(()),
+            result => result,
+        }
+    }
+
     fn park(self) -> Self {
         match self {
             Self::Foreground {
@@ -281,79 +307,104 @@ impl LocalUi {
         }
     }
 
-    fn try_foreground(self) -> Result<Self> {
-        if !LocalTerminal::foreground()? {
-            return Ok(self.park());
+    fn try_foreground(self) -> (Self, Result<()>) {
+        let foreground = match LocalTerminal::foreground() {
+            Ok(foreground) => foreground,
+            Err(error) => return (self, Err(error.into())),
+        };
+        if !foreground {
+            return (self.park(), Ok(()));
         }
         let Self::Parked {
             display,
             mut interrupted,
         } = self
         else {
-            return Ok(self);
+            return (self, Ok(()));
         };
-        let result = match interrupted.as_mut() {
-            Some(terminal) => terminal.reassert_owned_modes(),
-            None => LocalTerminal::enter().map(|terminal| interrupted = Some(terminal)),
-        };
-        if let Err(error) = result {
-            if foreground_lost(&error) {
-                return Ok(Self::Parked {
+        let result = (|| {
+            match interrupted.as_mut() {
+                Some(terminal) => terminal.reassert_owned_modes()?,
+                None => interrupted = Some(LocalTerminal::enter()?),
+            }
+            Ok((TtyOutput::new()?, input_terminal()?))
+        })();
+        match result {
+            Ok((writer, input)) => (
+                Self::Foreground {
+                    display: display.bind(writer),
+                    input,
+                    terminal: interrupted.expect("foreground terminal"),
+                },
+                Ok(()),
+            ),
+            Err(error) => (
+                Self::Parked {
                     display,
                     interrupted,
-                });
-            }
-            return Err(error);
+                },
+                if foreground_lost(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                },
+            ),
         }
-        Ok(Self::Foreground {
-            display: display.bind(TtyOutput::new()?),
-            input: input_terminal()?,
-            terminal: interrupted.expect("foreground terminal"),
-        })
     }
 
-    fn suspend(self) -> Result<Self> {
+    fn suspend(self) -> (Self, Result<()>) {
         let Self::Foreground {
             mut display,
             input,
             mut terminal,
         } = self
         else {
-            return Ok(self);
+            return (self, Ok(()));
         };
         if let Err(error) = display.flush() {
-            if foreground_lost(&error) {
-                return Ok(Self::Foreground {
-                    display,
-                    input,
-                    terminal,
-                }
-                .park());
-            }
-            return Err(error);
+            let ui = Self::Foreground {
+                display,
+                input,
+                terminal,
+            };
+            return if foreground_lost(&error) {
+                (ui.park(), Ok(()))
+            } else {
+                (ui, Err(error))
+            };
         }
         let (display, writer) = display.into_cached();
         drop(writer);
         drop(input);
         if let Err(error) = terminal.release() {
-            if foreground_lost(&error) {
-                return Ok(Self::Parked {
+            return (
+                Self::Parked {
                     display,
                     interrupted: Some(terminal),
-                });
-            }
-            return Err(error);
+                },
+                if foreground_lost(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                },
+            );
         }
-        let parked = Self::Parked {
-            display,
-            interrupted: None,
-        };
-        ensure!(
-            unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } == 0,
-            "suspend local client: {}",
-            io::Error::last_os_error()
-        );
-        Ok(parked)
+        if unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } != 0 {
+            return (
+                Self::Parked {
+                    display,
+                    interrupted: Some(terminal),
+                },
+                Err(io::Error::last_os_error()).context("suspend local client"),
+            );
+        }
+        (
+            Self::Parked {
+                display,
+                interrupted: None,
+            },
+            Ok(()),
+        )
     }
 }
 
@@ -362,6 +413,178 @@ enum SessionAction {
     Suspend,
     Detach,
     Exit(i32),
+}
+
+const CLOSE_NOTICE: &str =
+    "mosh-rs: remote close is unconfirmed; the remote command may still be running.\n";
+
+#[derive(Default)]
+enum CloseState {
+    #[default]
+    Open,
+    Requested {
+        after_sequence: u64,
+        queued_epoch: Option<u64>,
+    },
+}
+
+enum InputNotice {
+    Full,
+    TooLarge,
+    InvalidPaste,
+    Ready,
+}
+
+#[derive(Default)]
+struct PendingInput {
+    sequence: u64,
+    records: BTreeMap<u64, (InputRecord, usize)>,
+    bytes: usize,
+    paused: bool,
+    notice: Option<InputNotice>,
+    notice_presented: bool,
+    clipboard_not_sent: bool,
+    close: CloseState,
+}
+
+impl PendingInput {
+    fn is_closing(&self) -> bool {
+        matches!(self.close, CloseState::Requested { .. })
+    }
+
+    fn paste_admission(&self) -> PasteAdmission {
+        if self.paused || self.is_closing() {
+            PasteAdmission::Discard
+        } else {
+            PasteAdmission::Capture
+        }
+    }
+
+    fn recover(&mut self) {
+        if self.paused && self.bytes <= MAX_PENDING_INPUT / 2 {
+            self.paused = false;
+            self.notice = Some(InputNotice::Ready);
+            self.notice_presented = false;
+        }
+    }
+
+    fn committed(&mut self, through: u64) {
+        self.records.retain(|seq, (_, bytes)| {
+            if *seq <= through {
+                self.bytes -= *bytes;
+                false
+            } else {
+                true
+            }
+        });
+        self.recover();
+    }
+
+    fn admit(
+        &mut self,
+        events: Vec<InputEvent>,
+        user: bool,
+        display: &mut Display<TtyOutput>,
+    ) -> Result<bool> {
+        if events.is_empty() || self.is_closing() {
+            return Ok(false);
+        }
+        if user && self.paused {
+            return Ok(false);
+        }
+        let costs = events
+            .iter()
+            .map(|event| serde_json::to_vec(event).map(|bytes| bytes.len()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let bytes: usize = costs.iter().sum();
+        if bytes > MAX_PENDING_INPUT || self.bytes + bytes > MAX_PENDING_INPUT {
+            if user {
+                self.notice_presented = false;
+                if bytes > MAX_PENDING_INPUT {
+                    self.notice = Some(InputNotice::TooLarge);
+                } else {
+                    self.paused = true;
+                    self.notice = Some(InputNotice::Full);
+                    self.recover();
+                }
+            } else {
+                self.clipboard_not_sent = true;
+            }
+            return Ok(false);
+        }
+        let through = self
+            .sequence
+            .checked_add(events.len() as u64)
+            .context("input sequence exhausted")?;
+        let first = self.sequence + 1;
+        for (event, bytes) in events.into_iter().zip(costs) {
+            self.sequence += 1;
+            self.records.insert(
+                self.sequence,
+                (
+                    InputRecord {
+                        seq: self.sequence,
+                        event,
+                    },
+                    bytes,
+                ),
+            );
+        }
+        self.bytes += bytes;
+        if user && self.notice_presented {
+            self.notice = None;
+        }
+        for seq in first..=through {
+            display.predict(seq, &self.records[&seq].0.event)?;
+        }
+        Ok(true)
+    }
+
+    fn status(&self, help: bool, connection: &str) -> String {
+        let mut parts = Vec::new();
+        if self.is_closing() {
+            parts.push(if help {
+                "Close unconfirmed. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal."
+            } else {
+                "Close unconfirmed; remote may still run. Ctrl-^ . leaves; ? for help."
+            });
+        } else if help {
+            parts.push(match &self.notice {
+                Some(InputNotice::Full) => "Input not accepted. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
+                Some(InputNotice::TooLarge) => "Input too large. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
+                Some(InputNotice::InvalidPaste) => "Invalid paste. Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ literal.",
+                Some(InputNotice::Ready) => "Input ready; retype refused input. Ctrl-^ then . detach; Ctrl-Z suspend; q close.",
+                None => "Ctrl-^ then . detach; Ctrl-Z suspend; q close; ^ send Ctrl-^.",
+            });
+        } else if let Some(notice) = &self.notice {
+            parts.push(match notice {
+                InputNotice::Full => {
+                    "Input not accepted. Wait for input to resume, then retype it. Ctrl-^ ? help."
+                }
+                InputNotice::TooLarge => {
+                    "Input not accepted: too large. Use smaller input. Ctrl-^ ? help."
+                }
+                InputNotice::InvalidPaste => "Paste not accepted: invalid UTF-8. Ctrl-^ ? help.",
+                InputNotice::Ready => "Input ready. Rejected input was not sent; please retype it.",
+            });
+        }
+        if self.clipboard_not_sent {
+            parts.push("Clipboard reply not sent; remote query may time out.");
+        }
+        if !connection.is_empty() {
+            parts.push(connection);
+        }
+        parts.join(" ")
+    }
+}
+
+fn connection_notice(prefix: &str, reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(256)
+        .collect();
+    format!("Ctrl-^ . to detach. {prefix} {reason}")
 }
 
 fn read_size(size: &mut Size, generation: &mut u64) -> Result<()> {
@@ -396,14 +619,13 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut attempt = 0;
     let mut retry_at = Instant::now();
     let mut failures = 0u32;
-    let mut sequence = 0;
     let mut committed = 0;
-    let mut pending = BTreeMap::<u64, (InputRecord, usize)>::new();
-    let mut pending_bytes = 0usize;
+    let mut pending = PendingInput::default();
     let mut captured = VecDeque::<LocalEvent>::new();
-    let mut ready_input = VecDeque::<InputEvent>::new();
     let mut escape = EscapeSequence::new();
     let mut help_visible = false;
+    let mut connection_status = String::from("Connecting.");
+    let mut shown_status = connection_status.clone();
     let mut resources = BTreeMap::<Digest, Resource>::new();
     let mut pending_frame: Option<Frame> = None;
     let mut effects = BTreeMap::<u64, Effect>::new();
@@ -414,10 +636,15 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut remote_exit: Option<(i32, u64, u64)> = None;
     let mut resync_pending = false;
     let mut requested_resources = Instant::now() - Duration::from_secs(1);
-    let mut buffer = [0u8; 256];
+    let mut buffer = [0u8; MAX_INPUT_CHUNK];
     loop {
         let was_foreground = matches!(ui, LocalUi::Foreground { .. });
-        ui = ui.try_foreground()?;
+        let foreground_result;
+        (ui, foreground_result) = ui.try_foreground();
+        if let Err(error) = foreground_result {
+            let _ = ui.finish(pending.is_closing().then_some(CLOSE_NOTICE));
+            return Err(error);
+        }
         let LocalUi::Foreground {
             display,
             input: tty,
@@ -443,6 +670,15 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 read_size(&mut size, &mut resize_generation)?;
                 display.redraw_cached(size)?;
             }
+            if !captured.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = terminate.recv() => return Ok(SessionAction::Detach),
+                    _ = interrupt.recv() => return Ok(SessionAction::Detach),
+                    _ = hangup.recv() => return Ok(SessionAction::Detach),
+                    _ = std::future::ready(()) => (),
+                }
+            } else {
             tokio::select! {
                 _ = terminate.recv() => return Ok(SessionAction::Detach),
                 _ = interrupt.recv() => return Ok(SessionAction::Detach),
@@ -461,11 +697,9 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             connecting.take();
                             match result {
                                 Ok(new_link) => {
-                                    ensure!(new_link.committed >= committed && new_link.committed <= sequence, "server input commit is inconsistent");
+                                    ensure!(new_link.committed >= committed && new_link.committed <= pending.sequence, "server input commit is inconsistent");
                                     committed = new_link.committed;
-                                    pending.retain(|seq, (_, bytes)| {
-                                        if *seq <= committed { pending_bytes -= *bytes; false } else { true }
-                                    });
+                                    pending.committed(committed);
                                     display.set_epoch(new_link.epoch)?;
                                     display.set_effect_floor(new_link.effect_floor);
                                     effects.retain(|id, _| *id > new_link.effect_floor);
@@ -473,14 +707,14 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                     link = Some(new_link);
                                     resync_pending = false;
                                     failures = 0;
-                                    display.write_status("")?;
+                                    connection_status.clear();
                                 }
                                 Err(OpenFailure { error, fatal }) => {
                                     if fatal { return Err(error).context("server rejected session attachment"); }
                                     failures = failures.saturating_add(1);
                                     let delay = Duration::from_millis((250u64 << failures.min(4)).min(5000));
                                     retry_at = Instant::now() + delay;
-                                    display.write_status(&format!("Ctrl-^ . to detach. Connection unavailable, retrying. {error:#}"))?;
+                                    connection_status = connection_notice("Connection unavailable, retrying.", &format!("{error:#}"));
                                 }
                             }
                         }
@@ -488,11 +722,9 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             let active = link.as_ref().expect("active link");
                             match message {
                                 ServerMessage::Committed { epoch, through } if epoch == active.epoch => {
-                                    ensure!(through >= committed && through <= sequence, "invalid server input commit");
+                                    ensure!(through >= committed && through <= pending.sequence, "invalid server input commit");
                                     committed = through;
-                                    pending.retain(|seq, (_, bytes)| {
-                                        if *seq <= committed { pending_bytes -= *bytes; false } else { true }
-                                    });
+                                    pending.committed(committed);
                                 }
                                 ServerMessage::Effects { epoch, floor, items } if epoch == active.epoch => {
                                     display.set_effect_floor(floor);
@@ -540,12 +772,18 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             pending_frame = None;
                             resources.clear();
                             retry_at = Instant::now();
-                            display.write_status(&format!("Ctrl-^ . to detach. Connection interrupted, reconnecting. {reason}"))?;
+                            connection_status = connection_notice("Connection interrupted, reconnecting.", &reason);
                         }
                         _ => (),
                     }
                 }
-                ready = tty.readable(), if pending_bytes < MAX_PENDING_INPUT - 64 * 1024 && captured.is_empty() && ready_input.is_empty() => {
+                _ = timer.tick() => {
+                    display.tick()?;
+                    if captured.is_empty() && decoder.has_pending_escape() && last_escape.elapsed() >= Duration::from_millis(30) {
+                        captured = decoder.flush_escape().into();
+                    }
+                }
+                ready = tty.readable(), if captured.is_empty() => {
                     let mut ready = ready?;
                     let result = ready.try_io(|fd| {
                         use std::io::Read;
@@ -554,7 +792,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                     match result {
                         Ok(Ok(0)) => return Ok(SessionAction::Detach),
                         Ok(Ok(count)) => {
-                            captured.extend(decoder.feed(&buffer[..count])?);
+                            captured = decoder.feed(&buffer[..count], pending.paste_admission())?.into();
                             last_escape = Instant::now();
                         }
                         Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => (),
@@ -562,71 +800,26 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                         Err(_) => (),
                     }
                 }
-                _ = timer.tick() => {
-                    display.tick()?;
-                    if decoder.has_pending_escape() && last_escape.elapsed() >= Duration::from_millis(30) {
-                        captured.extend(decoder.flush_escape());
-                    }
-                }
             }
-            loop {
-                if let Some(event) = ready_input.front() {
-                    let bytes = serde_json::to_vec(event)?.len();
-                    ensure!(
-                        bytes <= MAX_PENDING_INPUT,
-                        "input event exceeds pending input limit"
-                    );
-                    if pending_bytes + bytes > MAX_PENDING_INPUT {
-                        break;
-                    }
-                    let event = ready_input.pop_front().expect("ready input");
-                    sequence = sequence
-                        .checked_add(1)
-                        .context("input sequence exhausted")?;
-                    pending.insert(
-                        sequence,
-                        (
-                            InputRecord {
-                                seq: sequence,
-                                event,
-                            },
-                            bytes,
-                        ),
-                    );
-                    pending_bytes += bytes;
-                    display.predict(sequence, &pending[&sequence].0.event)?;
-                    continue;
-                }
-                let Some(event) = captured.pop_front() else {
-                    break;
-                };
+            }
+            while let Some(event) = captured.pop_front() {
                 match event {
                     LocalEvent::Input(event) => match escape.feed(event) {
                         EscapeAction::Send(events) => {
-                            let clear_help = help_visible && !events.is_empty();
-                            ready_input.extend(events);
-                            if clear_help {
+                            if pending.admit(events, true, display)? {
                                 help_visible = false;
-                                display.write_status("")?;
                             }
+                            if pending.paused || pending.is_closing() { decoder.discard_active_paste(); }
                         }
                         EscapeAction::Detach => return Ok(SessionAction::Detach),
                         EscapeAction::Suspend => return Ok(SessionAction::Suspend),
                         EscapeAction::Close => {
-                            if let Some(active) = &link {
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(1),
-                                    active.output.send(ClientMessage::Close {
-                                        epoch: active.epoch,
-                                    }),
-                                )
-                                .await;
+                            if !pending.is_closing() {
+                                pending.close = CloseState::Requested { after_sequence: pending.sequence, queued_epoch: None };
                             }
+                            decoder.discard_active_paste();
                         }
                         EscapeAction::Help => {
-                            display.write_status(
-                                "Ctrl-^ . detach; Ctrl-^ Ctrl-Z suspend; Ctrl-^ q end session; Ctrl-^ ^ send Ctrl-^.",
-                            )?;
                             help_visible = true;
                         }
                     },
@@ -637,7 +830,16 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             .and_then(|index| clipboard_queries.remove(index))
                             .map(|(query, _, _)| InputEvent::QueryResult { query, data });
                         if let Some(response) = response {
-                            ready_input.push_back(response);
+                            pending.admit(vec![response], false, display)?;
+                        }
+                    }
+                    LocalEvent::Rejected(reason) => {
+                        if !pending.is_closing() {
+                            pending.notice_presented = false;
+                            pending.notice = Some(match reason {
+                                InputRejection::PasteTooLarge => InputNotice::TooLarge,
+                                InputRejection::InvalidPaste => InputNotice::InvalidPaste,
+                            });
                         }
                     }
                 }
@@ -664,9 +866,13 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
             for effect in ready_effects {
                 let response = display.apply_effect(&effect, options.clipboard_read)?;
                 if let Some(event) = response {
-                    captured.push_back(LocalEvent::Input(event));
+                    pending.admit(vec![event], false, display)?;
                 } else if let EffectKind::ClipboardRead { query, selection } = &effect.kind {
-                    clipboard_queries.push_back((*query, selection.clone(), Instant::now()));
+                    if !pending.is_closing() && clipboard_queries.len() < MAX_EFFECTS {
+                        clipboard_queries.push_back((*query, selection.clone(), Instant::now()));
+                    } else if !pending.is_closing() {
+                        pending.clipboard_not_sent = true;
+                    }
                 }
                 effects.remove(&effect.id);
             }
@@ -677,28 +883,32 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 let (query, _, _) = clipboard_queries
                     .pop_front()
                     .expect("expired clipboard query");
-                captured.push_back(LocalEvent::Input(InputEvent::QueryResult {
+                pending.admit(vec![InputEvent::QueryResult {
                     query,
                     data: None,
-                }));
+                }], false, display)?;
             }
             if let Some((code, revision, effects)) = remote_exit
                 && display.revision() >= revision
                 && display.effects_applied() >= effects
             {
-                if let Some(active) = &link {
-                    active
-                        .output
-                        .send(ClientMessage::ExitAck {
-                            epoch: active.epoch,
-                        })
-                        .await?;
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(1), active.connection.closed()).await;
-                }
                 return Ok(SessionAction::Exit(code));
             }
+            let status = pending.status(help_visible, &connection_status);
+            if status != shown_status {
+                display.write_status(&status)?;
+                shown_status = status;
+            }
+            pending.notice_presented = true;
             if let Some(active) = link.as_mut() {
+                if let CloseState::Requested { after_sequence, queued_epoch } = &mut pending.close
+                    && active.sent_through >= *after_sequence
+                    && committed >= *after_sequence
+                    && *queued_epoch != Some(active.epoch)
+                    && active.output.try_send(ClientMessage::Close { epoch: active.epoch }).is_ok()
+                {
+                    *queued_epoch = Some(active.epoch);
+                }
                 if requested_resources.elapsed() >= Duration::from_millis(500)
                     && let Some(frame) = &pending_frame
                 {
@@ -753,27 +963,18 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 {
                     active.effects_ack = display.effects_applied();
                 }
-                for (_, (record, _)) in pending.range((active.sent_through + 1)..).take(8) {
-                    if active
-                        .output
-                        .try_send(ClientMessage::Input {
-                            epoch: active.epoch,
-                            record: record.clone(),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                for (_, (record, _)) in pending.records.range((std::ops::Bound::Excluded(active.sent_through), std::ops::Bound::Unbounded)).take(8) {
+                    if active.output.try_send(ClientMessage::Input { epoch: active.epoch, record: record.clone() }).is_err() { break; }
                     active.sent_through = record.seq;
                 }
                 if active.resize_sent < resize_generation
-                    && active.sent_through >= sequence
+                    && active.sent_through >= pending.sequence
                     && active
                         .output
                         .try_send(ClientMessage::Resize {
                             epoch: active.epoch,
                             generation: resize_generation,
-                            after: sequence,
+                            after: pending.sequence,
                             size,
                         })
                         .is_ok()
@@ -804,17 +1005,44 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
         }.await;
         match result {
             Ok(SessionAction::Continue) => (),
-            Ok(SessionAction::Suspend) => ui = ui.suspend()?,
+            Ok(SessionAction::Suspend) => {
+                let suspended;
+                (ui, suspended) = ui.suspend();
+                if let Err(error) = suspended {
+                    let _ = ui.finish(pending.is_closing().then_some(CLOSE_NOTICE));
+                    return Err(error);
+                }
+            }
             Ok(SessionAction::Detach) => break,
-            Ok(SessionAction::Exit(code)) => return Ok(code),
+            Ok(SessionAction::Exit(code)) => {
+                ui.finish(None)?;
+                if let Some(active) = &link {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                        active
+                            .output
+                            .send(ClientMessage::ExitAck {
+                                epoch: active.epoch,
+                            })
+                            .await?;
+                        active.connection.closed().await;
+                        Result::<()>::Ok(())
+                    })
+                    .await;
+                }
+                return Ok(code);
+            }
             Err(error) if foreground_lost(&error) => {
                 ui = ui.park();
                 resync_pending = true;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _ = ui.finish(pending.is_closing().then_some(CLOSE_NOTICE));
+                return Err(error);
+            }
         }
     }
 
+    ui.finish(pending.is_closing().then_some(CLOSE_NOTICE))?;
     if let Some(active) = &link {
         let _ = active.output.try_send(ClientMessage::Detach {
             epoch: active.epoch,
