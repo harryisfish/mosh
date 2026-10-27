@@ -48,8 +48,7 @@ python3 scripts/update-homebrew-formula.py 0.1.2 target/homebrew-0.1.2/SHA256SUM
 
 The generator pins four archive URLs and their SHA-256 checksums. It uses musl
 archives for Linux when the manifest contains them, and GNU archives for older
-releases. The initial formula pins the published 0.1.1 release so it can be
-installed before 0.1.2 is available.
+releases.
 
 Review `Formula/mosh-rs.rb`, install it through the tap, and run both binaries
 with `--version`. Run `brew test harryisfish/mosh/mosh-rs`, then submit the
