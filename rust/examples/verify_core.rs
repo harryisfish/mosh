@@ -60,10 +60,18 @@ fn model() -> TerminalModel {
     .unwrap()
 }
 fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--combining-transcript")
+    {
+        return verify_combining_transcript(&arguments[1..]);
+    }
     verify_default_colors()?;
     verify_terminal_boundaries()?;
     verify_png_metadata()?;
     verify_projection_regressions()?;
+    verify_combining_regressions()?;
     verify_scrollback_wrap()?;
     let maximum = Size {
         cols: 512,
@@ -822,26 +830,31 @@ impl std::io::Write for CountBytes {
     }
 }
 
+fn checked(model: &mut TerminalModel) -> Result<Screen> {
+    use mosh_rs::{
+        display::{Display, Graphics, PredictionPolicy},
+        state,
+    };
+    let screen = model.snapshot()?;
+    assert_eq!(screen.rows.len(), usize::from(screen.size.rows));
+    assert!(screen.cursor.x < screen.size.cols && screen.cursor.y < screen.size.rows);
+    let dsr = model.advance(b"\x1b[6n")?.replies;
+    assert_eq!(
+        dsr,
+        format!("\x1b[{};{}R", screen.cursor.y + 1, screen.cursor.x + 1).as_bytes()
+    );
+    let frame = state::frame(1, 1, 0, &screen, None)?;
+    let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
+    display.set_epoch(1)?;
+    assert!(display.install(&frame, &screen.resources)?);
+    Ok(screen)
+}
+
 fn verify_projection_regressions() -> Result<()> {
     use mosh_rs::{
         display::{Display, Graphics, PredictionPolicy},
         state,
     };
-    fn checked(model: &mut TerminalModel) -> Result<Screen> {
-        let screen = model.snapshot()?;
-        assert_eq!(screen.rows.len(), usize::from(screen.size.rows));
-        assert!(screen.cursor.x < screen.size.cols && screen.cursor.y < screen.size.rows);
-        let dsr = model.advance(b"\x1b[6n")?.replies;
-        assert_eq!(
-            dsr,
-            format!("\x1b[{};{}R", screen.cursor.y + 1, screen.cursor.x + 1).as_bytes()
-        );
-        let frame = state::frame(1, 1, 0, &screen, None)?;
-        let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
-        display.set_epoch(1)?;
-        display.install(&frame, &screen.resources)?;
-        Ok(screen)
-    }
     fn small() -> Result<TerminalModel> {
         TerminalModel::new(
             Size {
@@ -1028,6 +1041,332 @@ fn verify_projection_regressions() -> Result<()> {
     checked(&mut resized)?;
     println!(
         "Unicode split/whole continuation, DSR, resize, semantic markers, scaled images, legacy symbols, metadata validation passed"
+    );
+    Ok(())
+}
+
+fn text_cells(screen: &Screen) -> Vec<(u16, u16, &str, u8)> {
+    screen
+        .rows
+        .iter()
+        .enumerate()
+        .flat_map(|(y, row)| {
+            row.cells.iter().filter_map(move |cell| {
+                (cell.text != " ").then_some((cell.x, y as u16, cell.text.as_str(), cell.width))
+            })
+        })
+        .collect()
+}
+
+fn expect_cells(screen: &Screen, cells: &[(u16, u16, &str, u8)], cursor: (u16, u16)) {
+    assert_eq!(text_cells(screen), cells);
+    assert_eq!((screen.cursor.x, screen.cursor.y), cursor);
+}
+
+fn verify_combining_regressions() -> Result<()> {
+    let size = Size {
+        cols: 20,
+        rows: 4,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    fn check(
+        size: Size,
+        chunks: &[&str],
+        cells: &[(u16, u16, &str, u8)],
+        cursor: (u16, u16),
+    ) -> Result<Screen> {
+        let whole = chunks.concat();
+        let variants = [
+            vec![whole.as_bytes()],
+            chunks.iter().map(|chunk| chunk.as_bytes()).collect(),
+            whole.as_bytes().chunks(1).collect(),
+        ];
+        let mut result = None;
+        for variant in variants {
+            let mut term = TerminalModel::new(size, false)?;
+            term.advance(b"\x1b[2J\x1b[H")?;
+            for chunk in variant {
+                term.advance(chunk)?;
+            }
+            let screen = checked(&mut term)?;
+            expect_cells(&screen, cells, cursor);
+            result = Some(screen);
+        }
+        Ok(result.unwrap())
+    }
+    let leading = [(0, 0, "\u{00a0}\u{0302}", 1), (1, 0, "X", 1)];
+    check(size, &["\u{0302}", "X"], &leading, (2, 0))?;
+    check(size, &["A\r\x1b[2K", "\u{0302}", "X"], &leading, (2, 0))?;
+    check(
+        size,
+        &["e\r\n", "\u{0302}", "X"],
+        &[
+            (0, 0, "e", 1),
+            (0, 1, "\u{00a0}\u{0302}", 1),
+            (1, 1, "X", 1),
+        ],
+        (2, 1),
+    )?;
+    check(
+        size,
+        &["\u{0302}", "\u{0301}", "X"],
+        &[(0, 0, "\u{00a0}\u{0302}\u{0301}", 1), (1, 0, "X", 1)],
+        (2, 0),
+    )?;
+    check(
+        size,
+        &["e", "\u{0302}", "X"],
+        &[(0, 0, "e\u{0302}", 1), (1, 0, "X", 1)],
+        (2, 0),
+    )?;
+    for (mark, expected) in [
+        ("\u{0900}", "\u{00a0}\u{0900}"),
+        ("\u{0488}", "\u{00a0}\u{0488}"),
+        ("\u{20dd}", "\u{00a0}\u{20dd}"),
+    ] {
+        check(
+            size,
+            &[mark, "X"],
+            &[(0, 0, expected, 1), (1, 0, "X", 1)],
+            (2, 0),
+        )?;
+    }
+    for ignorable in [
+        "\u{034f}",
+        "\u{17b4}",
+        "\u{17b5}",
+        "\u{180b}",
+        "\u{180c}",
+        "\u{180d}",
+        "\u{180f}",
+        "\u{fe00}",
+        "\u{fe0f}",
+        "\u{e0100}",
+        "\u{e01ef}",
+        "\u{200c}",
+        "\u{200d}",
+        "\u{2068}",
+        "\u{180e}",
+        "\u{e0020}",
+        "\u{102b}",
+        "\u{1038}",
+    ] {
+        check(size, &[ignorable, "X"], &[(0, 0, "X", 1)], (1, 0))?;
+    }
+    for (suffix, expected) in [
+        ("\u{034f}", "\u{00a0}\u{0302}\u{034f}"),
+        ("\u{fe0f}", "\u{00a0}\u{0302}\u{fe0f}"),
+        ("\u{e0100}", "\u{00a0}\u{0302}\u{e0100}"),
+    ] {
+        check(
+            size,
+            &["\u{0302}", suffix, "X"],
+            &[(0, 0, expected, 1), (1, 0, "X", 1)],
+            (2, 0),
+        )?;
+    }
+    check(
+        size,
+        &["e", "\u{034f}", "\u{0302}", "X"],
+        &[(0, 0, "e\u{034f}\u{0302}", 1), (1, 0, "X", 1)],
+        (2, 0),
+    )?;
+    check(
+        size,
+        &["\u{1e6e3}", "X"],
+        &[(0, 0, "\u{1e6e3}", 1), (1, 0, "X", 1)],
+        (2, 0),
+    )?;
+
+    let narrow = Size {
+        cols: 4,
+        rows: 3,
+        ..size
+    };
+    check(
+        narrow,
+        &["12界", "\u{0302}", "X"],
+        &[
+            (0, 0, "1", 1),
+            (1, 0, "2", 1),
+            (2, 0, "界\u{0302}", 2),
+            (0, 1, "X", 1),
+        ],
+        (1, 1),
+    )?;
+    check(
+        narrow,
+        &["123界", "\u{0302}", "X"],
+        &[
+            (0, 0, "1", 1),
+            (1, 0, "2", 1),
+            (2, 0, "3", 1),
+            (0, 1, "界\u{0302}", 2),
+            (2, 1, "X", 1),
+        ],
+        (3, 1),
+    )?;
+    check(
+        narrow,
+        &["\x1b[1;4H", "\u{0302}", "X"],
+        &[(3, 0, "\u{00a0}\u{0302}", 1), (0, 1, "X", 1)],
+        (1, 1),
+    )?;
+    check(
+        narrow,
+        &["\x1b[?7l\x1b[1;4H", "\u{0302}", "X"],
+        &[(3, 0, "X", 1)],
+        (3, 0),
+    )?;
+    check(
+        size,
+        &["AB\x1b[H\x1b[4h", "\u{0302}", "X"],
+        &[
+            (0, 0, "\u{00a0}\u{0302}", 1),
+            (1, 0, "X", 1),
+            (2, 0, "A", 1),
+            (3, 0, "B", 1),
+        ],
+        (2, 0),
+    )?;
+    let styled = check(
+        size,
+        &["\x1b[38;2;12;34;56m", "\u{0302}", "\x1b[0mX"],
+        &leading,
+        (2, 0),
+    )?;
+    assert_eq!(styled.rows[0].cells[0].style.fg, Color::Rgb([12, 34, 56]));
+    assert_eq!(styled.rows[0].cells[1].style.fg, Color::Default);
+    let styled = check(
+        size,
+        &["\x1b[38;2;12;34;56me", "\x1b[38;2;65;43;21m\u{0302}", "X"],
+        &[(0, 0, "e\u{0302}", 1), (1, 0, "X", 1)],
+        (2, 0),
+    )?;
+    assert_eq!(styled.rows[0].cells[0].style.fg, Color::Rgb([12, 34, 56]));
+
+    for (chunks, expected, cursor) in [
+        (vec!["\u{034f}\u{0302}X"], "\u{00a0}\u{034f}\u{0302}", 2),
+        (vec!["\u{034f}", "\u{0302}X"], "\u{00a0}\u{0302}", 2),
+        (vec!["\u{0600}\u{0302}X"], "X", 1),
+        (vec!["\u{0600}", "\u{0302}X"], "\u{00a0}\u{0302}", 2),
+    ] {
+        let mut term = TerminalModel::new(size, false)?;
+        for chunk in chunks {
+            term.advance(chunk.as_bytes())?;
+        }
+        let screen = checked(&mut term)?;
+        if cursor == 1 {
+            expect_cells(&screen, &[(0, 0, expected, 1)], (1, 0));
+        } else {
+            expect_cells(&screen, &[(0, 0, expected, 1), (1, 0, "X", 1)], (2, 0));
+        }
+    }
+
+    fn refused(chunks: &[&str]) -> Result<()> {
+        let mut term = model();
+        let mut error = None;
+        for chunk in chunks {
+            if let Err(rejected) = term.advance(chunk.as_bytes()) {
+                error = Some(rejected);
+                break;
+            }
+        }
+        assert!(
+            error
+                .context("oversized grapheme was accepted")?
+                .to_string()
+                .contains("grapheme byte limit")
+        );
+        assert!(term.snapshot().is_err());
+        assert!(term.advance(b"X").is_err());
+        Ok(())
+    }
+    let marks31 = "\u{0302}".repeat(31);
+    let marks32 = "\u{0302}".repeat(32);
+    let original31 = format!("¢{marks31}");
+    let original32 = format!("¢{marks32}");
+    let fallback31 = format!("\u{00a0}{marks31}");
+    assert_eq!(original31.len(), 64);
+    assert_eq!(fallback31.len(), 64);
+    check(size, &[&original31], &[(0, 0, &original31, 1)], (1, 0))?;
+    check(size, &["¢", &marks31], &[(0, 0, &original31, 1)], (1, 0))?;
+    check(size, &[&marks31], &[(0, 0, &fallback31, 1)], (1, 0))?;
+    refused(&[&original32])?;
+    refused(&["¢", &marks32])?;
+    refused(&[&marks32])?;
+    let mut accumulated = vec!["¢"];
+    accumulated.extend(std::iter::repeat_n("\u{0302}", 32));
+    refused(&accumulated)?;
+    refused(&["\u{0302}"; 32])?;
+    refused(&[&format!("\u{034f}{marks31}")])?;
+    let mut term = model();
+    term.advance("\u{034f}".as_bytes())?;
+    term.advance(marks31.as_bytes())?;
+    expect_cells(&checked(&mut term)?, &[(0, 0, &fallback31, 1)], (1, 0));
+    let mut term = model();
+    term.advance("0\x1b[1J\u{0334}".as_bytes())?;
+    checked(&mut term)?;
+    println!(
+        "orphan Mn/Me carriers, DI/Mc boundaries, exact cells/DSR, frame/display installation and three 64-byte limits passed"
+    );
+    Ok(())
+}
+
+fn verify_combining_transcript(arguments: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        arguments.len() == 2,
+        "expected transcript and combining case"
+    );
+    let mut term = TerminalModel::new(
+        Size {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+        },
+        false,
+    )?;
+    term.advance(&std::fs::read(&arguments[0])?)?;
+    let screen = checked(&mut term)?;
+    let leading = [(0, 0, "\u{00a0}\u{0302}", 1), (1, 0, "X", 1)];
+    match arguments[1].as_str() {
+        "leading" | "erase" | "split-utf8" => expect_cells(&screen, &leading, (2, 0)),
+        "newline" => expect_cells(
+            &screen,
+            &[
+                (0, 0, "e", 1),
+                (0, 1, "\u{00a0}\u{0302}", 1),
+                (1, 1, "X", 1),
+            ],
+            (2, 1),
+        ),
+        "repeated" => expect_cells(
+            &screen,
+            &[(0, 0, "\u{00a0}\u{0302}\u{0301}", 1), (1, 0, "X", 1)],
+            (2, 0),
+        ),
+        "normal-base" => expect_cells(&screen, &[(0, 0, "e\u{0302}", 1), (1, 0, "X", 1)], (2, 0)),
+        "filtered" => expect_cells(&screen, &[(0, 0, "X", 1)], (1, 0)),
+        "tail-di" => expect_cells(
+            &screen,
+            &[(0, 0, "\u{00a0}\u{0302}\u{fe0f}", 1), (1, 0, "X", 1)],
+            (2, 0),
+        ),
+        "enclosing" => expect_cells(
+            &screen,
+            &[(0, 0, "\u{00a0}\u{20dd}", 1), (1, 0, "X", 1)],
+            (2, 0),
+        ),
+        _ => anyhow::bail!("unknown combining case"),
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "case": arguments[1], "cells": text_cells(&screen), "cursor": screen.cursor,
+            "limits": "CLI transcript roundtrip through terminal core; native font/terminal visuals unverified"
+        })
     );
     Ok(())
 }

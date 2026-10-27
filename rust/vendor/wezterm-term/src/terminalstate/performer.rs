@@ -3,6 +3,7 @@ use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
 use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use finl_unicode::categories::CharacterCategories;
 use finl_unicode::grapheme_clusters::Graphemes;
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -28,6 +29,27 @@ use wezterm_escape_parser::osc::{
 use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
+
+fn orphan_combining_fallback(g: &str) -> Option<String> {
+    // Default-ignorable marks from the locked Unicode 16 property tables.
+    let has_visible_mark = g.chars().any(|c| {
+        (c.is_mark_nonspacing() || c.is_mark_enclosing())
+            && !matches!(
+                c,
+                '\u{034f}'
+                    | '\u{17b4}'..='\u{17b5}'
+                    | '\u{180b}'..='\u{180d}'
+                    | '\u{180f}'
+                    | '\u{fe00}'..='\u{fe0f}'
+                    | '\u{e0100}'..='\u{e01ef}'
+            )
+    });
+    if !has_visible_mark {
+        return None;
+    }
+    let text = format!("\u{00a0}{g}");
+    (Graphemes::new(&text).count() == 1).then_some(text)
+}
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
@@ -133,7 +155,8 @@ impl<'a> Performer<'a> {
         };
 
         for g in Graphemes::new(text) {
-            let g = self.remap_grapheme(g);
+            let mut g = self.remap_grapheme(g);
+            let fallback;
             if g.len() > 64 {
                 self.state.action_error = Some("grapheme byte limit exceeded".to_owned());
                 return;
@@ -212,6 +235,14 @@ impl<'a> Performer<'a> {
                 // We do not currently have a solution for that.
                 if is_white_space_grapheme(g) {
                     // Ensure that White_Space shows as a space
+                    print_width = 1;
+                } else if let Some(text) = orphan_combining_fallback(g) {
+                    if text.len() > 64 {
+                        self.state.action_error = Some("grapheme byte limit exceeded".to_owned());
+                        return;
+                    }
+                    fallback = text;
+                    g = &fallback;
                     print_width = 1;
                 } else {
                     log::trace!("Eliding zero-width grapheme {:?}", g);

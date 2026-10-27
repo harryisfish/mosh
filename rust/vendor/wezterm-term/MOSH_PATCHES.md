@@ -27,6 +27,10 @@ compatibility and is not the application's entry point.
   Arcs while the core still references the source and remove obsolete copies.
 - Bound user variables, Unicode mode stacks and accumulated titles. Join
   graphemes across PTY reads, with a 64-byte bound per grapheme.
+- Give orphan zero-width Mn/Me marks a one-column NBSP carrier after the existing
+  previous-cell join fails, if NBSP plus the entire original cluster is still
+  one grapheme. This follows [Mosh 1.4.0's fallback representation](https://github.com/mobile-shell/mosh/blob/bc73a26316ede2a79259d859f8ee309b32412420/src/terminal/terminalframebuffer.h#L191).
+  The carrier counts toward the same 64-byte bound.
 - Return Kitty success replies for explicit image IDs as well as image numbers.
 - Intersect rectangular checksum queries with the viewport and sum modulo 65536.
   Count physical columns, including blank cells and wide-character continuations.
@@ -42,6 +46,22 @@ text plus hyperlink strings are limited to 4 MiB per snapshot. A counting postca
 writer checks projected cell encoding against the frame budget before cells are
 retained in the snapshot; it never allocates a giant intermediate frame buffer.
 These content limits apply even when the requested window size itself is valid.
+
+The orphan carrier is part of `cell.text`, so snapshots and copied text include
+the synthetic U+00A0. Original mark bytes and order remain unchanged; NFC is not
+enabled. Default-ignorable marks cannot trigger a carrier. The exclusions are
+U+034F, U+17B4-U+17B5, U+180B-U+180D, U+180F, U+FE00-U+FE0F and U+E0100-U+E01EF,
+from [Unicode 16's Default_Ignorable_Code_Point table](https://www.unicode.org/Public/16.0.0/ucd/DerivedCoreProperties.txt)
+intersected with the locked Mn/Me categories. Recheck them when the category or
+width dependencies change. Format-only clusters and Mc keep their existing
+behavior. White_Space keeps its existing one-column rule. Trailing variation
+selectors or CGJ remain with a supported mark or an existing base.
+
+No orphan prefix is retained across flushes. A CGJ prefix is preserved when it
+arrives with an orphan mark, but is elided if it arrives alone first. Those forms
+can therefore differ in text and at the 64-byte limit. U+0600 Prepend mixed with
+an orphan mark still follows the old elision boundary when NBSP would form two
+graphemes. This is not complete support for every zero-width Unicode cluster.
 
 A decoded image is at most 16 MiB RGBA and 16384 pixels in either dimension.
 Core live decoded images are at most 64 MiB, with at most 4096 image objects,
@@ -98,7 +118,10 @@ attributes, split graphemes, Kitty keyboard phases/alternate codes/text, keypad,
 mouse, paste, effects, query responses, synchronized-output expiry, static
 images, size-aware resource identity, Arc reuse, deletion, unplaced-image quota,
 chunk count, forbidden data sources, parser bounds and sticky collector errors.
-It does not verify the network protocol, a real PTY or a local terminal renderer.
+Orphan carrier cases also pass through `state::frame` and `Display::install`,
+including the client's separate single-grapheme validation. It does not verify
+the network protocol, a real PTY or native terminal visuals. Other-platform and
+comprehensive performance acceptance remain outside this verification.
 
 Integration fixes: shell markers are observed after core actions, fresh-line-only
 events are omitted, and `N` exports the resulting prompt boundary. Unicode
