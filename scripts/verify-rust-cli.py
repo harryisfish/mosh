@@ -115,7 +115,17 @@ def remote_fixture(mode, state):
                 exact(b"next\r", timeout=30)
                 with received.open("ab") as output:
                     output.write(b"next\r")
+        sizes = []
         while True:
+            current = os.get_terminal_size(0)
+            measured = {"cols": current.columns, "rows": current.lines}
+            if not sizes or sizes[-1] != measured:
+                sizes.append(measured)
+                pending = Path(state + ".sizes.new")
+                pending.write_text(json.dumps(sizes))
+                pending.replace(state + ".sizes")
+            if not select.select([0], [], [], 0.02)[0]:
+                continue
             chunk = os.read(0, 65536)
             if not chunk:
                 return 0
@@ -1058,6 +1068,7 @@ def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None
                                "--", sys.executable, script, "--remote", "soft-wrap", state])
     facts = {"client": process.process.pid, "cases": [], "native_selection_clipboard": "unverified"}
     resizes = []
+    source_resizes = []
     source_cols, source_rows = 80, 24
     viewport_cols, viewport_rows = 80, 24
     stage = 0
@@ -1078,9 +1089,30 @@ def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None
         fcntl.ioctl(process.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, cols * 10, rows * 20))
         pump_for(0.2)
 
+    def wait_remote_size(cols, rows):
+        deadline = time.monotonic() + 15
+        while True:
+            path = Path(state + ".sizes")
+            measured = json.loads(path.read_text()) if path.exists() else []
+            if measured and measured[-1] == {"cols": cols, "rows": rows}:
+                return measured
+            process.pump(0.02)
+            assert time.monotonic() < deadline, ("remote resize did not arrive", cols, measured)
+
     def inspect(name, outgoing, start=0, status=False):
         raw = run / (name + ".remote.raw")
         raw.write_bytes(Path(state + f".{stage}.raw").read_bytes())
+        chunks = json.loads(Path(state + ".chunks").read_text())
+        source_steps = []
+        for source_stage in range(stage + 1):
+            recorded = [chunk for chunk in chunks if chunk["case"] == source_stage]
+            dimensions = {(chunk["cols"], chunk["rows"]) for chunk in recorded}
+            assert len(dimensions) == 1, (source_stage, dimensions)
+            cols, rows = dimensions.pop()
+            source_file = run / f"source-{source_stage}.raw"
+            source_file.write_bytes(Path(state + f".{source_stage}.raw").read_bytes())
+            source_steps.append({"size": size(cols, rows), "source_file": str(source_file)})
+        source_steps.extend({"size": dimensions} for dimensions in source_resizes)
         transcript = run / (name + ".tty")
         transcript.write_bytes(process.output)
         wraps = [False] * viewport_rows
@@ -1088,7 +1120,7 @@ def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None
             for y in outgoing:
                 if y + 1 < min(source_rows, viewport_rows):
                     wraps[y] = True
-        spec = {"source_size": size(source_cols, source_rows), "source_file": str(raw), "resizes": resizes,
+        spec = {"source_steps": source_steps, "resizes": resizes,
                 "wraps": wraps, "status": status}
         spec_path = run / (name + ".spec.json")
         spec_path.write_text(json.dumps(spec, indent=2) + "\n")
@@ -1117,6 +1149,7 @@ def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None
             process.until(b"\x1b]2;SOFT_WRAP_" + str(stage).encode() + b"\x1b\\", start=start)
             pump_for(0.1)
             inspect(f"{kind}-{cols}", outgoing, start)
+        wait_remote_size(32, 8)
         Path(state + ".drop").touch()
         pump_for(0.1)
         start = len(process.output)
@@ -1134,14 +1167,19 @@ def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None
         os.kill(process.process.pid, signal.SIGCONT)
         pump_for(0.2)
         inspect("sigcont-modes", [], start, True)
-        resize(32, 8)
         Path(state + ".drop").unlink()
+        for cols in [20, 32]:
+            if cols == 32:
+                resize(cols, 8)
+            measured = wait_remote_size(cols, 8)
+            source_resizes.append(size(cols, 8))
+        assert measured == [{"cols": 32, "rows": 8}, {"cols": 20, "rows": 8}, {"cols": 32, "rows": 8}], measured
         deadline = time.monotonic() + 15
         while Path(state + ".received").read_bytes() != b"next\r" * 5 + b"\x0c":
             process.pump(0.02)
             assert time.monotonic() < deadline, "Ctrl-L did not reach original PTY exactly once"
         pump_for(0.2)
-        inspect("recovered", [1, 2], status=True)
+        inspect("recovered", [2, 3], status=True)
         facts["passed"] = True
         process.send(b"\x1e.")
         process.finish(0)
@@ -1153,7 +1191,7 @@ def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None
         (run / "complete.tty").write_bytes(process.output)
         (run / "cases.json").write_text(json.dumps(facts, indent=2) + "\n")
         for suffix, name in [("", "pids.json"), (".raw", "remote.raw"), (".chunks", "remote-chunks.json"),
-                              (".received", "received.bin"), (".stats", "relay.json")]:
+                              (".received", "received.bin"), (".stats", "relay.json"), (".sizes", "remote-sizes.json")]:
             path = Path(state + suffix)
             if path.exists():
                 (run / name).write_bytes(path.read_bytes())

@@ -2406,7 +2406,8 @@ fn verify_soft_wrap_transcript(arguments: &[String]) -> Result<()> {
     );
     let bytes = std::fs::read(&arguments[0])?;
     let spec: serde_json::Value = serde_json::from_slice(&std::fs::read(&arguments[1])?)?;
-    let source_size: Size = serde_json::from_value(spec["source_size"].clone())?;
+    let source_steps = spec["source_steps"].as_array().unwrap();
+    let source_size: Size = serde_json::from_value(source_steps[0]["size"].clone())?;
     let mut local = TerminalModel::new(Size::default(), false)?;
     let mut offset = 0;
     let mut viewport = Size::default();
@@ -2423,9 +2424,13 @@ fn verify_soft_wrap_transcript(arguments: &[String]) -> Result<()> {
     }
     local.advance(&bytes[offset..])?;
     let actual = local.snapshot()?;
-    let raw = std::fs::read(spec["source_file"].as_str().unwrap())?;
     let mut model = TerminalModel::new(source_size, false)?;
-    model.advance(&raw)?;
+    for step in source_steps {
+        model.resize(serde_json::from_value(step["size"].clone())?)?;
+        if let Some(path) = step["source_file"].as_str() {
+            model.advance(&std::fs::read(path)?)?;
+        }
+    }
     let expected = model.snapshot()?;
     let start = usize::from(spec["status"].as_bool().unwrap_or(false));
     assert_eq!(
