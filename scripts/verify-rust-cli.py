@@ -901,10 +901,10 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
-def verify_redraw(bin_dir, temporary, evidence_dir=None):
+def verify_redraw(bin_dir, temporary, evidence_dir=None, display_example=None):
     script = str(Path(__file__).resolve())
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
-    replay = bin_dir / "examples" / "verify_display"
+    replay = display_example or (bin_dir / "examples" / "verify_display")
     assert replay.is_file(), "build the verify_display example before CLI redraw verification"
 
     def session(name, before_attach=False):
@@ -1268,7 +1268,7 @@ def verify_liveness(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
-def verify(bin_dir, network, evidence_dir=None):
+def verify(bin_dir, network, evidence_dir=None, display_example=None):
     script = str(Path(__file__).resolve())
     client = str(bin_dir / "mosh-rs")
     server = str(bin_dir / "mosh-rs-server")
@@ -1369,7 +1369,7 @@ else:
 
         if network:
             verify_legacy_input(bin_dir, temporary, evidence_dir)
-            verify_redraw(bin_dir, temporary, evidence_dir)
+            verify_redraw(bin_dir, temporary, evidence_dir, display_example)
             state = str(Path(temporary) / "network.json")
             wrapper = Path(temporary) / "bootstrap-proxy"
             wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
@@ -1805,6 +1805,7 @@ if __name__ == "__main__":
         sys.exit(0)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
+    parser.add_argument("--display-example", type=Path, help="path to the verify_display example used by redraw verification")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
     parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
@@ -1814,7 +1815,8 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     if arguments.redraw:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-redraw-") as temporary:
-            verify_redraw(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
+            verify_redraw(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
+                          arguments.display_example.resolve() if arguments.display_example else None)
     elif arguments.liveness:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-liveness-") as temporary:
             verify_liveness(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
@@ -1825,4 +1827,5 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory(prefix="mosh-rs-saturated-") as temporary:
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
     else:
-        verify(arguments.bin_dir.resolve(), arguments.network, arguments.evidence_dir)
+        verify(arguments.bin_dir.resolve(), arguments.network, arguments.evidence_dir,
+               arguments.display_example.resolve() if arguments.display_example else None)

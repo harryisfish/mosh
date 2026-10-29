@@ -78,7 +78,7 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml)
           test "$GITHUB_REF_NAME" = "rust-v$version"
-      - run: cargo build -p mosh-rs --bins --release --locked --target "$RELEASE_TARGET"
+      - run: cargo build -p mosh-rs --bins --examples --release --locked --target "$RELEASE_TARGET"
       - name: Verify static musl linking
         if: endsWith(matrix.target, '-musl')
         shell: bash
@@ -99,7 +99,10 @@ jobs:
           package=${package%.tar.gz}
           "$RUNNER_TEMP/$package/bin/mosh-rs" --version
           "$RUNNER_TEMP/$package/bin/mosh-rs-server" --version
-          python3 scripts/verify-rust-cli.py --bin-dir "$RUNNER_TEMP/$package/bin" --network
+          python3 scripts/verify-rust-cli.py \
+            --bin-dir "$RUNNER_TEMP/$package/bin" \
+            --display-example "$PWD/target/$RELEASE_TARGET/release/examples/verify_display" \
+            --network
       - name: Install nFPM
         if: endsWith(matrix.target, '-musl')
         shell: bash
