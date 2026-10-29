@@ -85,6 +85,8 @@ async fn installed_locale_names() -> Result<Vec<String>> {
     let mut child = Command::new("locale")
         .arg("-a")
         .env("LC_ALL", "C")
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("LD_PRELOAD")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
