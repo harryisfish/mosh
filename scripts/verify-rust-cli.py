@@ -1654,7 +1654,6 @@ if __name__ == "__main__":
     parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
-    parser.add_argument("--evidence-dir", type=Path, help="copy diagnostic JSONL files to this directory")
     arguments = parser.parse_args()
     if arguments.liveness:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-liveness-") as temporary:
