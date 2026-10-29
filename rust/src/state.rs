@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Result, ensure};
 
+use crate::diagnostics::{self, Context, Stage};
 use crate::model::{Frame, MAX_RESOURCES, RowPatch, Screen};
 
 pub fn frame(
@@ -11,6 +12,14 @@ pub fn frame(
     screen: &Screen,
     base: Option<(u64, &Screen)>,
 ) -> Result<Frame> {
+    let _operation = diagnostics::operation(
+        Stage::FrameDiff,
+        Context {
+            epoch,
+            revision,
+            ..Default::default()
+        },
+    );
     screen.size.validate()?;
     ensure!(
         screen.rows.len() == screen.size.rows as usize,
