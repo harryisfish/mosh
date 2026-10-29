@@ -1653,10 +1653,15 @@ fn verify_wide_padding_provenance() -> Result<()> {
     let logical = |screen: &Screen| {
         let mut text = String::new();
         for row in &screen.rows {
+            let mut x = 0;
             for cell in &row.cells {
+                for _ in x..cell.x {
+                    text.push(' ');
+                }
                 if row.wrap != RowWrap::WidePadding || cell.x != screen.size.cols - 1 {
                     text.push_str(&cell.text);
                 }
+                x = cell.x + u16::from(cell.width);
             }
             if !row.wrap.is_soft() {
                 break;

@@ -701,7 +701,14 @@ impl<W: Write> Display<W> {
                 rows.insert(y);
             }
         }
-        self.writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b[?7l")?;
+        self.writer.write_all(b"\x1b[?2026h\x1b[?25l")?;
+        if reset
+            || !rows.is_empty()
+            || !self.predictions.tokens.is_empty()
+            || !self.status.is_empty()
+        {
+            self.writer.write_all(b"\x1b[?7l")?;
+        }
         if reset {
             self.writer.write_all(b"\x1b[0m\x1b[2J")?;
         }
@@ -718,12 +725,36 @@ impl<W: Write> Display<W> {
             self.writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2K")?;
         }
         for y in rows {
+            let connected = {
+                let soft = |index: u16| {
+                    screen.rows[usize::from(index)].wrap.is_soft()
+                        || self
+                            .screen
+                            .as_ref()
+                            .and_then(|old| old.rows.get(usize::from(index)))
+                            .is_some_and(|row| row.wrap.is_soft())
+                };
+                soft(y) || (y > 0 && soft(y - 1))
+            };
+            let row = &screen.rows[usize::from(y)];
+            let end = if connected {
+                screen.size.cols - u16::from(row.wrap == RowWrap::WidePadding)
+            } else {
+                row.cells
+                    .last()
+                    .map_or(0, |cell| cell.x + u16::from(cell.width))
+            };
+            if end == 0 {
+                continue;
+            }
             cup(&mut self.writer, 0, y)?;
             if y > 0 && screen.rows[usize::from(y - 1)].wrap == RowWrap::WidePadding {
                 self.writer.write_all(b"\x1b[2K")?;
             }
-            self.writer.write_all(b"\x1b[?7h")?;
-            render_row(&mut self.writer, &screen, y)?;
+            if connected {
+                self.writer.write_all(b"\x1b[?7h")?;
+            }
+            render_row(&mut self.writer, &screen, y, end)?;
             match screen.rows[usize::from(y)].wrap {
                 RowWrap::Hard => (),
                 RowWrap::Soft => self.writer.write_all(b" ")?,
@@ -733,7 +764,9 @@ impl<W: Write> Display<W> {
                     self.writer.write_all("界".as_bytes())?;
                 }
             }
-            self.writer.write_all(b"\x1b[?7l")?;
+            if connected {
+                self.writer.write_all(b"\x1b[?7l")?;
+            }
         }
         self.render_graphics(&graphics)?;
         if metadata {
@@ -958,7 +991,7 @@ fn cup(writer: &mut impl Write, x: u16, y: u16) -> Result<()> {
     Ok(())
 }
 
-fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
+fn render_row(writer: &mut impl Write, screen: &Screen, y: u16, end: u16) -> Result<()> {
     let row = screen
         .rows
         .get(usize::from(y))
@@ -966,7 +999,6 @@ fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
     let mut x = 0;
     let mut style = None;
     let blank = Style::default();
-    let end = screen.size.cols - u16::from(row.wrap == RowWrap::WidePadding);
     for cell in &row.cells {
         if cell.x >= end {
             break;

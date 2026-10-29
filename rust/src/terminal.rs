@@ -435,6 +435,21 @@ impl TerminalModel {
                 };
                 cells.push(projected);
             }
+            let blank = Style::default();
+            cells.dedup_by(|next, kept| {
+                let plain_space = |cell: &Cell| {
+                    cell.width == 1
+                        && cell.text == " "
+                        && cell.style == blank
+                        && cell.images.is_empty()
+                };
+                if kept.x + 1 == next.x && plain_space(kept) && plain_space(next) {
+                    kept.x = next.x;
+                    true
+                } else {
+                    false
+                }
+            });
             let row = Row {
                 cells,
                 stable_id: screen.visible_row_to_stable_row(y as i64) as i64,
