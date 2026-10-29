@@ -8,6 +8,7 @@ use quinn::{Connection, Endpoint};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::{self, Context as DiagnosticContext, ProgressSnapshot, Stage};
 use crate::model::*;
 use crate::pty::Pty;
 use crate::state;
@@ -127,6 +128,7 @@ pub struct SessionActor {
     fatal: bool,
     resource_sequence: u64,
     exit_acknowledged: bool,
+    display_cancellations: u64,
 }
 
 impl SessionActor {
@@ -179,6 +181,7 @@ impl SessionActor {
             fatal: false,
             resource_sequence: 0,
             exit_acknowledged: false,
+            display_cancellations: 0,
         })
     }
 
@@ -219,7 +222,31 @@ impl SessionActor {
         let mut timer = tokio::time::interval(Duration::from_millis(16));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buffer = vec![0; 32 * 1024];
+        let mut pty_written_bytes = 0;
         loop {
+            if diagnostics::enabled() {
+                let attachment = self.attachment.as_ref();
+                diagnostics::progress(ProgressSnapshot {
+                    connected: attachment.is_some(),
+                    foreground: true,
+                    attempt: self.attempt,
+                    epoch: self.epoch,
+                    sequence: self.accepted,
+                    committed: self.committed,
+                    revision: self.revision,
+                    pty_queued_bytes: self.queued_bytes as u64,
+                    pty_written_bytes,
+                    event_queue: self.events.len() as u64,
+                    control_queue: attachment.map_or(0, |a| {
+                        (a.output.max_capacity() - a.output.capacity()) as u64
+                    }),
+                    pending_frame: attachment
+                        .filter(|a| a.display.is_some())
+                        .map_or(0, |a| a.last_sent),
+                    cancellations: self.display_cancellations,
+                    ..Default::default()
+                });
+            }
             tokio::select! {
                 event = self.events.recv() => {
                     if let Some(event) = event { self.event(event)?; }
@@ -230,11 +257,13 @@ impl SessionActor {
                 ready = self.pty.io.writable(), if !self.writes.is_empty() && self.exit.is_none() => {
                     let mut ready = ready?;
                     let write = self.writes.front_mut().expect("pending write");
+                    let _operation = diagnostics::operation(Stage::PtyWrite, DiagnosticContext { attempt: self.attempt, epoch: self.epoch, sequence: write.input.unwrap_or(0), bytes: (write.bytes.len() - write.position) as u64, ..Default::default() });
                     let result = ready.try_io(|fd| Pty::write(fd.get_ref(), &write.bytes[write.position..]));
                     match result {
                         Ok(Ok(0)) => bail!("PTY accepted an empty write"),
                         Ok(Ok(count)) => {
                             write.position += count;
+                            pty_written_bytes += count as u64;
                             self.queued_bytes -= count;
                             if write.position == write.bytes.len() { self.finish_write(); }
                         }
@@ -250,6 +279,7 @@ impl SessionActor {
                         Ok(Ok(count)) => {
                             self.last_output = Instant::now();
                             self.echo_through = self.committed;
+                            let _operation = diagnostics::operation(Stage::TerminalParse, DiagnosticContext { attempt: self.attempt, epoch: self.epoch, bytes: count as u64, ..Default::default() });
                             let change = self.terminal.advance(&buffer[..count])?;
                             self.change(change)?;
                             self.dirty = true;
@@ -528,6 +558,15 @@ impl SessionActor {
     }
 
     fn input(&mut self, record: InputRecord) -> Result<()> {
+        let _operation = diagnostics::operation(
+            Stage::InputEncode,
+            DiagnosticContext {
+                attempt: self.attempt,
+                epoch: self.epoch,
+                sequence: record.seq,
+                ..Default::default()
+            },
+        );
         record.event.validate()?;
         if self.exit.is_some() {
             return Ok(());
@@ -659,6 +698,7 @@ impl SessionActor {
             .as_ref()
             .is_some_and(|attachment| attachment.output.try_send(message).is_err())
         {
+            diagnostics::queue_full();
             self.disconnect();
         }
     }
@@ -703,6 +743,15 @@ impl SessionActor {
         if self.dirty
             && (self.publish_allowed || self.last_output.elapsed() > Duration::from_millis(150))
         {
+            let _operation = diagnostics::operation(
+                Stage::Snapshot,
+                DiagnosticContext {
+                    attempt: self.attempt,
+                    epoch: self.epoch,
+                    revision: self.revision + 1,
+                    ..Default::default()
+                },
+            );
             let mut screen = self.terminal.snapshot()?;
             screen.prediction.echo_enabled = self.pty.echo_enabled();
             self.latest = Some(Arc::new(screen));
@@ -815,6 +864,7 @@ impl SessionActor {
                 if let Some(task) = attachment.display.take() {
                     task.abort();
                     attachment.cancellations = attachment.cancellations.saturating_add(1);
+                    self.display_cancellations += 1;
                 }
                 attachment.sent.insert(self.revision, screen.clone());
                 while attachment.sent.len() > 2 {
@@ -976,6 +1026,13 @@ async fn serve_connection(connection: Connection, sender: mpsc::Sender<Event>) -
     let writer_connection = connection.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = receive.recv().await {
+            let _operation = diagnostics::operation(
+                Stage::ControlSend,
+                DiagnosticContext {
+                    epoch,
+                    ..Default::default()
+                },
+            );
             if !matches!(
                 tokio::time::timeout(
                     Duration::from_secs(10),
@@ -991,6 +1048,13 @@ async fn serve_connection(connection: Connection, sender: mpsc::Sender<Event>) -
     });
     let result = async {
         while let Some(message) = transport::recv_message(&mut input).await? {
+            let _operation = diagnostics::operation(
+                Stage::EventQueueSend,
+                DiagnosticContext {
+                    epoch,
+                    ..Default::default()
+                },
+            );
             sender.send(Event::Message { epoch, message }).await?;
         }
         Result::<()>::Ok(())
