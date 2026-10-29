@@ -964,10 +964,10 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
-def verify_combining(bin_dir, temporary, evidence_dir=None):
+def verify_combining(bin_dir, temporary, evidence_dir=None, core_example=None):
     script = str(Path(__file__).resolve())
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
-    replay = bin_dir / "examples" / "verify_core"
+    replay = core_example or (bin_dir / "examples" / "verify_core")
     assert replay.is_file(), "build the verify_core example before CLI combining verification"
     run = evidence_dir / "combining" if evidence_dir is not None else Path(temporary) / "combining-evidence"
     run.mkdir(parents=True, exist_ok=True)
@@ -1019,10 +1019,10 @@ def verify_combining(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
-def verify_soft_wrap(bin_dir, temporary, evidence_dir=None):
+def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None):
     script = str(Path(__file__).resolve())
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
-    replay = bin_dir / "examples" / "verify_display"
+    replay = display_example or (bin_dir / "examples" / "verify_display")
     assert replay.is_file(), "build verify_display before CLI soft-wrap verification"
     run = evidence_dir / "soft-wrap" if evidence_dir is not None else Path(temporary) / "soft-wrap-evidence"
     run.mkdir(parents=True, exist_ok=True)
@@ -1513,7 +1513,7 @@ def verify_liveness(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
-def verify(bin_dir, network, evidence_dir=None, display_example=None):
+def verify(bin_dir, network, evidence_dir=None, display_example=None, core_example=None):
     script = str(Path(__file__).resolve())
     client = str(bin_dir / "mosh-rs")
     server = str(bin_dir / "mosh-rs-server")
@@ -1613,8 +1613,8 @@ else:
         print("CLI running background clients exit on TERM/HUP without touching the terminal or ending the remote command", flush=True)
 
         if network:
-            verify_soft_wrap(bin_dir, temporary, evidence_dir)
-            verify_combining(bin_dir, temporary, evidence_dir)
+            verify_soft_wrap(bin_dir, temporary, evidence_dir, display_example)
+            verify_combining(bin_dir, temporary, evidence_dir, core_example)
             verify_legacy_input(bin_dir, temporary, evidence_dir)
             verify_redraw(bin_dir, temporary, evidence_dir, display_example)
             state = str(Path(temporary) / "network.json")
@@ -2053,6 +2053,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
     parser.add_argument("--display-example", type=Path, help="path to the verify_display example used by redraw verification")
+    parser.add_argument("--core-example", type=Path, help="path to the verify_core example used by combining verification")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
     parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
@@ -2064,10 +2065,12 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     if arguments.soft_wrap:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-soft-wrap-") as temporary:
-            verify_soft_wrap(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
+            verify_soft_wrap(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
+                             arguments.display_example.resolve() if arguments.display_example else None)
     elif arguments.combining:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-combining-") as temporary:
-            verify_combining(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
+            verify_combining(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
+                             arguments.core_example.resolve() if arguments.core_example else None)
     elif arguments.redraw:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-redraw-") as temporary:
             verify_redraw(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
@@ -2083,4 +2086,5 @@ if __name__ == "__main__":
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
     else:
         verify(arguments.bin_dir.resolve(), arguments.network, arguments.evidence_dir,
-               arguments.display_example.resolve() if arguments.display_example else None)
+               arguments.display_example.resolve() if arguments.display_example else None,
+               arguments.core_example.resolve() if arguments.core_example else None)

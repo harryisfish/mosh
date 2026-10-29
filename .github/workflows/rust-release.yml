@@ -102,6 +102,7 @@ jobs:
           python3 scripts/verify-rust-cli.py \
             --bin-dir "$RUNNER_TEMP/$package/bin" \
             --display-example "$PWD/target/$RELEASE_TARGET/release/examples/verify_display" \
+            --core-example "$PWD/target/$RELEASE_TARGET/release/examples/verify_core" \
             --network
       - name: Install nFPM
         if: endsWith(matrix.target, '-musl')
