@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use mosh_rs::client::{self, ClientOptions};
+use mosh_rs::diagnostics::{self, Role};
 use mosh_rs::display::{Graphics, PredictionPolicy};
 use mosh_rs::input::LocalTerminal;
 use mosh_rs::model::{BootstrapRequest, PROTOCOL_VERSION, valid_locale_name};
@@ -57,6 +58,9 @@ struct Args {
     /// Allow remote programs to request the local clipboard.
     #[arg(long)]
     clipboard_read: bool,
+    /// Record bounded diagnostics on both endpoints without terminal contents.
+    #[arg(long)]
+    diagnostics: bool,
     /// Program and literal arguments. Omit to start a login shell.
     #[arg(last = true)]
     command: Vec<String>,
@@ -81,6 +85,14 @@ async fn run() -> Result<i32> {
         !(args.local && args.target.is_some()),
         "--local does not take an SSH target"
     );
+    let _diagnostics = if args.diagnostics {
+        let path = diagnostics::create_path(Role::Client)?;
+        let monitor = diagnostics::start(Role::Client, &path)?;
+        eprintln!("mosh-rs: diagnostics: {}", path.display());
+        Some(monitor)
+    } else {
+        None
+    };
     let size = LocalTerminal::size().context("a local terminal is required")?;
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {

@@ -26,6 +26,7 @@ import tty
 
 RAW_NETWORK_INPUT = b"impaired-" + b"x" * 8192 + b"\r"
 ATOMIC_SECOND_PASTE_BYTES = 128 * 1024 - 24 - 98
+DIAGNOSTIC_FILES = set()
 GRANT_BEGIN = b"\x1eMOSH-RS-GRANT\n"
 GRANT_END = b"\x1eMOSH-RS-GRANT-END\n"
 SSH_LITERAL_ARG = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line"
@@ -149,6 +150,23 @@ def remote_fixture(mode, state):
         while os.read(0, 1):
             pass
         return 0
+    if mode == "diagnostic-idle":
+        os.write(1, b"DIAGNOSTIC_IDLE_READY\r\n")
+        exact(b"finish\r")
+        return 0
+    if mode == "diagnostic-flood":
+        os.write(1, b"DIAGNOSTIC_FLOOD_READY\r\n")
+        exact(b"start\r")
+        received = bytearray()
+        counter = 0
+        while b"stop\r" not in received:
+            if select.select([0], [], [], 0)[0]:
+                received.extend(os.read(0, 4096))
+            os.write(1, (f"{counter:016x} " + "D" * 64 + "\r\n").encode() * 8)
+            counter += 1
+            time.sleep(0.001)
+        os.write(1, b"\r\nDIAGNOSTIC_FLOOD_DONE\r\n")
+        return 0
     if mode == "job":
         os.write(1, b"\x1b[2J\x1b[H\x1b[?5h\x1b]2;JOB_TITLE\x1b\\\x1b]7;file:///tmp/mosh-job\x1b\\"
                     b"\x1b]133;A\x1b\\\x07\x1b]52;c;am9i\x1b\\"
@@ -265,7 +283,9 @@ def proxy_bootstrap(server, state):
     request = json.loads(sys.stdin.buffer.readline())
     request["bind"] = "127.0.0.1"
     request = (json.dumps(request) + "\n").encode()
-    result = subprocess.run([server, "bootstrap"], input=request, stdout=subprocess.PIPE, check=True)
+    diagnostic_args = ["--diagnostics"] if "--diagnostics" in sys.argv else []
+    result = subprocess.run([server, "bootstrap", *diagnostic_args], input=request,
+                            stdout=subprocess.PIPE, check=True)
     grant = decode_grant(result.stdout)
     if Path(state + ".drop").exists():
         assert not Path(state).exists(), "server bootstrap spawned a command before publishing its grant"
@@ -377,6 +397,7 @@ class TerminalProcess:
         self.saved = termios.tcgetattr(self.slave)
         self.output = bytearray()
         self.closing = False
+        self.diagnostic_files = set()
         environment = dict(os.environ, TERM="xterm-kitty", COLORTERM="truecolor")
         environment.update(extra_env or {})
 
@@ -412,6 +433,9 @@ class TerminalProcess:
             except OSError:
                 data = b""
             self.output.extend(data)
+            for match in re.finditer(rb"mosh-rs(?:-server)?: diagnostics: ([^\r\n]+)[\r\n]", self.output[-8192:]):
+                self.diagnostic_files.add(Path(os.fsdecode(match[1])))
+            DIAGNOSTIC_FILES.update(self.diagnostic_files)
         if self.closing:
             self.output = self.output[-4096:]
         else:
@@ -1268,10 +1292,95 @@ def verify_liveness(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
-def verify(bin_dir, network, evidence_dir=None, display_example=None):
+def read_diagnostics(paths):
+    records = []
+    for path in paths:
+        data = path.read_bytes()
+        lines = data.splitlines(keepends=True)
+        records.extend(json.loads(line) for line in lines if line.endswith(b"\n"))
+    return records
+
+
+def verify_diagnostics(client, server, script, temporary):
+    prefix = [client, "--diagnostics", "--local", "--server", server, "--predict", "never", "--"]
+    state = str(Path(temporary) / "diagnostic-idle.json")
+    process = TerminalProcess(prefix + [sys.executable, script, "--remote", "diagnostic-idle", state])
+    try:
+        process.until(b"DIAGNOSTIC_IDLE_READY")
+        assert len(process.diagnostic_files) == 2, process.diagnostic_files
+        deadline = time.monotonic() + 1.7
+        while time.monotonic() < deadline:
+            process.pump()
+        records = read_diagnostics(process.diagnostic_files)
+        assert {record["role"] for record in records} == {"client", "server"}, records
+        assert not any(record["event"] == "waiting" for record in records), records
+        process.send(b"finish\r")
+        process.finish(0)
+    finally:
+        process.close()
+        cleanup(state)
+
+    state = str(Path(temporary) / "diagnostic-flood.json")
+    process = TerminalProcess(prefix + [sys.executable, script, "--remote", "diagnostic-flood", state])
+    try:
+        process.until(b"DIAGNOSTIC_FLOOD_READY")
+        process.send(b"start\r")
+        deadline = time.monotonic() + 10
+        waiting = []
+        while not waiting:
+            assert process.process.poll() is None, "client exited during blocked terminal output"
+            waiting = [record for record in read_diagnostics(process.diagnostic_files)
+                       if record["role"] == "client" and record["event"] == "waiting"
+                       and record.get("stage") in {"tty_write", "tty_flush"}]
+            assert time.monotonic() < deadline, "no live diagnostic while terminal output was blocked"
+            time.sleep(0.05)
+        assert waiting[0]["duration_ms"] >= 1000, waiting[0]
+        assert waiting[0]["progress"]["epoch"] > 0, waiting[0]
+        process.send(b"stop\r")
+        process.until(b"DIAGNOSTIC_FLOOD_DONE")
+        process.finish(0)
+        records = read_diagnostics(process.diagnostic_files)
+        assert any(record["event"] == "resumed" and record.get("stage") in {"tty_write", "tty_flush"}
+                   for record in records), "no recovery diagnostic after draining terminal output"
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI diagnostics observed a blocked terminal before release, recovery and healthy idle", flush=True)
+
+
+def check_diagnostics(evidence_dir):
+    assert DIAGNOSTIC_FILES, "no diagnostic paths were reported"
+    records = read_diagnostics(DIAGNOSTIC_FILES)
+    assert {record["role"] for record in records} == {"client", "server"}
+    for record in records:
+        assert record["schema"] == 1, record
+        assert isinstance(record["pid"], int) and record["pid"] > 0, record
+        assert record["elapsed_ms"] >= 0, record
+        assert record["event"] in {"start", "summary", "waiting", "resumed", "transition",
+                                   "slow", "queue_full", "stop", "budget_exhausted"}, record
+        if "context" in record:
+            assert set(record["context"]) <= {"attempt", "epoch", "sequence", "revision", "bytes"}, record
+            assert all(isinstance(value, int) and value >= 0 for value in record["context"].values()), record
+    forbidden = [b"DIAGNOSTIC_IDLE_READY", b"DIAGNOSTIC_FLOOD", b"NETWORK_BURST_OK",
+                 b"READY_CLI", b"literal ' quotes", b"local-clipboard", b"am9i", RAW_NETWORK_INPUT[:-1]]
+    for path in DIAGNOSTIC_FILES:
+        data = path.read_bytes()
+        assert path.stat().st_mode & 0o777 == 0o600, path
+        assert path.parent.stat().st_mode & 0o777 == 0o700, path.parent
+        assert len(data) <= 16 * 1024 * 1024, path
+        assert all(value not in data for value in forbidden), path
+        if evidence_dir is not None:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            (evidence_dir / f"{path.parent.name}-{path.name}").write_bytes(data)
+    print(f"CLI diagnostics schema, privacy and file bounds passed for {len(DIAGNOSTIC_FILES)} files", flush=True)
+
+
+def verify(bin_dir, network, diagnostics=False, evidence_dir=None, display_example=None):
+    DIAGNOSTIC_FILES.clear()
     script = str(Path(__file__).resolve())
     client = str(bin_dir / "mosh-rs")
     server = str(bin_dir / "mosh-rs-server")
+    diagnostic_args = ["--diagnostics"] if diagnostics else []
     with tempfile.TemporaryDirectory(prefix="mosh-rs-cli-") as temporary:
         verify_delayed_spawn(bin_dir, temporary)
         verify_failed_spawn(bin_dir, temporary)
@@ -1280,7 +1389,7 @@ def verify(bin_dir, network, evidence_dir=None, display_example=None):
         verify_failed_locale(bin_dir, temporary)
         verify_prediction(bin_dir, temporary)
         state = str(Path(temporary) / "session.json")
-        prefix = [client, "--local", "--server", server, "--graphics", "kitty", "--clipboard-read", "--"]
+        prefix = [client, *diagnostic_args, "--local", "--server", server, "--graphics", "kitty", "--clipboard-read", "--"]
         process = TerminalProcess(prefix + [sys.executable, script, "--remote", "modern", state,
                                              "literal ' quotes $HOME $(printf unsafe) ; &"])
         try:
@@ -1330,7 +1439,7 @@ else:
         shim.chmod(0o700)
         state = str(Path(temporary) / "ssh-bind.json")
         process = TerminalProcess(
-            [client, "--server", server, "--bind", "127.0.0.1", "fixture", "--",
+            [client, *diagnostic_args, "--server", server, "--bind", "127.0.0.1", "fixture", "--",
              sys.executable, script, "--remote", "ssh-argv", state, SSH_LITERAL_ARG],
             {"PATH": temporary + os.pathsep + os.environ["PATH"],
              "SSH_CONNECTION": "192.0.2.1 40000 ::1 22"})
@@ -1344,7 +1453,7 @@ else:
         finally:
             process.close()
             cleanup(state)
-        print("CLI explicit bind, fragmented grant, SSH banners/stderr, and literal multiline argv passed through a local SSH shim", flush=True)
+        print("CLI explicit bind, framed grant, SSH banners/stderr, and literal multiline argv passed through a local SSH shim", flush=True)
 
         for suffix, prefix_bytes in [("legacy", b"\x1e"), ("kitty", b"\x1b[94;5u\x1b[94;5:3u")]:
             state = str(Path(temporary) / f"detach-{suffix}.json")
@@ -1372,9 +1481,9 @@ else:
             verify_redraw(bin_dir, temporary, evidence_dir, display_example)
             state = str(Path(temporary) / "network.json")
             wrapper = Path(temporary) / "bootstrap-proxy"
-            wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+            wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}+sys.argv[1:]\nrunpy.run_path({script!r},run_name='__main__')\n")
             wrapper.chmod(0o700)
-            process = TerminalProcess([client, "--local", "--server", str(wrapper), "--predict", "never", "--",
+            process = TerminalProcess([client, *diagnostic_args, "--local", "--server", str(wrapper), "--predict", "never", "--",
                                        sys.executable, script, "--remote", "network", state])
             try:
                 def set_profile(profile):
@@ -1420,6 +1529,9 @@ else:
             print("CLI recovered through a UDP outage with queued input applied once and the original command still running", flush=True)
             verify_saturated_input(bin_dir, temporary)
             verify_liveness(bin_dir, temporary, evidence_dir)
+        if diagnostics:
+            verify_diagnostics(client, server, script, temporary)
+            check_diagnostics(evidence_dir)
 
 
 def verify_delayed_spawn(bin_dir, temporary):
@@ -1812,6 +1924,7 @@ if __name__ == "__main__":
     parser.add_argument("--redraw", action="store_true", help="exercise cached Ctrl-L redraw, key identity, images, effects and rejected input")
     parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
+    parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
     arguments = parser.parse_args()
     if arguments.redraw:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-redraw-") as temporary:
@@ -1827,5 +1940,5 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory(prefix="mosh-rs-saturated-") as temporary:
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
     else:
-        verify(arguments.bin_dir.resolve(), arguments.network, arguments.evidence_dir,
+        verify(arguments.bin_dir.resolve(), arguments.network, arguments.diagnostics, arguments.evidence_dir,
                arguments.display_example.resolve() if arguments.display_example else None)
