@@ -358,7 +358,7 @@ async fn pair(
 #[tokio::main]
 async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
-        Some("bootstrap") => return spawn_worker().await,
+        Some("bootstrap") => return spawn_worker(false).await,
         Some("worker") => return worker().await,
         _ => (),
     }
