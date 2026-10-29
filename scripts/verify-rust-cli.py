@@ -1665,6 +1665,4 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory(prefix="mosh-rs-saturated-") as temporary:
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
     else:
-        if arguments.evidence_dir is not None and not arguments.diagnostics:
-            parser.error("--evidence-dir requires --diagnostics")
         verify(arguments.bin_dir.resolve(), arguments.network, arguments.diagnostics, arguments.evidence_dir)
