@@ -78,7 +78,7 @@ fn frame(revision: u64, base: Option<u64>, resources: Vec<ResourceMeta>) -> Fram
                 row: Row {
                     cells: Vec::new(),
                     stable_id: i64::from(y),
-                    soft_wrapped: false,
+                    wrap: RowWrap::Hard,
                 },
             })
             .collect(),
@@ -864,7 +864,7 @@ fn verify_render(graphics: Graphics) -> Result<()> {
         row: Row {
             cells: vec![cell(8, "Y", 1)],
             stable_id: 1,
-            soft_wrapped: false,
+            wrap: RowWrap::Hard,
         },
     }];
     assert!(display.install(&second, &resources)?);
@@ -1038,7 +1038,7 @@ fn verify_prediction_modes() -> Result<()> {
                     .map(|(x, ch)| cell(x as u16 + 8, &ch.to_string(), 1))
                     .collect(),
                 stable_id: 1,
-                soft_wrapped: false,
+                wrap: RowWrap::Hard,
             },
         }];
         assert!(display.install(&current, &BTreeMap::new())?);
@@ -1882,10 +1882,20 @@ impl SoftDisplay {
             actual
                 .rows
                 .iter()
-                .map(|row| row.soft_wrapped)
+                .map(|row| row.wrap.is_soft())
                 .collect::<Vec<_>>(),
             wraps,
             "{label}: wrap"
+        );
+        assert_eq!(
+            actual.rows.iter().map(|row| row.wrap).collect::<Vec<_>>(),
+            expected
+                .rows
+                .iter()
+                .zip(wraps)
+                .map(|(row, soft)| { if *soft { row.wrap } else { RowWrap::Hard } })
+                .collect::<Vec<_>>(),
+            "{label}: wrap provenance"
         );
         assert_eq!(
             (actual.cursor.x, actual.cursor.y),
@@ -1927,7 +1937,7 @@ fn verify_soft_wrap() -> Result<()> {
             screen
                 .rows
                 .iter()
-                .map(|row| row.soft_wrapped)
+                .map(|row| row.wrap.is_soft())
                 .collect::<Vec<_>>(),
             wraps
         );
@@ -1942,7 +1952,7 @@ fn verify_soft_wrap() -> Result<()> {
             hard.advance(chunk)?;
         }
         let screen = hard.snapshot()?;
-        assert!(screen.rows.iter().all(|row| !row.soft_wrapped));
+        assert!(screen.rows.iter().all(|row| !row.wrap.is_soft()));
         view.install(&screen)?;
         view.check(&format!("url-hard-{cols}"), &screen, &[false; 8])?;
     }
@@ -1956,6 +1966,30 @@ fn verify_soft_wrap() -> Result<()> {
             vec![true, false, false, false],
         ),
         ("wide-padding", 4, "abc界Z", vec![true, false, false, false]),
+        (
+            "wide-padding-color",
+            4,
+            "abc\x1b[44m界Z",
+            vec![true, false, false, false],
+        ),
+        (
+            "wide-padding-real-space",
+            4,
+            "abc 界Z",
+            vec![true, false, false, false],
+        ),
+        (
+            "wide-padding-overwrite",
+            4,
+            "abc界Z\x1b[1;4H ",
+            vec![true, false, false, false],
+        ),
+        (
+            "wide-padding-narrow-successor",
+            4,
+            "abc界Z\x1b[2;1H\x1b[2KAZ",
+            vec![true, false, false, false],
+        ),
         ("one-column", 1, "ABC", vec![true, true, false, false]),
         ("two-columns", 2, "界界Z", vec![true, true, false, false]),
         (
@@ -1985,7 +2019,7 @@ fn verify_soft_wrap() -> Result<()> {
             screen
                 .rows
                 .iter()
-                .map(|row| row.soft_wrapped)
+                .map(|row| row.wrap.is_soft())
                 .collect::<Vec<_>>(),
             wraps,
             "{label}: source"
@@ -1996,6 +2030,90 @@ fn verify_soft_wrap() -> Result<()> {
         view.display.redraw_cached(size)?;
         view.check(&format!("{label}-cached"), &screen, &wraps)?;
     }
+    let size = soft_size(4, 4);
+    let mut source = TerminalModel::new(size, false)?;
+    source.advance("abc\x1b[48;2;17;34;51m界Z".as_bytes())?;
+    let mut screen = source.snapshot()?;
+    assert_eq!(screen.rows[0].wrap, RowWrap::WidePadding);
+    assert_eq!(
+        screen.rows[0].cells.last().unwrap().style.bg,
+        Color::Rgb([17, 34, 51])
+    );
+    let mut view = SoftDisplay::new(size)?;
+    view.install(&screen)?;
+    view.check(
+        "padding-color-initial",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    source.advance(b"\x1b[2;1H\x1b[2KAZ")?;
+    screen = source.snapshot()?;
+    assert_eq!(screen.rows[0].wrap, RowWrap::WidePadding);
+    let delta = view.install(&screen)?;
+    assert_eq!(
+        delta.rows.iter().map(|row| row.y).collect::<Vec<_>>(),
+        vec![1]
+    );
+    view.check(
+        "padding-narrow-delta",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    view.display.redraw_cached(size)?;
+    view.check(
+        "padding-narrow-cached",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    source.advance(b"\x1b[1;4H ")?;
+    screen = source.snapshot()?;
+    assert_eq!(screen.rows[0].wrap, RowWrap::Soft);
+    view.install(&screen)?;
+    view.check(
+        "padding-to-user-space",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    let mut clipped = SoftDisplay::new(soft_size(3, 4))?;
+    clipped.install(&source.snapshot()?)?;
+    clipped.check("padding-clipped", &screen, &[false; 4])?;
+    let deletion_size = soft_size(16, 6);
+    let mut deletion = TerminalModel::new(deletion_size, false)?;
+    deletion.advance("\x1b[4;1Hhttps://e.test/界Z".as_bytes())?;
+    let mut deletion_view = SoftDisplay::new(deletion_size)?;
+    deletion_view.install(&deletion.snapshot()?)?;
+    deletion_view.check(
+        "partial-delete-initial",
+        &deletion.snapshot()?,
+        &[false, false, false, true, false, false],
+    )?;
+    deletion.advance(b"\x1b[?69h\x1b[1;4s\x1b[4;1H\x1b[P\x1b[?69l")?;
+    let deleted = deletion.snapshot()?;
+    assert_eq!(deleted.rows[3].wrap, RowWrap::Hard);
+    let delta = deletion_view.install(&deleted)?;
+    assert_eq!(delta.rows.len(), 1);
+    assert_eq!(delta.rows[0].y, 3);
+    deletion_view.check("partial-delete-hard", &deleted, &[false; 6])?;
+    let mut insertion = TerminalModel::new(deletion_size, false)?;
+    insertion.advance("\x1b[4;1Hhttps://e.test/界Z".as_bytes())?;
+    let mut insertion_view = SoftDisplay::new(deletion_size)?;
+    insertion_view.install(&insertion.snapshot()?)?;
+    insertion_view.check(
+        "partial-insert-initial",
+        &insertion.snapshot()?,
+        &[false, false, false, true, false, false],
+    )?;
+    insertion.advance(b"\x1b[?69h\x1b[1;4s\x1b[4;2H\x1b[@\x1b[?69l")?;
+    let inserted = insertion.snapshot()?;
+    assert_eq!(inserted.rows[3].wrap, RowWrap::WidePadding);
+    let delta = insertion_view.install(&inserted)?;
+    assert_eq!(delta.rows.len(), 1);
+    assert_eq!(delta.rows[0].y, 3);
+    insertion_view.check(
+        "partial-insert-keeps-padding",
+        &inserted,
+        &[false, false, false, true, false, false],
+    )?;
     let size = soft_size(8, 4);
     let mut source = TerminalModel::new(size, false)?;
     source.advance(b"abcdefghijklmnopq\x1b[2;2H")?;
@@ -2006,7 +2124,7 @@ fn verify_soft_wrap() -> Result<()> {
     view.install(&screen)?;
     view.check("delta-initial", &screen, &[true, true, false, false])?;
     for soft in [false, true] {
-        screen.rows[0].soft_wrapped = soft;
+        screen.rows[0].wrap = if soft { RowWrap::Soft } else { RowWrap::Hard };
         let delta = view.install(&screen)?;
         assert_eq!(delta.rows.len(), 1);
         assert_eq!(delta.rows[0].y, 0);
@@ -2063,7 +2181,7 @@ fn verify_soft_wrap() -> Result<()> {
         };
     }
     view.check("status-on", &status, &[false, true, false, false])?;
-    assert!(view.display.screen().unwrap().rows[0].soft_wrapped);
+    assert!(view.display.screen().unwrap().rows[0].wrap.is_soft());
     view.display.write_status("")?;
     view.check("status-off", &screen, &[true, true, false, false])?;
     for cols in [6, 10, 8] {
@@ -2129,11 +2247,11 @@ fn verify_soft_wrap() -> Result<()> {
     let mut synthetic = screen.clone();
     synthetic.rows[0].cells = vec![cell(2, "G", 1)];
     synthetic.rows[1].cells.clear();
-    synthetic.rows[3].soft_wrapped = true;
+    synthetic.rows[3].wrap = RowWrap::Soft;
     let mut view = SoftDisplay::new(size)?;
     view.install(&synthetic)?;
     view.check("gap-short-bottom", &synthetic, &[true, true, false, false])?;
-    assert!(view.display.screen().unwrap().rows[3].soft_wrapped);
+    assert!(view.display.screen().unwrap().rows[3].wrap.is_soft());
     let mut wide = TerminalModel::new(size, false)?;
     wide.advance("123456界Z".as_bytes())?;
     let wide = wide.snapshot()?;
@@ -2203,7 +2321,7 @@ fn verify_soft_wrap() -> Result<()> {
             actual
                 .rows
                 .iter()
-                .map(|row| row.soft_wrapped)
+                .map(|row| row.wrap.is_soft())
                 .collect::<Vec<_>>(),
             vec![true, true, false, false]
         );
@@ -2328,7 +2446,7 @@ fn verify_soft_wrap_transcript(arguments: &[String]) -> Result<()> {
         actual
             .rows
             .iter()
-            .map(|row| row.soft_wrapped)
+            .map(|row| row.wrap.is_soft())
             .collect::<Vec<_>>(),
         flags,
         "CLI local wraps"

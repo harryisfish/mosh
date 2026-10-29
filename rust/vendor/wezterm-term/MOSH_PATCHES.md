@@ -139,3 +139,11 @@ UTF-8 boundaries. Integer image tiles cover fractional sampling intervals using
 floor/ceil bounds; non-integral scales may overlap source pixels. Legacy shifted
 symbols use the supplied shifted identity. All image dimension probes apply the
 static format allowlist and decoder limits before constructing a decoder.
+
+Wide-wrap padding carries a dedicated CellAttributes provenance bit supplied by
+Mosh's local cell patch. Printing, edits, scrolling and reflow preserve or clear
+the bit according to its origin. Reflow consumes synthetic columns before
+joining logical lines and creates new padding while placing wide graphemes.
+Cursor placement counts logical columns separately from physical padding; an
+open final logical group is retained. Alternate-screen width changes invalidate
+old padding rather than reviving it on a later resize.

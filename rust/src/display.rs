@@ -414,7 +414,8 @@ impl<W: Write> Display<W> {
             pinned.insert(meta.digest, resource.clone());
         }
         let mut tiles = 0usize;
-        for row in &rows {
+        for (y, row) in rows.iter().enumerate() {
+            row.validate_wrap(frame.size, y as u16)?;
             ensure!(
                 row.cells.len() <= usize::from(frame.size.cols),
                 "too many cells in row"
@@ -653,9 +654,12 @@ impl<W: Write> Display<W> {
         screen.size = self.viewport;
         screen.rows.truncate(usize::from(self.viewport.rows));
         for (y, row) in screen.rows.iter_mut().enumerate() {
-            row.soft_wrapped &= source.size.cols == self.viewport.cols
-                && y + 1 < usize::from(source.size.rows.min(self.viewport.rows))
-                && (y != 0 || self.status.is_empty());
+            if source.size.cols != self.viewport.cols
+                || y + 1 >= usize::from(source.size.rows.min(self.viewport.rows))
+                || (y == 0 && !self.status.is_empty())
+            {
+                row.wrap = RowWrap::Hard;
+            }
             row.cells.retain(|cell| cell.x < self.viewport.cols);
             for cell in &mut row.cells {
                 if cell.x + u16::from(cell.width) > self.viewport.cols {
@@ -679,12 +683,12 @@ impl<W: Write> Display<W> {
                 continue;
             }
             let connected = |y: u16| {
-                screen.rows[usize::from(y)].soft_wrapped
+                screen.rows[usize::from(y)].wrap.is_soft()
                     || self
                         .screen
                         .as_ref()
                         .and_then(|old| old.rows.get(usize::from(y)))
-                        .is_some_and(|row| row.soft_wrapped)
+                        .is_some_and(|row| row.wrap.is_soft())
             };
             let mut y = start;
             while y > 0 && connected(y - 1) {
@@ -715,11 +719,19 @@ impl<W: Write> Display<W> {
         }
         for y in rows {
             cup(&mut self.writer, 0, y)?;
+            if y > 0 && screen.rows[usize::from(y - 1)].wrap == RowWrap::WidePadding {
+                self.writer.write_all(b"\x1b[2K")?;
+            }
             self.writer.write_all(b"\x1b[?7h")?;
             render_row(&mut self.writer, &screen, y)?;
-            if screen.rows[usize::from(y)].soft_wrapped {
-                // An ASCII sentinel consumes wrap without joining adjacent regional indicators.
-                self.writer.write_all(b" ")?;
+            match screen.rows[usize::from(y)].wrap {
+                RowWrap::Hard => (),
+                RowWrap::Soft => self.writer.write_all(b" ")?,
+                RowWrap::WidePadding => {
+                    let padding = screen.rows[usize::from(y)].cells.last().unwrap();
+                    render_style(&mut self.writer, &padding.style)?;
+                    self.writer.write_all("界".as_bytes())?;
+                }
             }
             self.writer.write_all(b"\x1b[?7l")?;
         }
@@ -954,7 +966,11 @@ fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
     let mut x = 0;
     let mut style = None;
     let blank = Style::default();
+    let end = screen.size.cols - u16::from(row.wrap == RowWrap::WidePadding);
     for cell in &row.cells {
+        if cell.x >= end {
+            break;
+        }
         if cell.x > x {
             render_style(writer, &blank)?;
             for _ in x..cell.x {
@@ -969,9 +985,9 @@ fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
         writer.write_all(cell.text.as_bytes())?;
         x = cell.x + u16::from(cell.width);
     }
-    if x < screen.size.cols {
+    if x < end {
         render_style(writer, &blank)?;
-        for _ in x..screen.size.cols {
+        for _ in x..end {
             writer.write_all(b" ")?;
         }
     }

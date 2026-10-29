@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CELL_IMAGES: usize = 4096;
@@ -286,11 +286,40 @@ pub struct Cell {
     pub images: Vec<ImageTile>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RowWrap {
+    #[default]
+    Hard,
+    Soft,
+    WidePadding,
+}
+
+impl RowWrap {
+    pub fn is_soft(self) -> bool {
+        self != Self::Hard
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub stable_id: i64,
-    pub soft_wrapped: bool,
+    pub wrap: RowWrap,
+}
+
+impl Row {
+    pub fn validate_wrap(&self, size: Size, y: u16) -> Result<()> {
+        ensure!(
+            self.wrap != RowWrap::WidePadding
+                || (size.cols >= 2
+                    && y < size.rows.saturating_sub(1)
+                    && self.cells.last().is_some_and(|cell| {
+                        cell.x == size.cols - 1 && cell.width == 1 && cell.text == " "
+                    })),
+            "invalid wide-wrap padding"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

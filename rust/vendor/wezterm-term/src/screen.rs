@@ -48,7 +48,10 @@ pub struct Screen {
 
 pub(crate) fn set_line_wrapped(line: &mut Line, wrapped: bool, seqno: SequenceNo) {
     line.set_last_cell_was_wrapped(wrapped, seqno);
-    let last = line.visible_cells().last().map(|cell| (cell.cell_index(), cell.width()));
+    let last = line
+        .visible_cells()
+        .last()
+        .map(|cell| (cell.cell_index(), cell.width()));
     if let Some((index, width)) = last {
         if width > 1 {
             // The surface getter reads the wide leader; its Vec setter writes the spacer.
@@ -57,6 +60,127 @@ pub(crate) fn set_line_wrapped(line: &mut Line, wrapped: bool, seqno: SequenceNo
             }
         }
     }
+}
+
+fn clear_wide_padding(line: &mut Line, seqno: SequenceNo) {
+    if line
+        .visible_cells()
+        .any(|cell| cell.attrs().wide_wrap_padding())
+    {
+        for cell in line.cells_mut_for_attr_changes_only() {
+            cell.attrs_mut().set_wide_wrap_padding(false);
+        }
+        line.update_last_change_seqno(seqno);
+    }
+}
+
+fn overwrites_wide_padding(line: &Line, x: usize, width: usize) -> bool {
+    line.last_cell_was_wrapped()
+        && line.visible_cells().last().is_some_and(|cell| {
+            cell.attrs().wide_wrap_padding()
+                && x <= cell.cell_index()
+                && cell.cell_index() < x + width
+        })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorAffinity {
+    Position,
+    PendingWrap,
+    Padding,
+}
+
+#[derive(Clone, Copy)]
+struct ReflowAnchor {
+    column: usize,
+    affinity: CursorAffinity,
+}
+
+fn reflow_line(
+    line: Line,
+    columns: usize,
+    seqno: SequenceNo,
+    cursor: Option<ReflowAnchor>,
+) -> (Vec<Line>, Option<(usize, usize)>) {
+    if line.len() <= columns || line.visible_cells().all(|cell| cell.str() == " ") {
+        let position = cursor.map(|anchor| {
+            let row = anchor.column / columns;
+            let column = anchor.column % columns;
+            if row > 0 && column == 0 && anchor.affinity == CursorAffinity::PendingWrap {
+                (columns, row - 1)
+            } else {
+                (column, row)
+            }
+        });
+        return (vec![line], position);
+    }
+    let mut template = line.clone();
+    template.resize(0, seqno);
+    let mut cells: Vec<_> = line.visible_cells().map(|cell| cell.as_cell()).collect();
+    if let Some(last) = cells
+        .iter()
+        .rposition(|cell| cell.str() != " " || cell.attrs() != &CellAttributes::blank())
+    {
+        cells.truncate(last + 1);
+    } else {
+        cells.clear();
+    }
+    let mut lines = vec![template.clone()];
+    let mut x = 0;
+    let mut logical = 0;
+    let mut position = None;
+    for mut cell in cells {
+        let width = cell.width();
+        if x > 0 && x + width > columns {
+            let previous = lines.last_mut().unwrap();
+            if x < columns && width <= columns {
+                let mut padding = cell.attrs().clone();
+                padding.set_wrapped(false).set_wide_wrap_padding(true);
+                previous.set_cell_grapheme(x, " ", 1, padding, seqno);
+            }
+            set_line_wrapped(previous, true, seqno);
+            lines.push(template.clone());
+            x = 0;
+        }
+        if let Some(anchor) = cursor {
+            if position.is_none() && anchor.column >= logical && anchor.column < logical + width {
+                position = Some((x + anchor.column - logical, lines.len() - 1));
+                if anchor.column == logical && x == 0 && lines.len() > 1 {
+                    let previous = &lines[lines.len() - 2];
+                    if anchor.affinity == CursorAffinity::PendingWrap {
+                        position = Some((columns, lines.len() - 2));
+                    } else if anchor.affinity == CursorAffinity::Padding {
+                        if let Some(padding) = previous
+                            .visible_cells()
+                            .find(|c| c.attrs().wide_wrap_padding())
+                        {
+                            position = Some((padding.cell_index(), lines.len() - 2));
+                        }
+                    }
+                }
+            }
+        }
+        cell.attrs_mut()
+            .set_wrapped(false)
+            .set_wide_wrap_padding(false);
+        lines.last_mut().unwrap().set_cell(x, cell, seqno);
+        x += width;
+        logical += width;
+    }
+    if let Some(anchor) = cursor {
+        if position.is_none() {
+            let mut remaining = anchor.column.saturating_sub(logical);
+            while x + remaining > columns
+                || (x + remaining == columns && anchor.affinity == CursorAffinity::Position)
+            {
+                remaining = x + remaining - columns;
+                lines.push(template.clone());
+                x = 0;
+            }
+            position = Some((x + remaining, lines.len() - 1));
+        }
+    }
+    (lines, position)
 }
 
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
@@ -120,12 +244,35 @@ impl Screen {
     ) -> (usize, PhysRowIndex) {
         let mut rewrapped = VecDeque::new();
         let mut logical_line: Option<Line> = None;
-        let mut logical_cursor_x: Option<usize> = None;
+        let mut logical_cursor: Option<ReflowAnchor> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
+        let old_columns = self.physical_cols;
+
+        let flush =
+            |line, cursor, rewrapped: &mut VecDeque<Line>, adjusted_cursor: &mut (usize, usize)| {
+                let (lines, position) = reflow_line(line, physical_cols, seqno, cursor);
+                if let Some((x, y)) = position {
+                    *adjusted_cursor = (x, rewrapped.len() + y);
+                }
+                rewrapped.extend(lines);
+            };
 
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
+            let padding = line
+                .get_cell(old_columns - 1)
+                .filter(|cell| {
+                    was_wrapped
+                        && cell.width() == 1
+                        && cell.str() == " "
+                        && cell.attrs().wide_wrap_padding()
+                })
+                .map(|cell| cell.cell_index());
+            if let Some(index) = padding {
+                line.remove_cell(index, seqno);
+            }
+            clear_wide_padding(&mut line, seqno);
 
             if was_wrapped {
                 set_line_wrapped(&mut line, false, seqno);
@@ -134,13 +281,33 @@ impl Screen {
             let line = match logical_line.take() {
                 None => {
                     if phys_idx == cursor_y {
-                        logical_cursor_x = Some(cursor_x);
+                        logical_cursor = Some(ReflowAnchor {
+                            column: cursor_x
+                                - usize::from(padding.is_some_and(|index| index < cursor_x)),
+                            affinity: if cursor_x == old_columns {
+                                CursorAffinity::PendingWrap
+                            } else if padding == Some(cursor_x) {
+                                CursorAffinity::Padding
+                            } else {
+                                CursorAffinity::Position
+                            },
+                        });
                     }
                     line
                 }
                 Some(mut prior) => {
                     if phys_idx == cursor_y {
-                        logical_cursor_x = Some(cursor_x + prior.len());
+                        logical_cursor = Some(ReflowAnchor {
+                            column: cursor_x + prior.len()
+                                - usize::from(padding.is_some_and(|index| index < cursor_x)),
+                            affinity: if cursor_x == old_columns {
+                                CursorAffinity::PendingWrap
+                            } else if padding == Some(cursor_x) {
+                                CursorAffinity::Padding
+                            } else {
+                                CursorAffinity::Position
+                            },
+                        });
                     }
                     prior.append_line(line, seqno);
                     prior
@@ -152,38 +319,20 @@ impl Screen {
                 continue;
             }
 
-            if let Some(x) = logical_cursor_x.take() {
-                let num_lines = x / physical_cols;
-                let last_x = x - (num_lines * physical_cols);
-                adjusted_cursor = (last_x, rewrapped.len() + num_lines);
-
-                // Special case: if the cursor lands in column zero, we'll
-                // lose track of its logical association with the wrapped
-                // line and it won't resize with the line correctly.
-                // Put it back on the prior line. The cursor is now
-                // technically outside of the viewport width.
-                if adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
-                    if physical_cols < self.physical_cols {
-                        // getting smaller: preserve its original position
-                        // on the prior line
-                        adjusted_cursor.0 = cursor_x;
-                    } else {
-                        // getting larger; we were most likely in column 1
-                        // or somewhere close. Jump to the end of the
-                        // prior line.
-                        adjusted_cursor.0 = physical_cols;
-                    }
-                    adjusted_cursor.1 -= 1;
-                }
-            }
-
-            if line.len() <= physical_cols {
-                rewrapped.push_back(line);
-            } else {
-                for line in line.wrap(physical_cols, seqno) {
-                    rewrapped.push_back(line);
-                }
-            }
+            flush(
+                line,
+                logical_cursor.take(),
+                &mut rewrapped,
+                &mut adjusted_cursor,
+            );
+        }
+        if let Some(line) = logical_line.take() {
+            flush(
+                line,
+                logical_cursor.take(),
+                &mut rewrapped,
+                &mut adjusted_cursor,
+            );
         }
         self.lines = rewrapped;
 
@@ -247,6 +396,7 @@ impl Screen {
                 self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
             } else {
                 for line in &mut self.lines {
+                    clear_wide_padding(line, seqno);
                     if physical_cols < self.physical_cols {
                         // Do a simple prune of the lines instead
                         line.resize(physical_cols, seqno);
@@ -389,6 +539,24 @@ impl Screen {
 
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
+        let moved = x..right_margin;
+        if line
+            .visible_cells()
+            .any(|cell| moved.contains(&cell.cell_index()) && cell.attrs().wide_wrap_padding())
+        {
+            for (column, cell) in line
+                .cells_mut_for_attr_changes_only()
+                .iter_mut()
+                .enumerate()
+            {
+                if moved.contains(&column) {
+                    cell.attrs_mut().set_wide_wrap_padding(false);
+                }
+            }
+        }
+        if right_margin == phys_cols {
+            set_line_wrapped(line, false, seqno);
+        }
         line.update_last_change_seqno(seqno);
         line.insert_cell(x, Cell::default(), right_margin, seqno);
         if line.len() > phys_cols {
@@ -408,6 +576,8 @@ impl Screen {
     ) {
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
+        clear_wide_padding(line, seqno);
+        set_line_wrapped(line, false, seqno);
         line.erase_cell_with_margin(x, right_margin, seqno, blank_attr);
     }
 
@@ -418,7 +588,11 @@ impl Screen {
         //debug!("set_cell x={} y={} phys={} {:?}", x, y, line_idx, cell);
 
         let line = self.line_mut(line_idx);
+        let preserve_wrap = overwrites_wide_padding(line, x, cell.width());
         line.set_cell(x, cell.clone(), seqno);
+        if preserve_wrap {
+            set_line_wrapped(line, true, seqno);
+        }
     }
 
     pub fn set_cell_grapheme(
@@ -432,7 +606,11 @@ impl Screen {
     ) {
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
+        let preserve_wrap = overwrites_wide_padding(line, x, width);
         line.set_cell_grapheme(x, text, width, attr, seqno);
+        if preserve_wrap {
+            set_line_wrapped(line, true, seqno);
+        }
     }
 
     pub fn cell_mut(&mut self, x: usize, y: VisibleRowIndex) -> Option<&mut Cell> {
@@ -580,6 +758,11 @@ impl Screen {
 
         // Need to do the slower, more complex left and right bounded scroll
         let phys_scroll = self.phys_range(scroll_region);
+        for row in phys_scroll.clone() {
+            let line = self.line_mut(row);
+            clear_wide_padding(line, seqno);
+            set_line_wrapped(line, false, seqno);
+        }
 
         // The scroll is really a copy + a clear operation
         let region_height = phys_scroll.end - phys_scroll.start;
@@ -850,6 +1033,11 @@ impl Screen {
 
         // Need to do the slower, more complex left and right bounded scroll
         let phys_scroll = self.phys_range(scroll_region);
+        for row in phys_scroll.clone() {
+            let line = self.line_mut(row);
+            clear_wide_padding(line, seqno);
+            set_line_wrapped(line, false, seqno);
+        }
 
         // The scroll is really a copy + a clear operation
         let region_height = phys_scroll.end - phys_scroll.start;

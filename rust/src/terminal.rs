@@ -438,7 +438,17 @@ impl TerminalModel {
             let row = Row {
                 cells,
                 stable_id: screen.visible_row_to_stable_row(y as i64) as i64,
-                soft_wrapped: line.last_cell_was_wrapped(),
+                wrap: if !line.last_cell_was_wrapped() {
+                    RowWrap::Hard
+                } else if line
+                    .get_cell(usize::from(self.size.cols) - 1)
+                    .is_some_and(|cell| cell.attrs().wide_wrap_padding())
+                    && y + 1 < usize::from(self.size.rows)
+                {
+                    RowWrap::WidePadding
+                } else {
+                    RowWrap::Soft
+                },
             };
             postcard::to_io(&row, &mut encoded_budget)?;
             rows.push(row);

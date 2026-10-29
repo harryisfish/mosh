@@ -2196,7 +2196,7 @@ impl TerminalState {
                 let top_and_bottom_margins = self.top_and_bottom_margins.clone();
 
                 // Resolve the source cell.  It may be a double-wide character.
-                let cell = {
+                let mut cell = {
                     let screen = self.screen_mut();
                     let to_copy = x.saturating_sub(1);
                     let line_idx = screen.phys_row(y);
@@ -2221,6 +2221,7 @@ impl TerminalState {
                     }
                 };
 
+                cell.attrs_mut().set_wide_wrap_padding(false);
                 for _ in 0..n {
                     {
                         let screen = self.screen_mut();

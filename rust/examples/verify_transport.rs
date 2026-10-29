@@ -8,7 +8,7 @@ use mosh_rs::model::{
     Attach, BootstrapRequest, ClientMessage, Cursor as ScreenCursor, Effect, EffectKind, Frame,
     Grant, InputEvent, InputRecord, Key, KeyCode, KeyPhase, MAX_CONTROL, MAX_EFFECTS, MAX_FRAME,
     MAX_LOCALE_CANDIDATES, Mouse, MouseKind, PROTOCOL_VERSION, PredictionContext, Resource,
-    ResourceMeta, Row, RowPatch, ServerMessage, Size, resource_digest,
+    ResourceMeta, Row, RowPatch, RowWrap, ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
     ClientEndpoints, ClientIdentity, EncodedFrame, Incoming, ServerListeners, bootstrap_local,
@@ -380,7 +380,7 @@ async fn main() -> Result<()> {
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, protocol v6, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v7, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
     );
     Ok(())
 }
@@ -849,7 +849,7 @@ async fn verify() -> Result<()> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
     ensure!(
-        handshake.protocol.as_deref() == Some(&b"mosh-rs/6"[..]),
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/7"[..]),
         "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");
@@ -990,7 +990,14 @@ async fn verify() -> Result<()> {
     cancelled.write_all(b"incomplete frame").await?;
     cancelled.reset(VarInt::from_u32(0x10))?;
     let mut wrapped_frame = frame();
-    wrapped_frame.rows[0].row.soft_wrapped = true;
+    wrapped_frame.rows[0].row.wrap = RowWrap::WidePadding;
+    wrapped_frame.rows[0].row.cells.push(mosh_rs::model::Cell {
+        x: 19,
+        text: " ".into(),
+        width: 1,
+        style: Default::default(),
+        images: Vec::new(),
+    });
     let frame_sender = tokio::spawn({
         let connection = server_connection.clone();
         let frame = wrapped_frame.clone();
@@ -1000,7 +1007,7 @@ async fn verify() -> Result<()> {
         anyhow::bail!("superseded stream prevented next frame");
     };
     ensure!(
-        received.rows[0].row.soft_wrapped
+        received.rows[0].row.wrap == RowWrap::WidePadding
             && postcard::to_allocvec(&received)? == postcard::to_allocvec(&wrapped_frame)?,
         "soft-wrapped checkpoint changed in transit"
     );
@@ -1008,7 +1015,7 @@ async fn verify() -> Result<()> {
     wrapped_frame.base = Some(1);
     wrapped_frame.revision = 2;
     wrapped_frame.rows.truncate(1);
-    wrapped_frame.rows[0].row.soft_wrapped = false;
+    wrapped_frame.rows[0].row.wrap = RowWrap::Hard;
     let frame_sender = tokio::spawn({
         let connection = server_connection.clone();
         let frame = wrapped_frame.clone();

@@ -2443,8 +2443,6 @@ dependencies = [
 [[package]]
 name = "tattoy-wezterm-cell"
 version = "0.1.0-1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db5ac261e627d60b003c5ee85f9954b532fc7107f5297576029b85189441e7c4"
 dependencies = [
  "finl_unicode",
  "image",
