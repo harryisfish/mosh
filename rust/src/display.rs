@@ -248,7 +248,7 @@ impl<W: Write> Display<W> {
         let mut screen = self.assemble(frame, resources)?;
         let graphics = prepare_graphics(&screen, self.graphics)?;
         let stamp = PredictionStamp::from(screen.prediction);
-        let mode_changed = self.predictions.remote.is_some_and(|old| old != stamp);
+        let mode_changed = self.predictions.remote != Some(stamp);
         let mut repaint = BTreeSet::new();
         for token in &self.predictions.tokens {
             if token.shown {
@@ -509,7 +509,8 @@ impl<W: Write> Display<W> {
         let Some(screen) = &self.screen else {
             return Ok(());
         };
-        if !screen.prediction.eligible {
+        let stamp = PredictionStamp::from(screen.prediction);
+        if !screen.prediction.eligible || self.predictions.remote != Some(stamp) {
             return Ok(());
         };
         if self.predictions.tokens.len() >= 256 {
@@ -537,7 +538,7 @@ impl<W: Write> Display<W> {
         let token = PredictionToken {
             seq,
             local_epoch: self.predictions.local_epoch,
-            remote: PredictionStamp::from(screen.prediction),
+            remote: stamp,
             x,
             y,
             glyph: text,
