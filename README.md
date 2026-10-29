@@ -12,7 +12,7 @@ state travels over QUIC.
 This project is a Rust rewrite of [Mosh](https://github.com/mobile-shell/mosh).
 The client and server are `mosh-rs` and `mosh-rs-server`.
 
-The current source uses protocol v6 and is not compatible with the original Mosh
+The current source uses protocol v7 and is not compatible with the original Mosh
 wire protocol or earlier Rust protocols. Install both endpoints from the same release.
 
 ## Install

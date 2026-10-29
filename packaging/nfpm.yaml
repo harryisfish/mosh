@@ -8,7 +8,7 @@ priority: optional
 maintainer: harryisfish <harryisfish@users.noreply.github.com>
 description: |
   Resumable remote terminal with local input prediction.
-  Includes the mosh-rs client and mosh-rs-server for protocol v6.
+  Includes the mosh-rs client and mosh-rs-server for protocol v7.
 homepage: https://github.com/harryisfish/mosh
 license: GPL-3.0-or-later
 contents:

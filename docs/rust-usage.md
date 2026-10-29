@@ -414,7 +414,7 @@ absence of fixture input and screen text.
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
-Both Rust endpoints must use protocol version 6. Earlier Rust workers
+Both Rust endpoints must use protocol version 7. Earlier Rust workers
 cannot resume with the new client. No compatibility with the old Mosh wire
 protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client
