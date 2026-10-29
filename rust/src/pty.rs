@@ -33,6 +33,15 @@ struct Utf8Locale {
 impl Utf8Locale {
     async fn select(candidates: &[String]) -> Result<Self> {
         validate_locale_candidates(candidates)?;
+        #[cfg(all(target_os = "linux", target_env = "musl"))]
+        let installed = Some(installed_locale_names().await?);
+        #[cfg(not(all(target_os = "linux", target_env = "musl")))]
+        let installed: Option<Vec<String>> = None;
+        let is_installed = |name: &str| {
+            installed
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|installed| installed == name))
+        };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let server = ["LC_ALL", "LC_CTYPE", "LANG"]
@@ -43,11 +52,19 @@ impl Utf8Locale {
                 .map(str::to_owned);
             let mut seen = BTreeSet::new();
             for name in candidates.iter().cloned().chain(server).chain(fallback) {
-                if valid_locale_name(&name) && seen.insert(name.clone()) && locale_is_utf8(&name) {
+                if valid_locale_name(&name)
+                    && is_installed(&name)
+                    && seen.insert(name.clone())
+                    && locale_is_utf8(&name)
+                {
                     return Ok(Self { name });
                 }
             }
-            for name in installed_locale_names().await? {
+            let installed = match installed {
+                Some(names) => names,
+                None => installed_locale_names().await?,
+            };
+            for name in installed {
                 if valid_locale_name(&name) && seen.insert(name.clone()) && locale_is_utf8(&name) {
                     return Ok(Self { name });
                 }
