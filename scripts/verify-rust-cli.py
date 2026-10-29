@@ -460,7 +460,9 @@ class TerminalProcess:
         while self.process.poll() is None:
             self.pump()
             assert time.monotonic() < deadline, bytes(self.output[-4000:])
-        self.pump(0)
+        drain_deadline = time.monotonic() + 0.25
+        while time.monotonic() < drain_deadline:
+            self.pump(0.01)
         assert self.process.returncode == code, (self.process.returncode, bytes(self.output[-4000:]))
         assert termios.tcgetattr(self.master) == self.saved, "local termios was not restored"
         assert b"\x1b[?1049l" in self.output, "alternate screen was not restored"
