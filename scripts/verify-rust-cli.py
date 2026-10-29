@@ -1703,10 +1703,16 @@ char *nl_langinfo_l(nl_item item, locale_t locale) {
     variable = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
     wrapper.write_text(f"#!{sys.executable}\nimport os,sys\nenv=dict(os.environ)\nenv[{variable!r}]={str(library)!r}\nos.execve({server!r}, [{server!r}]+sys.argv[1:], env)\n")
     wrapper.chmod(0o700)
+    no_locale_tools = Path(temporary) / "no-locale-tools"
+    no_locale_tools.mkdir()
+    no_locale = no_locale_tools / "locale"
+    no_locale.write_text(f"#!{sys.executable}\n")
+    no_locale.chmod(0o700)
     state = str(Path(temporary) / "failed-locale.json")
     process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server", str(wrapper),
                                "--", sys.executable, str(Path(__file__).resolve()),
-                               "--remote", "startup", state])
+                               "--remote", "startup", state],
+                             {"PATH": str(no_locale_tools), "LC_ALL": "C", "LC_CTYPE": "C", "LANG": "C"})
     try:
         process.finish(1)
         assert b"no usable UTF-8 locale" in process.output, "locale startup failure was not visible"
@@ -1725,13 +1731,15 @@ char *nl_langinfo_l(nl_item item, locale_t locale) {
         ("missing", None, b"cannot discover server locales"),
         ("oversized", "sys.stdout.write('x' * (64 * 1024 + 1))", b"locale list exceeds"),
         ("timeout", "time.sleep(6)", b"locale discovery timed out"),
-        ("discovered", "print('mosh_discovered.UTF-8')", None),
+        ("discovered", "print('C.UTF-8')", None),
     ]:
         if output is not None:
             tool.write_text(f"#!{sys.executable}\nimport sys,time\n{output}\n")
             tool.chmod(0o700)
         state = str(Path(temporary) / f"locale-{mode}.json")
-        environment = {"PATH": str(discovery), "MOSH_RS_TEST_DISCOVERED": "mosh_discovered.UTF-8"}
+        environment = {"PATH": str(discovery), "LC_ALL": "C", "LC_CTYPE": "C", "LANG": "C"}
+        if mode == "discovered":
+            environment["MOSH_RS_TEST_DISCOVERED"] = "C.UTF-8"
         process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server", str(wrapper),
                                    "--", sys.executable, str(Path(__file__).resolve()),
                                    "--remote", "startup", state], environment)
