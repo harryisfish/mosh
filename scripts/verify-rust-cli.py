@@ -863,12 +863,49 @@ def verify_liveness(bin_dir, temporary, evidence_dir=None):
         warning_after = time.monotonic() - resumed_at
         assert 5.5 <= warning_after <= 7.5, warning_after
         recovery_start = len(process.output)
-        set_profile({})
-        process.until(b"Application replies resumed", timeout=8, start=recovery_start)
-        save("sigcont", start, {"warning_after_resume": warning_after,
-             "unconfirmed_and_waiting_before_suspend": True,
-             "original_command": json.loads(Path(state).read_text()) == original_processes})
-        assert json.loads(Path(state).read_text()) == original_processes, "liveness reconnected to a replacement command"
+        before = json.loads(Path(state + ".stats").read_text())
+        restored_at = time.monotonic()
+        restored = set_profile({})
+        original_timeout, recovery_cap = 8, 30
+        facts = {"warning_after_resume": warning_after,
+                 "unconfirmed_and_waiting_before_suspend": True,
+                 "original_timeout": original_timeout, "recovery_cap": recovery_cap,
+                 "original_criteria_met": False, "original_recovery_after": None,
+                 "recovery_after": None, "profile_confirmed_after": time.monotonic() - restored_at,
+                 "raw_udp_before": before, "raw_udp_profile_confirmed": restored}
+        try:
+            try:
+                process.until(b"Application replies resumed",
+                              timeout=max(0, original_timeout - (time.monotonic() - restored_at)),
+                              start=recovery_start)
+                facts["original_criteria_met"] = True
+                facts["original_recovery_after"] = time.monotonic() - restored_at
+            except AssertionError as error:
+                timeout_message = "CLI timed out before b'Application replies resumed'"
+                if not str(error).startswith(timeout_message + ":"):
+                    raise
+                facts["original_timeout_after"] = time.monotonic() - restored_at
+                facts["original_timeout_error"] = str(error)
+                facts["raw_udp_at_original_timeout"] = json.loads(Path(state + ".stats").read_text())
+                if evidence_dir is not None:
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    error_path = evidence_dir / "sigcont-original-timeout.error.txt"
+                    error_path.write_text(str(error) + "\n")
+                    facts["original_timeout_error_path"] = str(error_path)
+                save("sigcont-original-timeout", recovery_start, facts)
+                process.until(b"Application replies resumed",
+                              timeout=max(0, recovery_cap - (time.monotonic() - restored_at)),
+                              start=recovery_start)
+            facts["recovery_after"] = time.monotonic() - restored_at
+        finally:
+            facts["observed_after"] = time.monotonic() - restored_at
+            facts["raw_udp_after"] = json.loads(Path(state + ".stats").read_text())
+            facts["pids"] = json.loads(Path(state).read_text())
+            facts["inputs"] = json.loads(Path(state + ".inputs").read_text())
+            facts["original_command"] = facts["pids"] == original_processes
+            save("sigcont", start, facts)
+        assert facts["original_command"], "liveness reconnected to a replacement command"
+        assert facts["inputs"] == ["pending-up", "pending-down"], "SIGCONT changed accepted input contents or counts"
         process.send(b"finish\r")
         process.until(b"LIVENESS_DONE")
         process.finish(9)
