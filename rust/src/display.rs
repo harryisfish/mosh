@@ -72,7 +72,7 @@ struct PredictionToken {
     x: u16,
     y: u16,
     glyph: char,
-    original: Option<Cell>,
+    original_glyph: Option<char>,
     shown: bool,
     expires: Instant,
 }
@@ -266,7 +266,7 @@ impl<W: Write> Display<W> {
             {
                 let token = self.predictions.tokens.pop_front().unwrap();
                 let new_glyph = char_at(&screen, token.x, token.y);
-                let original_glyph = token.original.as_ref().and_then(cell_glyph);
+                let original_glyph = token.original_glyph;
                 if token.local_epoch == self.predictions.local_epoch
                     && new_glyph == Some(token.glyph)
                     && original_glyph != Some(token.glyph)
@@ -541,7 +541,7 @@ impl<W: Write> Display<W> {
             x,
             y,
             glyph: text,
-            original: cell_at(screen, x, y).cloned(),
+            original_glyph: char_at(screen, x, y),
             shown,
             expires: Instant::now() + Duration::from_millis(750),
         };
