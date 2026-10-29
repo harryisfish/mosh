@@ -1,4 +1,5 @@
 pub mod client;
+pub mod diagnostics;
 pub mod display;
 pub mod input;
 pub mod model;

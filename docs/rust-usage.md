@@ -246,6 +246,55 @@ no recurring status redraw.
 Suspension and SIGCONT begin a new observation window, so the suspended interval
 does not immediately trigger a warning. Queued old replies cannot confirm
 recovery. Local close and input-refusal notices keep their priority.
+## Diagnose a stalled session
+
+Start a session with diagnostics enabled on both endpoints:
+
+```sh
+mosh-rs --diagnostics user@host
+```
+
+Before the terminal opens, the client prints a local JSONL path and the server
+prints its remote JSONL path. Each file is in a private directory and has
+owner-only permissions. Both endpoints need a version that supports
+`--diagnostics`. The flag does not change the terminal wire protocol.
+
+Save both files after a stall. Copy the remote file using its printed path:
+
+```sh
+scp user@host:/path/from/server/output/diagnostics.jsonl ./server-diagnostics.jsonl
+```
+
+The records describe connection transitions, input and PTY queue progress,
+missing image resources, and time spent in transport, terminal parsing, frame
+encoding, rendering, and local terminal writes. `attempt`, `epoch`, `sequence`,
+and `revision` link observations within an endpoint. Each process measures time
+from its own start, so compare these identifiers rather than subtracting client
+and server timestamps.
+
+Summary records contain cumulative stage counts, total and maximum durations
+in microseconds, and byte counts. `pending_age_ms` lists the ages of unconfirmed
+input, queued PTY writes, and missing resources, in that order. `high_water`
+lists peak pending-input bytes, PTY-write bytes, control-queue entries,
+event-queue entries, and missing-resource counts. `dropped` counts observations
+skipped when diagnostic capacity is exhausted. Overlapping stages have separate
+totals; adding those totals does not measure wall time.
+
+An independent thread records operations that remain active for at least one
+second. This includes synchronous terminal writes that block the main event
+loop. A `waiting` record describes an observation, not a confirmed cause. A
+`resumed` record means that the observed operation ended; it does not imply
+success. Normal idle reads do not count as stalled operations.
+
+Diagnostics are off by default. The files contain counters, durations, and
+fixed event names. They exclude input text, screen contents, remote command
+arguments, addresses, credentials, and dynamic error messages. Capture stops
+at a 16 MiB limit per file. Start another session to collect a new capture.
+Remove the files when they are no longer needed. No data is uploaded.
+
+An in-process monitor cannot run while its process is stopped or the host is
+asleep. A disk stall can also delay diagnostic output. Neither condition proves
+a terminal protocol failure.
 
 ## Terminal capabilities
 
@@ -350,6 +399,17 @@ Reported frame and row metadata sizes come from reconstructed snapshots and
 postcard encoding. They are not captured server frames or encrypted wire sizes.
 These transcript checks do not verify native terminal visuals or selection.
 They do not establish other-platform or comprehensive performance acceptance.
+
+To verify diagnostics, including a blocked local terminal and a healthy idle
+session, run:
+
+```sh
+python3 scripts/verify-rust-cli.py --network --diagnostics --evidence-dir /tmp/mosh-diagnostics-check
+```
+
+The diagnostic check also validates both endpoint logs and copies them to the
+evidence directory. It checks the schema, file permissions, size limit, and
+absence of fixture input and screen text.
 
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.

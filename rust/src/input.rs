@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 
+use crate::diagnostics::{self, Context as DiagnosticContext, Stage};
 use crate::model::{InputEvent, Key, KeyCode, KeyPhase, MAX_PENDING_INPUT, Mouse, MouseKind, Size};
 
 const ESC: u8 = 0x1b;
@@ -1135,10 +1136,18 @@ impl TtyOutput {
 impl Write for TtyOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         require_foreground()?;
+        let _operation = diagnostics::operation(
+            Stage::TtyWrite,
+            DiagnosticContext {
+                bytes: bytes.len() as u64,
+                ..Default::default()
+            },
+        );
         self.0.as_mut().expect("terminal output").write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
         require_foreground()?;
+        let _operation = diagnostics::operation(Stage::TtyFlush, DiagnosticContext::default());
         self.0.as_mut().expect("terminal output").flush()
     }
 }
