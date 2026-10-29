@@ -72,7 +72,7 @@ struct PredictionToken {
     x: u16,
     y: u16,
     glyph: char,
-    original: Option<Cell>,
+    original_glyph: Option<char>,
     shown: bool,
     expires: Instant,
 }
@@ -255,7 +255,7 @@ impl<W: Write> Display<W> {
         let mut screen = self.assemble(frame, resources)?;
         let graphics = prepare_graphics(&screen, self.graphics)?;
         let stamp = PredictionStamp::from(screen.prediction);
-        let mode_changed = self.predictions.remote.is_some_and(|old| old != stamp);
+        let mode_changed = self.predictions.remote != Some(stamp);
         let mut repaint = BTreeSet::new();
         for token in &self.predictions.tokens {
             if token.shown {
@@ -273,7 +273,7 @@ impl<W: Write> Display<W> {
             {
                 let token = self.predictions.tokens.pop_front().unwrap();
                 let new_glyph = char_at(&screen, token.x, token.y);
-                let original_glyph = token.original.as_ref().and_then(cell_glyph);
+                let original_glyph = token.original_glyph;
                 if token.local_epoch == self.predictions.local_epoch
                     && new_glyph == Some(token.glyph)
                     && original_glyph != Some(token.glyph)
@@ -517,7 +517,8 @@ impl<W: Write> Display<W> {
         let Some(screen) = &self.screen else {
             return Ok(());
         };
-        if !screen.prediction.eligible {
+        let stamp = PredictionStamp::from(screen.prediction);
+        if !screen.prediction.eligible || self.predictions.remote != Some(stamp) {
             return Ok(());
         };
         if self.predictions.tokens.len() >= 256 {
@@ -545,11 +546,11 @@ impl<W: Write> Display<W> {
         let token = PredictionToken {
             seq,
             local_epoch: self.predictions.local_epoch,
-            remote: PredictionStamp::from(screen.prediction),
+            remote: stamp,
             x,
             y,
             glyph: text,
-            original: cell_at(screen, x, y).cloned(),
+            original_glyph: char_at(screen, x, y),
             shown,
             expires: Instant::now() + Duration::from_millis(750),
         };
