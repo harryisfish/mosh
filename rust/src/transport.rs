@@ -17,6 +17,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::diagnostics::{self, Context as DiagnosticContext, Stage};
 use crate::model::{
     BootstrapRequest, Frame, Grant, MAX_CELL_IMAGES, MAX_CONTROL, MAX_FRAME, MAX_IMAGE_TILES,
     MAX_RESOURCE, MAX_RESOURCES, PROTOCOL_VERSION, Resource, ResourceMeta,
@@ -460,10 +461,12 @@ fn server_sockets(bind: Option<IpAddr>, port: u16) -> io::Result<(UdpSocket, Opt
 
 pub async fn connect(endpoints: &ClientEndpoints, grant: &Grant) -> Result<Connection> {
     validate_grant(grant)?;
+    let resolve = diagnostics::operation(Stage::Resolve, DiagnosticContext::default());
     let addresses: Vec<_> = tokio::net::lookup_host((grant.address.as_str(), grant.port))
         .await
         .context("cannot resolve server UDP address")?
         .collect();
+    drop(resolve);
     ensure!(
         !addresses.is_empty(),
         "server address resolved to no IP addresses"
@@ -482,6 +485,7 @@ pub async fn connect(endpoints: &ClientEndpoints, grant: &Grant) -> Result<Conne
             continue;
         };
         attempts.spawn(async move {
+            let _operation = diagnostics::operation(Stage::Connect, DiagnosticContext::default());
             let connecting = endpoint
                 .connect(address, "mosh.local")
                 .with_context(|| format!("cannot start UDP connection to {address}"))?;
@@ -531,7 +535,15 @@ pub async fn bootstrap_ssh(
         .arg("ClearAllForwardings=yes")
         .arg("--")
         .arg(target)
-        .arg(format!("{} bootstrap", shell_quote(server_path)));
+        .arg(format!(
+            "{} bootstrap{}",
+            shell_quote(server_path),
+            if diagnostics::enabled() {
+                " --diagnostics"
+            } else {
+                ""
+            }
+        ));
     let grant = run_bootstrap(command, &request).await?;
     destination.authorize(grant)
 }
@@ -545,6 +557,9 @@ pub async fn bootstrap_local(
     validate_request(&request)?;
     let mut command = Command::new(server_path);
     command.arg("bootstrap");
+    if diagnostics::enabled() {
+        command.arg("--diagnostics");
+    }
     run_bootstrap(command, &request).await
 }
 
@@ -646,6 +661,7 @@ fn shell_quote(value: &str) -> String {
 }
 
 async fn run_bootstrap(mut command: Command, request: &BootstrapRequest) -> Result<Grant> {
+    let _operation = diagnostics::operation(Stage::Bootstrap, DiagnosticContext::default());
     let bytes = json_line(request)?;
     command
         .stdin(Stdio::piped())
@@ -720,7 +736,7 @@ fn worker_log_diagnostics(log: &mut std::fs::File) -> String {
     }
 }
 
-pub async fn spawn_worker() -> Result<()> {
+pub async fn spawn_worker(diagnostics_enabled: bool) -> Result<()> {
     let request = read_request(std::io::stdin().lock())?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let directory = std::env::temp_dir().join(format!("mosh-rs-{}-{stamp}", std::process::id()));
@@ -741,6 +757,10 @@ pub async fn spawn_worker() -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(log);
+    let diagnostic_path = directory.join("diagnostics.jsonl");
+    if diagnostics_enabled {
+        command.arg("--diagnostics").arg(&diagnostic_path);
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -770,6 +790,9 @@ pub async fn spawn_worker() -> Result<()> {
     .await;
     match grant {
         Ok(Ok(grant)) => {
+            if diagnostics_enabled {
+                eprintln!("mosh-rs-server: diagnostics: {}", diagnostic_path.display());
+            }
             let delivered = write_grant(std::io::stdout().lock(), &grant);
             if delivered.is_err() {
                 let _ = child.kill().await;
@@ -977,6 +1000,13 @@ fn validate_grant(grant: &Grant) -> Result<()> {
 pub async fn send_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
     let bytes = postcard::to_allocvec(message)?;
     ensure!(bytes.len() <= MAX_CONTROL, "control message exceeds limit");
+    let _operation = diagnostics::operation(
+        Stage::ControlWrite,
+        DiagnosticContext {
+            bytes: bytes.len() as u64,
+            ..Default::default()
+        },
+    );
     send.set_priority(10)?;
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     send.write_all(&bytes).await?;
@@ -989,6 +1019,8 @@ pub async fn recv_message<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<
     if first.is_none() {
         return Ok(None);
     }
+    let _operation =
+        diagnostics::operation(Stage::ControlPayloadRead, DiagnosticContext::default());
     recv.read_exact(&mut length[1..]).await?;
     let length = u32::from_be_bytes(length) as usize;
     ensure!(length <= MAX_CONTROL, "control message exceeds limit");
@@ -1032,10 +1064,20 @@ impl Drop for CancellableStream {
 
 pub struct EncodedFrame {
     compressed: Vec<u8>,
+    epoch: u64,
+    revision: u64,
 }
 
 impl EncodedFrame {
     pub fn new(frame: &Frame) -> Result<Self> {
+        let _operation = diagnostics::operation(
+            Stage::FrameEncode,
+            DiagnosticContext {
+                epoch: frame.epoch,
+                revision: frame.revision,
+                ..Default::default()
+            },
+        );
         validate_frame(frame)?;
         let bytes = postcard::to_allocvec(frame)?;
         ensure!(bytes.len() <= MAX_FRAME, "display frame exceeds limit");
@@ -1044,7 +1086,11 @@ impl EncodedFrame {
             compressed.len() <= MAX_FRAME,
             "compressed frame exceeds limit"
         );
-        Ok(Self { compressed })
+        Ok(Self {
+            compressed,
+            epoch: frame.epoch,
+            revision: frame.revision,
+        })
     }
 
     pub fn compressed_len(&self) -> usize {
@@ -1052,6 +1098,15 @@ impl EncodedFrame {
     }
 
     pub async fn send(self, connection: &Connection) -> Result<()> {
+        let _operation = diagnostics::operation(
+            Stage::FrameSend,
+            DiagnosticContext {
+                bytes: self.compressed.len() as u64,
+                epoch: self.epoch,
+                revision: self.revision,
+                ..Default::default()
+            },
+        );
         let mut stream = CancellableStream(Some(connection.open_uni().await?));
         stream.stream().set_priority(0)?;
         stream.stream().write_all(&[FRAME_STREAM]).await?;
@@ -1061,6 +1116,13 @@ impl EncodedFrame {
 }
 
 pub async fn send_resource(connection: &Connection, resource: &Resource) -> Result<()> {
+    let _operation = diagnostics::operation(
+        Stage::ResourceSend,
+        DiagnosticContext {
+            bytes: resource.rgba.len() as u64,
+            ..Default::default()
+        },
+    );
     resource.validate()?;
     let metadata = serde_json::to_vec(&resource.meta)?;
     ensure!(metadata.len() <= 4096, "image metadata exceeds limit");
@@ -1103,11 +1165,20 @@ fn is_superseded(error: &anyhow::Error) -> bool {
 
 async fn receive_one_uni(connection: &Connection) -> Result<Incoming> {
     let mut stream = connection.accept_uni().await?;
+    let payload = diagnostics::operation(Stage::DisplayPayloadRead, DiagnosticContext::default());
     let mut kind = [0_u8; 1];
     stream.read_exact(&mut kind).await?;
     match kind[0] {
         FRAME_STREAM => {
             let bytes = stream.read_to_end(MAX_FRAME).await?;
+            drop(payload);
+            let _operation = diagnostics::operation(
+                Stage::FrameDecode,
+                DiagnosticContext {
+                    bytes: bytes.len() as u64,
+                    ..Default::default()
+                },
+            );
             let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))?;
             decoder.window_log_max(23)?;
             let mut decoded = Vec::new();

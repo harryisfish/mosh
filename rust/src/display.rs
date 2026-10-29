@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::diagnostics::{self, Context as DiagnosticContext, Stage};
 use crate::model::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +128,9 @@ pub struct Display<W> {
 }
 
 impl<W> Display<W> {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     fn with_writer<T>(self, writer: T) -> (Display<T>, W) {
         (
             Display {
@@ -190,9 +194,6 @@ impl<W: Write> Display<W> {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
     pub fn needs_checkpoint(&self) -> bool {
         self.checkpoint_required
     }
@@ -227,6 +228,14 @@ impl<W: Write> Display<W> {
         frame: &Frame,
         resources: &BTreeMap<Digest, Resource>,
     ) -> Result<bool> {
+        let _operation = diagnostics::operation(
+            Stage::InstallFrame,
+            DiagnosticContext {
+                epoch: frame.epoch,
+                revision: frame.revision,
+                ..Default::default()
+            },
+        );
         if frame.epoch != self.epoch || frame.revision <= self.revision {
             return Ok(false);
         }

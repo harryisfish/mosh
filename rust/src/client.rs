@@ -14,6 +14,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::{self, Context as DiagnosticContext, ProgressSnapshot, Stage};
 use crate::display::{Display, Graphics, PredictionPolicy};
 use crate::input::{
     EscapeAction, EscapeSequence, InputDecoder, InputRejection, LocalEvent, LocalTerminal,
@@ -85,6 +86,13 @@ async fn open_link(
     events: mpsc::Sender<NetworkEvent>,
 ) -> std::result::Result<Link, OpenFailure> {
     let attempt = attach.attempt;
+    let _attach = diagnostics::operation(
+        Stage::Attach,
+        DiagnosticContext {
+            attempt,
+            ..Default::default()
+        },
+    );
     let connection = transport::connect(&endpoint, &grant)
         .await
         .map_err(|error| OpenFailure {
@@ -128,6 +136,19 @@ async fn open_link(
         }
         let result = async {
             while let Some(message) = receive.recv().await {
+                let sequence = match &message {
+                    ClientMessage::Input { record, .. } => record.seq,
+                    _ => 0,
+                };
+                let _operation = diagnostics::operation(
+                    Stage::ControlSend,
+                    DiagnosticContext {
+                        attempt,
+                        epoch,
+                        sequence,
+                        ..Default::default()
+                    },
+                );
                 transport::send_message(&mut output, &message).await?;
             }
             Result::<()>::Ok(())
@@ -153,6 +174,14 @@ async fn open_link(
         }
         let result = async {
             while let Some(message) = transport::recv_message(&mut input).await? {
+                let _operation = diagnostics::operation(
+                    Stage::EventQueueSend,
+                    DiagnosticContext {
+                        attempt,
+                        epoch,
+                        ..Default::default()
+                    },
+                );
                 notify
                     .send(NetworkEvent::Message { attempt, message })
                     .await?;
@@ -183,6 +212,14 @@ async fn open_link(
             loop {
                 match transport::receive_uni(&receiving).await {
                     Ok(incoming) => {
+                        let _operation = diagnostics::operation(
+                            Stage::EventQueueSend,
+                            DiagnosticContext {
+                                attempt,
+                                epoch,
+                                ..Default::default()
+                            },
+                        );
                         if notify
                             .send(NetworkEvent::Display { attempt, incoming })
                             .await
@@ -638,6 +675,39 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut requested_resources = Instant::now() - Duration::from_secs(1);
     let mut buffer = [0u8; MAX_INPUT_CHUNK];
     loop {
+        if diagnostics::enabled() {
+            let (foreground, revision) = match &ui {
+                LocalUi::Foreground { display, .. } => (true, display.revision()),
+                LocalUi::Parked { display, .. } => (false, display.revision()),
+            };
+            diagnostics::progress(ProgressSnapshot {
+                connected: link.is_some(),
+                foreground,
+                attempt,
+                epoch: link.as_ref().map_or(0, |active| active.epoch),
+                sequence: pending.sequence,
+                committed,
+                revision,
+                pending_input_bytes: pending.bytes as u64,
+                event_queue: receive.len() as u64,
+                control_queue: link.as_ref().map_or(0, |active| {
+                    (active.output.max_capacity() - active.output.capacity()) as u64
+                }),
+                pending_frame: pending_frame.as_ref().map_or(0, |frame| frame.revision),
+                missing_resources: pending_frame.as_ref().map_or(0, |frame| {
+                    frame
+                        .resources
+                        .iter()
+                        .filter(|meta| {
+                            resources
+                                .get(&meta.digest)
+                                .is_none_or(|resource| resource.meta != **meta)
+                        })
+                        .count() as u64
+                }),
+                ..Default::default()
+            });
+        }
         let was_foreground = matches!(ui, LocalUi::Foreground { .. });
         let foreground_result;
         (ui, foreground_result) = ui.try_foreground();
@@ -964,7 +1034,17 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                     active.effects_ack = display.effects_applied();
                 }
                 for (_, (record, _)) in pending.records.range((std::ops::Bound::Excluded(active.sent_through), std::ops::Bound::Unbounded)).take(8) {
-                    if active.output.try_send(ClientMessage::Input { epoch: active.epoch, record: record.clone() }).is_err() { break; }
+                    if active
+                        .output
+                        .try_send(ClientMessage::Input {
+                            epoch: active.epoch,
+                            record: record.clone(),
+                        })
+                        .is_err()
+                    {
+                        diagnostics::queue_full();
+                        break;
+                    }
                     active.sent_through = record.seq;
                 }
                 if active.resize_sent < resize_generation
