@@ -759,6 +759,108 @@ fn verify_prediction_boundaries() -> Result<()> {
     Ok(())
 }
 
+fn verify_prediction_epoch_context() -> Result<()> {
+    for policy in [PredictionPolicy::Adaptive, PredictionPolicy::Conservative] {
+        let capture = Capture::default();
+        let mut display = Display::new(capture.clone(), Graphics::None, policy);
+        display.set_epoch(1)?;
+        let mut current = frame(1, None, Vec::new());
+        assert!(display.install(&current, &BTreeMap::new())?);
+        display.predict(1, &printable('P'))?;
+        display.set_epoch(2)?;
+        let before = capture.0.lock().unwrap().len();
+        display.predict(2, &printable('S'))?;
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            before,
+            "cached ECHO must not expose input before the new epoch's first frame: {policy:?}"
+        );
+        current.epoch = 2;
+        current.revision += 1;
+        current.prediction.generation += 1;
+        current.echo_through = 2;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        let before = capture.0.lock().unwrap().len();
+        display.predict(3, &printable('N'))?;
+        assert!(
+            capture.0.lock().unwrap()[before..]
+                .windows(b"\x1b[0;4mN".len())
+                .any(|bytes| bytes == b"\x1b[0;4mN"),
+            "a confirmed ECHO frame must restore prediction: {policy:?}"
+        );
+
+        let capture = Capture::default();
+        let mut display = Display::new(capture.clone(), Graphics::None, policy);
+        display.set_epoch(1)?;
+        let mut current = frame(1, None, Vec::new());
+        current.prediction.echo_enabled = false;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        display.set_epoch(2)?;
+        for (seq, glyph) in [(1, 'a'), (2, 'b'), (3, 'c')] {
+            display.predict(seq, &printable(glyph))?;
+        }
+        current.epoch = 2;
+        current.revision += 1;
+        current.prediction.generation += 1;
+        current.echo_through = 3;
+        current.rows[1].row.cells = ['a', 'b', 'c']
+            .into_iter()
+            .enumerate()
+            .map(|(index, glyph)| cell(8 + index as u16, &glyph.to_string(), 1))
+            .collect();
+        current.cursor.x = 11;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        let before = capture.0.lock().unwrap().len();
+        display.predict(4, &printable('S'))?;
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            before,
+            "input before the first frame must not teach a new remote stamp: {policy:?}"
+        );
+        display.predict(5, &printable('\n'))?;
+        for (seq, glyph) in [(6, 'd'), (7, 'e'), (8, 'f')] {
+            display.predict(seq, &printable(glyph))?;
+            current.base = Some(current.revision);
+            current.revision += 1;
+            current.echo_through = seq;
+            current.rows[1]
+                .row
+                .cells
+                .push(cell(current.cursor.x, &glyph.to_string(), 1));
+            current.cursor.x += 1;
+            assert!(display.install(&current, &BTreeMap::new())?);
+        }
+        let before = capture.0.lock().unwrap().len();
+        display.predict(9, &printable('N'))?;
+        if policy == PredictionPolicy::Adaptive {
+            assert!(
+                capture.0.lock().unwrap()[before..]
+                    .windows(b"\x1b[0;4mN".len())
+                    .any(|bytes| bytes == b"\x1b[0;4mN"),
+                "the confirmed new epoch must still learn real noecho replies"
+            );
+        } else {
+            assert_eq!(capture.0.lock().unwrap().len(), before);
+        }
+        current.base = Some(current.revision);
+        current.revision += 1;
+        current.prediction.echo_enabled = true;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        let before = capture.0.lock().unwrap().len();
+        display.predict(10, &printable('T'))?;
+        assert!(
+            capture.0.lock().unwrap()[before..]
+                .windows(b"\x1b[0;4mT".len())
+                .any(|bytes| bytes == b"\x1b[0;4mT"),
+            "prediction must resume after a confirmed ECHO transition: {policy:?}"
+        );
+    }
+    println!(
+        "prediction: attachment context gates cached ECHO and learning without disabling confirmed prediction"
+    );
+    Ok(())
+}
+
 fn verify_lifecycle() -> Result<()> {
     let rgba = vec![0, 0, 255, 255];
     let digest = resource_digest(1, 1, &rgba);
@@ -955,6 +1057,7 @@ fn main() -> Result<()> {
     verify_render(Graphics::Sixel)?;
     verify_prediction_modes()?;
     verify_prediction_boundaries()?;
+    verify_prediction_epoch_context()?;
     verify_lifecycle()?;
     verify_escape_sequences()?;
     Ok(())
