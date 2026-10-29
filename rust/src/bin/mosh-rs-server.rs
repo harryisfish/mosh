@@ -1,8 +1,13 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mosh_rs::{session::SessionActor, transport};
+use mosh_rs::{
+    diagnostics::{self, Role},
+    session::SessionActor,
+    transport,
+};
 
 #[derive(Parser)]
 #[command(version, about = "Host a resumable Rust terminal session")]
@@ -14,9 +19,15 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Read an authenticated bootstrap request from SSH standard input.
-    Bootstrap,
+    Bootstrap {
+        #[arg(long)]
+        diagnostics: bool,
+    },
     #[command(hide = true)]
-    Worker,
+    Worker {
+        #[arg(long)]
+        diagnostics: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -32,8 +43,12 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     match Args::parse().command {
-        Command::Bootstrap => transport::spawn_worker().await,
-        Command::Worker => {
+        Command::Bootstrap { diagnostics } => transport::spawn_worker(diagnostics).await,
+        Command::Worker { diagnostics: path } => {
+            let _diagnostics = path
+                .as_ref()
+                .map(|path| diagnostics::start(Role::Server, path))
+                .transpose()?;
             let request = transport::read_request(std::io::stdin().lock())?;
             let (endpoint, grant) = transport::listen(&request)?;
             let session = SessionActor::new(&request, grant.session.clone())?;
