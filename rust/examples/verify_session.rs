@@ -448,6 +448,17 @@ async fn main() -> Result<()> {
         Some("--locale-fixture") => return locale_fixture(),
         _ => (),
     }
+    let _diagnostics = if mode.as_deref() == Some("--diagnostics") {
+        let path = std::env::args()
+            .nth(2)
+            .context("--diagnostics requires an output path")?;
+        Some(mosh_rs::diagnostics::start(
+            mosh_rs::diagnostics::Role::Server,
+            std::path::Path::new(&path),
+        )?)
+    } else {
+        None
+    };
     tokio::task::LocalSet::new()
         .run_until(async {
             tokio::time::timeout(Duration::from_secs(180), async {
@@ -868,8 +879,13 @@ async fn verify() -> Result<()> {
     })
     .await
     .context("large display helper did not finish its output")??;
+    let hold = Duration::from_millis(if mosh_rs::diagnostics::enabled() {
+        1200
+    } else {
+        350
+    });
     loop {
-        match tokio::time::timeout(Duration::from_millis(350), held.received_reset()).await {
+        match tokio::time::timeout(hold, held.received_reset()).await {
             Err(_) => break,
             Ok(Ok(Some(code))) if code == VarInt::from_u32(0x10) => {
                 held = tokio::time::timeout(WAIT, hold_large_frame(&mut peer, &mut view)).await??;
