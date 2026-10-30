@@ -186,6 +186,32 @@ including any embedded local escape commands. An unfinished paste can still be
 interrupted with an operating system signal. Clipboard replies share the input
 budget; a refused reply is discarded and the remote query may time out.
 
+Legacy ESC key prefixes have a fixed 30 ms deadline from their first ESC byte.
+With no suffix, ESC becomes Escape, `ESC [` becomes Alt-[, and `ESC O` becomes
+Alt-O. Later bytes do not extend that deadline. Unfinished parameterized CSI,
+SS3, and Linux-console key sequences are refused with `Input sequence timed
+out`; their tail is discarded through its final byte. Retype the key after the
+notice. Ctrl-^ or a new ESC sequence can end this tail discard, so local commands
+remain available. Suspension does not restart the keyboard deadline.
+
+Paste and OSC/DCS/APC reply bodies retain their own parsing rules. An identified
+X10 mouse event waits for its button and two coordinate bytes. These bodies do
+not become keys after this deadline. A bare `ESC [` is indistinguishable from a
+terminal reply whose next byte arrives after the deadline; the client uses the
+Alt-[ convention in that case. Complete cursor reports still use the existing
+filter, including the F3/CPR ambiguity when their bytes are identical.
+
+Linux-console F1-F5 and xterm F21-F24 are sent as semantic keys and encoded for
+the remote application's current keyboard mode. Keypad Begin and Equal retain
+their normal, application-keypad, or Kitty meaning.
+
+Rxvt Shift and Ctrl arrows, plus Shift, Ctrl, and Shift+Ctrl navigation and
+F1-F20 suffix forms, use the same semantic input path. For example, rxvt
+`ESC [ 3 $` sends Shift-Delete. After a prefix timeout, a late `$` ends that
+key's discarded tail without consuming the next typed character. Standard
+terminal replies with `$` intermediates remain filtered. Higher rxvt function
+key codes outside this set are not inferred from terminfo capability numbers.
+
 Press Ctrl-^, then `.` to close the local client, or Ctrl-^, then `q` to end the
 remote command. Ctrl-^, then `^` sends a literal Ctrl-^. Ctrl-^, then `?` shows
 these commands. Press Ctrl-^, then Ctrl-Z to return to the local shell without
@@ -324,6 +350,7 @@ target/debug/examples/verify_display
 target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
 python3 scripts/verify-rust-cli.py --saturated-input
+python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
 python3 scripts/verify-rust-cli.py --liveness --evidence-dir /tmp/mosh-rs-liveness
 ```
 
@@ -339,6 +366,10 @@ Its per-direction counters describe encrypted UDP traffic, not actor replies.
 `--evidence-dir` saves raw TTY output and relay observations for these cases.
 `verify_session --verify-liveness` separately pauses only actor polling while
 Quinn continues, then records raw probe replies and QUIC ACK counts.
+`--network` also runs the legacy-input cases. `--legacy-input` checks real PTY
+bytes for prefix deadlines, function and keypad keys, late-tail refusal,
+management recovery, reply filters, UTF-8, Kitty phases, and SIGCONT.
+Its evidence directory contains the TTY transcript and exact received bytes.
 
 To verify diagnostics, including a blocked local terminal and a healthy idle
 session, run:

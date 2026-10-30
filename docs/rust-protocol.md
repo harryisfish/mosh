@@ -116,6 +116,41 @@ Frames use bounded postcard encoding and zstd compression. Image keys hash their
 dimensions followed by their RGBA bytes. A cache miss explicitly requests the
 missing resources. A base mismatch requests a checkpoint. Application exit has its own final acknowledgement.
 
+## Local key-prefix decoding
+
+Keyboard prefixes have an absolute 30 ms deadline beginning with their first
+ESC. The decoder expires an old prefix before appending newly read bytes and
+can expire without another TTY read. Bare ESC, `ESC [`, and `ESC O` become one
+Escape, Alt-[, or Alt-O key. An incomplete parameterized CSI, SS3, or Linux
+function prefix instead emits one local refusal, clears its payload, and
+discards bytes through a final. This discard holds no growing payload. Raw
+Ctrl-^ and a new ESC end the discard and return to normal classification.
+
+The deadline does not apply inside paste, OSC/DCS/APC strings, or an identified
+X10 mouse event's three payload bytes. These bodies cannot execute local escape
+commands. The captured input tail is processed before a clock-only expiry.
+Suspension does not refresh keyboard deadlines. Refusals allocate no input seq
+and cannot be replayed later. The wire remains version 5; Linux F1-F5,
+xterm F21-F24, Keypad Begin, and Keypad Equal use existing semantic keys.
+
+Empty-parameter rxvt `CSI a` through `CSI d` encode Shift arrows, and `SS3 a`
+through `SS3 d` encode Ctrl arrows. The canonical decimal navigation codes
+1-8 and F1-F20 codes accept `$`, `^`, and `@` for Shift, Ctrl, and Shift+Ctrl.
+These forms use existing semantic keys and the remote application's keyboard
+mode. The existing xterm `~` parser still accepts leading zeros and F21-F24.
+
+Only a complete supported rxvt number makes `$` a final byte. Normal parsing
+and expired-tail discard share this rule. Discard retains a bounded numeric
+prefix classifier after clearing the payload, so a late `$` preserves the next
+typed character without restoring the refused key. A semicolon, private prefix,
+or unsupported number keeps `$` as an intermediate, including in split DECRPM
+replies. Exact supported rxvt keys take priority over nonstandard control strings
+with the same bytes, regardless of input chunk boundaries.
+
+An extremely slow reply beginning with bare `ESC [` is indistinguishable from
+Alt-[. Existing complete F3/CPR ambiguity is unchanged; unsupported reply
+families remain filtered rather than replayed as raw input.
+
 ## Actor application confirmation
 
 Version 5 appends `Probe { epoch, nonce }` and `ProbeReply { epoch, nonce }` to
