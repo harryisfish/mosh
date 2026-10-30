@@ -128,6 +128,7 @@ pub struct SessionActor {
 
 struct PreparedSession {
     command: Vec<String>,
+    locale_candidates: Vec<String>,
     size: Size,
     terminal: TerminalModel,
     session: String,
@@ -189,6 +190,7 @@ impl SessionActor {
             request.version == PROTOCOL_VERSION,
             "unsupported protocol version"
         );
+        validate_locale_candidates(&request.locale_candidates)?;
         ensure!(
             (60..=604800).contains(&request.idle_seconds),
             "idle timeout must be 60..=604800 seconds"
@@ -198,6 +200,7 @@ impl SessionActor {
         Ok(Self {
             prepared: PreparedSession {
                 command: request.command.clone(),
+                locale_candidates: request.locale_candidates.clone(),
                 size: request.size,
                 terminal,
                 session,
@@ -310,7 +313,7 @@ impl PreparedSession {
     }
 
     async fn start(self, first: FirstAttachment) -> Result<RunningSession> {
-        let pty = match Pty::spawn(&self.command, self.size) {
+        let pty = match Pty::spawn(&self.command, self.size, &self.locale_candidates).await {
             Ok(pty) => pty,
             Err(error) => {
                 reject_attachment(

@@ -7,8 +7,8 @@ use anyhow::{Context, Result, ensure};
 use mosh_rs::model::{
     Attach, BootstrapRequest, ClientMessage, Cursor as ScreenCursor, Effect, EffectKind, Frame,
     Grant, InputEvent, InputRecord, Key, KeyCode, KeyPhase, MAX_CONTROL, MAX_EFFECTS, MAX_FRAME,
-    Mouse, MouseKind, PROTOCOL_VERSION, PredictionContext, Resource, ResourceMeta, Row, RowPatch,
-    ServerMessage, Size, resource_digest,
+    MAX_LOCALE_CANDIDATES, Mouse, MouseKind, PROTOCOL_VERSION, PredictionContext, Resource,
+    ResourceMeta, Row, RowPatch, ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
     ClientEndpoints, ClientIdentity, EncodedFrame, Incoming, bootstrap_local, connect, listen,
@@ -303,6 +303,7 @@ fn request(identity: &ClientIdentity) -> BootstrapRequest {
         port: None,
         idle_seconds: 60,
         clipboard_read: false,
+        locale_candidates: Vec::new(),
     }
 }
 
@@ -371,7 +372,7 @@ async fn main() -> Result<()> {
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, protocol v3, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v4, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
     );
     Ok(())
 }
@@ -460,7 +461,7 @@ fn bootstrap_fixture(mode: &str) -> Result<()> {
         }
         "invalid-grant" => {
             let mut old = grant;
-            old.version = 2;
+            old.version = 3;
             stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
             serde_json::to_writer(&mut stdout, &old)?;
             stdout.write_all(b"\n\x1eMOSH-RS-GRANT-END\n")?;
@@ -659,28 +660,71 @@ async fn verify() -> Result<()> {
     let identity = ClientIdentity::generate()?;
     let request = request(&identity);
     let mut legacy_request = request.clone();
-    legacy_request.version = 2;
+    legacy_request.version = 3;
     let mut legacy_json = serde_json::to_vec(&legacy_request)?;
     legacy_json.push(b'\n');
     ensure!(
         read_request(Cursor::new(legacy_json)).is_err(),
-        "v2 bootstrap request was accepted"
+        "v3 bootstrap request was accepted"
     );
     ensure!(
         listen(&legacy_request).is_err(),
-        "v2 listener request was accepted"
+        "v3 listener request was accepted"
+    );
+    let mut invalid_locale = request.clone();
+    invalid_locale.locale_candidates = vec!["bad/name".into()];
+    let mut invalid_json = serde_json::to_vec(&invalid_locale)?;
+    invalid_json.push(b'\n');
+    ensure!(
+        read_request(Cursor::new(invalid_json)).is_err(),
+        "invalid locale candidate was accepted"
+    );
+    for name in [
+        "".to_owned(),
+        "x".repeat(129),
+        "C\0UTF-8".into(),
+        "中文.UTF-8".into(),
+    ] {
+        invalid_locale.locale_candidates = vec![name];
+        let mut bytes = serde_json::to_vec(&invalid_locale)?;
+        bytes.push(b'\n');
+        ensure!(
+            read_request(Cursor::new(bytes)).is_err(),
+            "invalid locale name passed decoding"
+        );
+    }
+    let mut excessive_locales = request.clone();
+    excessive_locales.locale_candidates = (0..=MAX_LOCALE_CANDIDATES)
+        .map(|index| format!("C.UTF-8@{index}"))
+        .collect();
+    let mut excessive_json = serde_json::to_vec(&excessive_locales)?;
+    excessive_json.push(b'\n');
+    ensure!(
+        read_request(Cursor::new(excessive_json)).is_err(),
+        "excessive locale candidates were accepted"
+    );
+    let mut missing_locale = serde_json::to_value(&request)?;
+    missing_locale
+        .as_object_mut()
+        .context("bootstrap request was not a JSON object")?
+        .remove("locale_candidates");
+    let mut missing_json = serde_json::to_vec(&missing_locale)?;
+    missing_json.push(b'\n');
+    ensure!(
+        read_request(Cursor::new(missing_json)).is_err(),
+        "missing locale candidates were accepted"
     );
     let (server, grant) = listen(&request)?;
     let client = identity.endpoint(&grant)?;
     let mut legacy_grant = grant.clone();
-    legacy_grant.version = 2;
+    legacy_grant.version = 3;
     ensure!(
         identity.endpoint(&legacy_grant).is_err(),
-        "v2 server grant was accepted"
+        "v3 server grant was accepted"
     );
     ensure!(
         connect(&client, &legacy_grant).await.is_err(),
-        "v2 connection grant was accepted"
+        "v3 connection grant was accepted"
     );
     let mut hostname_grant = grant.clone();
     hostname_grant.address = "localhost".into();
@@ -700,7 +744,7 @@ async fn verify() -> Result<()> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
     ensure!(
-        handshake.protocol.as_deref() == Some(&b"mosh-rs/3"[..]),
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/4"[..]),
         "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");

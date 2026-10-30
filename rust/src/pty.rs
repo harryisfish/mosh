@@ -1,14 +1,182 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 
-use crate::model::Size;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::model::valid_locale_name;
+use crate::model::{Size, validate_locale_candidates};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe extern "C" {
+    #[link_name = "nl_langinfo_l"]
+    fn locale_codeset(item: libc::nl_item, locale: libc::locale_t) -> *mut libc::c_char;
+}
+
+struct Utf8Locale {
+    name: String,
+}
+
+impl Utf8Locale {
+    async fn select(candidates: &[String]) -> Result<Self> {
+        validate_locale_candidates(candidates)?;
+        #[cfg(all(target_os = "linux", target_env = "musl"))]
+        let installed = Some(installed_locale_names().await?);
+        #[cfg(not(all(target_os = "linux", target_env = "musl")))]
+        let installed: Option<Vec<String>> = None;
+        let is_installed = |name: &str| {
+            installed
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|installed| installed == name))
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let server = ["LC_ALL", "LC_CTYPE", "LANG"]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok());
+            let fallback = ["C.UTF-8", "C.utf8", "UTF-8", "en_US.UTF-8", "en_US.utf8"]
+                .into_iter()
+                .map(str::to_owned);
+            let mut seen = BTreeSet::new();
+            for name in candidates.iter().cloned().chain(server).chain(fallback) {
+                if valid_locale_name(&name)
+                    && is_installed(&name)
+                    && seen.insert(name.clone())
+                    && locale_is_utf8(&name)
+                {
+                    return Ok(Self { name });
+                }
+            }
+            let installed = match installed {
+                Some(names) => names,
+                None => installed_locale_names().await?,
+            };
+            for name in installed {
+                if valid_locale_name(&name) && seen.insert(name.clone()) && locale_is_utf8(&name) {
+                    return Ok(Self { name });
+                }
+            }
+            anyhow::bail!(
+                "no usable UTF-8 locale found; generate or install a UTF-8 locale on the server and set LC_ALL, LC_CTYPE, or LANG to its name"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("UTF-8 locale selection is unsupported on this platform");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn installed_locale_names() -> Result<Vec<String>> {
+    const MAX_OUTPUT: usize = 64 * 1024;
+    const MAX_NAMES: usize = 1024;
+    let mut child = Command::new("locale")
+        .arg("-a")
+        .env("LC_ALL", "C")
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("LD_PRELOAD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context(
+            "cannot discover server locales; install a locale utility that supports locale -a",
+        )?;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stdout = child.stdout.take().context("locale stdout missing")?;
+        let mut bytes = Vec::new();
+        (&mut stdout)
+            .take((MAX_OUTPUT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        ensure!(
+            bytes.len() <= MAX_OUTPUT,
+            "server locale list exceeds 64 KiB"
+        );
+        ensure!(
+            child.wait().await?.success(),
+            "server locale discovery failed; check that locale -a succeeds on the server"
+        );
+        let listing = std::str::from_utf8(&bytes).context("server locale list is not UTF-8")?;
+        let mut names = Vec::new();
+        for name in listing.lines() {
+            ensure!(
+                names.len() < MAX_NAMES,
+                "server locale list exceeds 1024 names"
+            );
+            names.push(name.to_owned());
+        }
+        Ok::<_, anyhow::Error>(names)
+    })
+    .await;
+    match result {
+        Ok(Ok(names)) => Ok(names),
+        result => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            match result {
+                Ok(Err(error)) => Err(error),
+                Err(_) => anyhow::bail!(
+                    "server locale discovery timed out; check that locale -a completes on the server"
+                ),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn locale_is_utf8(name: &str) -> bool {
+    let Ok(name) = CString::new(name) else {
+        return false;
+    };
+    let locale =
+        unsafe { libc::newlocale(libc::LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut()) };
+    if locale.is_null() {
+        return false;
+    }
+    let codeset = unsafe { locale_codeset(libc::CODESET, locale) };
+    let is_utf8 = if codeset.is_null() {
+        false
+    } else {
+        let codeset = unsafe { CStr::from_ptr(codeset) }.to_bytes();
+        codeset.eq_ignore_ascii_case(b"UTF-8") || codeset.eq_ignore_ascii_case(b"UTF8")
+    };
+    unsafe { libc::freelocale(locale) };
+    is_utf8
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn enable_utf8_input(slave: &OwnedFd) -> Result<()> {
+    let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(slave.as_raw_fd(), attrs.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error()).context("read PTY input modes");
+    }
+    let mut attrs = unsafe { attrs.assume_init() };
+    attrs.c_iflag |= libc::IUTF8;
+    if unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attrs) } == -1 {
+        return Err(io::Error::last_os_error()).context("enable PTY UTF-8 input");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn enable_utf8_input(_slave: &OwnedFd) -> Result<()> {
+    Ok(())
+}
 
 pub struct Pty {
     pub io: AsyncFd<OwnedFd>,
@@ -26,12 +194,13 @@ fn winsize(size: Size) -> libc::winsize {
 }
 
 impl Pty {
-    pub fn spawn(argv: &[String], size: Size) -> Result<Self> {
+    pub async fn spawn(argv: &[String], size: Size, locale_candidates: &[String]) -> Result<Self> {
         size.validate()?;
         ensure!(
             argv.len() <= 256 && argv.iter().map(String::len).sum::<usize>() <= 128 * 1024,
             "command exceeds limit"
         );
+        let locale = Utf8Locale::select(locale_candidates).await?;
         let mut master = -1;
         let mut slave = -1;
         let mut window = winsize(size);
@@ -49,6 +218,7 @@ impl Pty {
         }
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        enable_utf8_input(&slave)?;
         for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
             if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
                 return Err(io::Error::last_os_error()).context("set PTY close-on-exec");
@@ -78,6 +248,9 @@ impl Pty {
             command.args(&argv[1..]);
         }
         command
+            .env_remove("LC_ALL")
+            .env("LC_CTYPE", &locale.name)
+            .env("LANG", &locale.name)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "mosh-rs");

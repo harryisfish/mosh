@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CELL_IMAGES: usize = 4096;
@@ -16,6 +16,8 @@ pub const MAX_RESOURCES: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_INPUT: usize = 256 * 1024;
 pub const MAX_EFFECT_BYTES: usize = 1024 * 1024;
 pub const MAX_EFFECTS: usize = 256;
+pub const MAX_LOCALE_CANDIDATES: usize = 8;
+pub const MAX_LOCALE_NAME_BYTES: usize = 128;
 pub type Digest = [u8; 32];
 
 fn bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -52,6 +54,60 @@ where
     }
 
     deserializer.deserialize_seq(BoundedVec::<T, MAX>(PhantomData))
+}
+
+pub fn valid_locale_name(name: &str) -> bool {
+    (1..=MAX_LOCALE_NAME_BYTES).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.@-".contains(&byte))
+}
+
+pub fn validate_locale_candidates(candidates: &[String]) -> Result<()> {
+    ensure!(
+        candidates.len() <= MAX_LOCALE_CANDIDATES,
+        "too many locale candidates"
+    );
+    ensure!(
+        candidates.iter().all(|name| valid_locale_name(name)),
+        "locale names must contain 1..=128 ASCII bytes from [A-Za-z0-9_.@-]"
+    );
+    Ok(())
+}
+
+fn deserialize_locale_candidates<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LocaleName(String);
+
+    impl<'de> Deserialize<'de> for LocaleName {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct LocaleNameVisitor;
+
+            impl serde::de::Visitor<'_> for LocaleNameVisitor {
+                type Value = LocaleName;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a locale name of 1..=128 ASCII bytes from [A-Za-z0-9_.@-]")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<LocaleName, E> {
+                    if !valid_locale_name(name) {
+                        return Err(E::custom(
+                            "locale names must contain 1..=128 ASCII bytes from [A-Za-z0-9_.@-]",
+                        ));
+                    }
+                    Ok(LocaleName(name.to_owned()))
+                }
+            }
+
+            deserializer.deserialize_str(LocaleNameVisitor)
+        }
+    }
+
+    bounded_vec::<_, LocaleName, MAX_LOCALE_CANDIDATES>(deserializer)
+        .map(|names| names.into_iter().map(|name| name.0).collect())
 }
 
 pub fn resource_digest(width: u32, height: u32, rgba: &[u8]) -> Digest {
@@ -437,6 +493,8 @@ pub struct BootstrapRequest {
     pub port: Option<u16>,
     pub idle_seconds: u64,
     pub clipboard_read: bool,
+    #[serde(deserialize_with = "deserialize_locale_candidates")]
+    pub locale_candidates: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
