@@ -908,13 +908,21 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         confirmed("RXVT_REPLY")
         for name, prefix, tail, expected in LEGACY_RXVT_DELAYED:
             before = observed.read_bytes()
+            assert expected.startswith(b"|")
+            process.send(expected[:1])
+            deadline = time.monotonic() + 3
+            while observed.read_bytes() != before + expected[:1]:
+                process.pump(0.01)
+                assert process.process.poll() is None
+                assert time.monotonic() < deadline, "accepted input did not clear the prior notice"
+            before += expected[:1]
             start = len(process.output)
             process.send(prefix)
             process.until(b"Input sequence timed out", timeout=3, start=start)
             process.send(tail)
             pump_for(0.05)
             assert observed.read_bytes() == before, (name, "late prefix or reply reached the PTY")
-            process.send(expected)
+            process.send(expected[1:])
             confirmed(name)
         process.send(b"\xe4")
         pump_for(0.08)
