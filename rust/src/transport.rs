@@ -1229,7 +1229,15 @@ fn validate_resource_meta(meta: &ResourceMeta) -> Result<()> {
 }
 
 fn safe_text(text: &str, limit: usize) -> bool {
-    text.len() <= limit && !text.chars().any(char::is_control)
+    if text.len() > limit {
+        return false;
+    }
+    let end = text
+        .as_bytes()
+        .iter()
+        .position(|b| !(b' '..=b'~').contains(b))
+        .unwrap_or(text.len());
+    !text[end..].chars().any(char::is_control)
 }
 
 pub fn validate_frame(frame: &Frame) -> Result<()> {
