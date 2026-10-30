@@ -13,7 +13,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarIn
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::diagnostics::{self, Context as DiagnosticContext, Stage};
@@ -45,6 +45,45 @@ enum GrantPhase {
     Body,
     End(Grant),
     Finished(Grant),
+}
+
+enum SshDestination {
+    Hostname(String),
+    Bind(IpAddr),
+}
+
+impl SshDestination {
+    async fn resolve(bind: Option<&str>, target: &str, ssh_port: Option<u16>) -> Result<Self> {
+        let bind = bind
+            .map(str::parse::<IpAddr>)
+            .transpose()
+            .context("--bind must be an IP address")?
+            .map(normalize_ip);
+        if let Some(bind) = bind.filter(|ip| !ip.is_unspecified()) {
+            return Ok(Self::Bind(bind));
+        }
+        Ok(Self::Hostname(ssh_hostname(target, ssh_port).await?))
+    }
+
+    fn authorize(self, mut grant: Grant) -> Result<Grant> {
+        match self {
+            Self::Hostname(hostname) => grant.address = hostname,
+            Self::Bind(bind) => {
+                let advertised = grant
+                    .address
+                    .parse::<IpAddr>()
+                    .map(normalize_ip)
+                    .context("server UDP address does not match --bind")?;
+                ensure!(
+                    advertised == bind,
+                    "server UDP address does not match --bind"
+                );
+                grant.address = bind.to_string();
+            }
+        }
+        validate_grant(&grant)?;
+        Ok(grant)
+    }
 }
 
 pub struct ClientIdentity {
@@ -258,14 +297,8 @@ pub async fn connect(endpoints: &ClientEndpoints, grant: &Grant) -> Result<Conne
     );
     let mut attempts = tokio::task::JoinSet::new();
     let mut last_error = None;
-    for address in addresses {
-        let address = if let IpAddr::V6(ipv6) = address.ip()
-            && let Some(ipv4) = ipv6.to_ipv4_mapped()
-        {
-            SocketAddr::new(ipv4.into(), address.port())
-        } else {
-            address
-        };
+    for mut address in addresses {
+        address.set_ip(normalize_ip(address.ip()));
         let endpoint = if address.is_ipv4() {
             &endpoints.ipv4
         } else {
@@ -316,6 +349,7 @@ pub async fn bootstrap_ssh(
     );
     request.client_cert = identity.certificate();
     validate_request(&request)?;
+    let destination = SshDestination::resolve(request.bind.as_deref(), target, ssh_port).await?;
     let mut command = ssh_command(ssh_port);
     command
         .arg("-T")
@@ -334,31 +368,8 @@ pub async fn bootstrap_ssh(
                 ""
             }
         ));
-    let mut grant = run_bootstrap(command, &request).await?;
-    let use_ssh_hostname = request
-        .bind
-        .as_deref()
-        .map(str::parse::<IpAddr>)
-        .transpose()?
-        .is_none_or(|ip| ip.is_unspecified());
-    let mut query = ssh_command(ssh_port);
-    query.arg("-G").arg("--").arg(target);
-    if use_ssh_hostname
-        && let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), query.output()).await
-        && output.status.success()
-        && output.stdout.len() <= MAX_CONTROL
-        && let Some(hostname) = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.strip_prefix("hostname "))
-    {
-        ensure!(
-            hostname.len() <= 1024 && !hostname.chars().any(char::is_control),
-            "invalid SSH hostname"
-        );
-        grant.address = hostname.trim_matches(['[', ']']).to_owned();
-    }
-    validate_grant(&grant)?;
-    Ok(grant)
+    let grant = run_bootstrap(command, &request).await?;
+    destination.authorize(grant)
 }
 
 pub async fn bootstrap_local(
@@ -382,6 +393,91 @@ fn ssh_command(port: Option<u16>) -> Command {
         command.arg("-p").arg(port.to_string());
     }
     command
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
+}
+
+async fn ssh_hostname(target: &str, ssh_port: Option<u16>) -> Result<String> {
+    let mut child = ssh_command(ssh_port)
+        .arg("-G")
+        .arg("--")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .context("cannot query SSH configuration")?;
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("SSH configuration stdout missing")?
+            .take((MAX_CONTROL + 1) as u64);
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await?;
+        ensure!(
+            bytes.len() <= MAX_CONTROL,
+            "SSH configuration output exceeds limit"
+        );
+        let status = child.wait().await?;
+        ensure!(
+            status.success(),
+            "SSH configuration query exited with {status}"
+        );
+        let output = std::str::from_utf8(&bytes).context("SSH configuration is not UTF-8")?;
+        let mut hostname = None;
+        for line in output.lines() {
+            let mut fields = line.splitn(2, char::is_whitespace);
+            if fields.next() == Some("hostname") {
+                ensure!(
+                    hostname.is_none(),
+                    "SSH configuration contains duplicate hostname"
+                );
+                hostname = Some(fields.next().unwrap_or(""));
+            }
+        }
+        let hostname = hostname.context("SSH configuration is missing hostname")?;
+        ensure!(
+            !hostname.is_empty()
+                && hostname.len() <= 1024
+                && !hostname
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control()),
+            "invalid SSH hostname"
+        );
+        let hostname = if hostname.starts_with('[') && hostname.ends_with(']') {
+            let inner = &hostname[1..hostname.len() - 1];
+            inner.parse::<Ipv6Addr>().context("invalid SSH hostname")?;
+            inner
+        } else {
+            hostname
+        };
+        ensure!(!hostname.contains(['[', ']']), "invalid SSH hostname");
+        Ok(hostname
+            .parse::<IpAddr>()
+            .map(normalize_ip)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| hostname.to_owned()))
+    })
+    .await;
+    match result {
+        Ok(Ok(hostname)) => Ok(hostname),
+        result => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            match result {
+                Ok(Err(error)) => Err(error),
+                Err(_) => bail!("SSH configuration query timed out"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
 }
 
 fn shell_quote(value: &str) -> String {
