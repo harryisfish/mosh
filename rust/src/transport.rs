@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,6 +13,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarIn
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -119,6 +120,43 @@ pub struct ClientEndpoints {
     ipv6: Option<Endpoint>,
 }
 
+#[derive(Clone)]
+pub struct ServerListeners {
+    primary: Endpoint,
+    secondary: Option<Endpoint>,
+}
+
+impl ServerListeners {
+    pub async fn accept(&self) -> Option<quinn::Incoming> {
+        let Some(secondary) = &self.secondary else {
+            return self.primary.accept().await;
+        };
+        tokio::select! {
+            incoming = self.primary.accept() => {
+                if incoming.is_some() { incoming } else { secondary.accept().await }
+            }
+            incoming = secondary.accept() => {
+                if incoming.is_some() { incoming } else { self.primary.accept().await }
+            }
+        }
+    }
+
+    pub fn close(&self, code: VarInt, reason: &[u8]) {
+        self.primary.close(code, reason);
+        if let Some(secondary) = &self.secondary {
+            secondary.close(code, reason);
+        }
+    }
+
+    pub async fn wait_idle(&self) {
+        tokio::join!(self.primary.wait_idle(), async {
+            if let Some(secondary) = &self.secondary {
+                secondary.wait_idle().await;
+            }
+        });
+    }
+}
+
 impl ClientEndpoints {
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         for endpoint in self.ipv4.iter().chain(self.ipv6.iter()) {
@@ -208,7 +246,7 @@ fn transport_config() -> TransportConfig {
     config
 }
 
-pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
+pub fn listen(request: &BootstrapRequest) -> Result<(ServerListeners, Grant)> {
     validate_request(request)?;
     let certified = rcgen::generate_simple_self_signed(vec!["mosh.local".into()])?;
     let cert = certified.cert.der().to_vec();
@@ -239,19 +277,38 @@ pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
         .map(str::parse::<IpAddr>)
         .transpose()
         .context("--bind must be an IP address")?
-        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-    let address = SocketAddr::new(bind, request.port.unwrap_or(0));
-    let endpoint = Endpoint::server(config.clone(), address).or_else(|error| {
-        if request.bind.is_none() {
-            Endpoint::server(
-                config,
-                (Ipv4Addr::UNSPECIFIED, request.port.unwrap_or(0)).into(),
-            )
-        } else {
-            Err(error)
+        .map(normalize_ip);
+    let (primary, secondary) =
+        server_sockets(bind, request.port.unwrap_or(0)).context("bind server UDP listeners")?;
+    let local = primary.local_addr()?;
+    if secondary.is_some() {
+        config
+            .max_incoming(16)
+            .incoming_buffer_size_total(2 * 1024 * 1024);
+    }
+    let runtime = Arc::new(quinn::TokioRuntime);
+    let primary = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config.clone()),
+        primary,
+        runtime.clone(),
+    )?;
+    let secondary = if let Some(socket) = secondary {
+        match Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(config),
+            socket,
+            runtime,
+        ) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                primary.close(1_u32.into(), b"listener startup failed");
+                return Err(error).context("initialize server UDP listener");
+            }
         }
-    })?;
-    let local = endpoint.local_addr()?;
+    } else {
+        None
+    };
     let address = if !local.ip().is_unspecified() {
         local.ip().to_string()
     } else {
@@ -272,7 +329,7 @@ pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     Ok((
-        endpoint,
+        ServerListeners { primary, secondary },
         Grant {
             version: PROTOCOL_VERSION,
             session,
@@ -280,6 +337,125 @@ pub fn listen(request: &BootstrapRequest) -> Result<(Endpoint, Grant)> {
             port: local.port(),
             address,
         },
+    ))
+}
+
+fn family_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT)
+    )
+}
+
+fn dual_stack_unavailable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || matches!(
+            error.raw_os_error(),
+            Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EINVAL)
+        )
+}
+
+fn verify_ipv6_mode(socket: &Socket, only_v6: bool) -> io::Result<()> {
+    if socket.only_v6()? != only_v6 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "IPv6 socket did not retain the requested V6ONLY mode",
+        ));
+    }
+    Ok(())
+}
+
+fn dual_stack_socket(port: u16) -> io::Result<Option<UdpSocket>> {
+    if cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let socket = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(socket) => socket,
+        Err(error) if family_unavailable(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = socket
+        .set_only_v6(false)
+        .and_then(|()| verify_ipv6_mode(&socket, false))
+    {
+        return if dual_stack_unavailable(&error) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if let Err(error) = socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into()) {
+        return if family_unavailable(&error) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if let Err(error) = verify_ipv6_mode(&socket, false) {
+        return if dual_stack_unavailable(&error) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(Some(socket.into()))
+}
+
+fn bind_udp(address: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+        verify_ipv6_mode(&socket, true)?;
+    }
+    socket.bind(&address.into())?;
+    if address.is_ipv6() {
+        verify_ipv6_mode(&socket, true)?;
+    }
+    Ok(socket.into())
+}
+
+fn server_sockets(bind: Option<IpAddr>, port: u16) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
+    if let Some(bind) = bind {
+        return Ok((bind_udp(SocketAddr::new(bind, port))?, None));
+    }
+    if let Some(socket) = dual_stack_socket(port)? {
+        return Ok((socket, None));
+    }
+    for _ in 0..8 {
+        let ipv6 = match bind_udp((Ipv6Addr::UNSPECIFIED, port).into()) {
+            Ok(socket) => Some(socket),
+            Err(error) if family_unavailable(&error) => None,
+            Err(error) => return Err(error),
+        };
+        let common_port = match &ipv6 {
+            Some(socket) => socket.local_addr()?.port(),
+            None => port,
+        };
+        match bind_udp((Ipv4Addr::UNSPECIFIED, common_port).into()) {
+            Ok(ipv4) => {
+                return Ok(match ipv6 {
+                    Some(ipv6) => (ipv6, Some(ipv4)),
+                    None => (ipv4, None),
+                });
+            }
+            Err(error) if family_unavailable(&error) => {
+                return match ipv6 {
+                    Some(ipv6) => Ok((ipv6, None)),
+                    None => Err(error),
+                };
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse && port == 0 && ipv6.is_some() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "cannot allocate a common IPv4/IPv6 UDP port after 8 attempts",
     ))
 }
 

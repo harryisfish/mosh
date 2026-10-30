@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail, ensure};
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
 use mosh_rs::model::*;
 use mosh_rs::session::SessionActor;
-use mosh_rs::transport::{self, ClientEndpoints, ClientIdentity, Incoming};
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use mosh_rs::transport::{self, ClientEndpoints, ClientIdentity, Incoming, ServerListeners};
+use quinn::{Connection, RecvStream, SendStream, VarInt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -400,7 +400,7 @@ impl View {
 }
 
 struct Running {
-    endpoint: Endpoint,
+    endpoint: ServerListeners,
     task: Option<JoinHandle<Result<()>>>,
 }
 
@@ -948,13 +948,17 @@ async fn verify_prepared() -> Result<()> {
             "--close-fixture".into(),
             marker.to_string_lossy().into_owned(),
         ],
-        bind: Some("127.0.0.1".into()),
+        bind: None,
         port: None,
         idle_seconds: 60,
         clipboard_read: false,
         locale_candidates: Vec::new(),
     };
     let (endpoint, grant) = transport::listen(&request)?;
+    let mut ipv4_grant = grant.clone();
+    ipv4_grant.address = "127.0.0.1".into();
+    let mut ipv6_grant = grant.clone();
+    ipv6_grant.address = "::1".into();
     let actor = SessionActor::new(&request, grant.session.clone())?;
     let mut grant_bytes = Vec::new();
     transport::write_grant(&mut grant_bytes, &grant)?;
@@ -963,7 +967,7 @@ async fn verify_prepared() -> Result<()> {
         endpoint,
     };
     let client = identity.endpoint(&grant)?;
-    let handshake = transport::connect(&client, &grant).await?;
+    let handshake = transport::connect(&client, &ipv4_grant).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     ensure!(
         !marker.exists(),
@@ -972,7 +976,12 @@ async fn verify_prepared() -> Result<()> {
     handshake.close(0_u32.into(), b"no attachment");
 
     for invalid in 0..6 {
-        let connection = transport::connect(&client, &grant).await?;
+        let destination = if invalid % 2 == 0 {
+            &ipv4_grant
+        } else {
+            &ipv6_grant
+        };
+        let connection = transport::connect(&client, destination).await?;
         let (mut send, mut receive) = connection.open_bi().await?;
         let mut attach = Attach {
             version: PROTOCOL_VERSION,
@@ -1015,8 +1024,8 @@ async fn verify_prepared() -> Result<()> {
     let mut view = View::new();
     view.ack_effects = true;
     let (first, second) = tokio::join!(
-        Peer::attach(&client, &grant, &mut first_view, 1, None, 3),
-        Peer::attach(&client, &grant, &mut view, 2, None, 3),
+        Peer::attach(&client, &ipv4_grant, &mut first_view, 1, None, 3),
+        Peer::attach(&client, &ipv6_grant, &mut view, 2, None, 3),
     );
     let (mut peer, mut view) = match (first, second) {
         (Ok(first), Ok(second)) if first.epoch > second.epoch => (first, first_view),
@@ -1038,11 +1047,18 @@ async fn verify_prepared() -> Result<()> {
             .is_err(),
         "obsolete attachment was accepted after command startup"
     );
+    let epoch = peer.epoch;
+    let destination = if peer.connection.remote_address().is_ipv4() {
+        &ipv6_grant
+    } else {
+        &ipv4_grant
+    };
     drop(peer);
-    let mut peer = Peer::attach(&client, &grant, &mut view, 3, None, 3).await?;
+    let mut peer = Peer::attach(&client, destination, &mut view, 3, None, 3).await?;
     view.wait_text(&mut peer, "CLOSE_READY").await?;
     ensure!(
-        extract_pid(&view.text())? == pid
+        peer.epoch > epoch
+            && extract_pid(&view.text())? == pid
             && std::fs::read_to_string(&marker)? == format!("{pid}\n"),
         "reattachment restarted the user command"
     );
@@ -1060,6 +1076,42 @@ async fn verify_prepared() -> Result<()> {
     )
     .await???;
     std::fs::remove_file(&marker)?;
+
+    let (unpolled, unpolled_grant) = transport::listen(&request)?;
+    let actor = SessionActor::new(&request, unpolled_grant.session.clone())?;
+    drop(actor.run(unpolled.clone()));
+    ensure!(
+        tokio::time::timeout(WAIT, unpolled.accept())
+            .await?
+            .is_none(),
+        "unpolled actor future left a listener accepting"
+    );
+
+    let (cancelled, cancellation_grant) = transport::listen(&request)?;
+    drop(cancelled.clone());
+    let actor = SessionActor::new(&request, cancellation_grant.session.clone())?;
+    let cancellation_task = tokio::task::spawn_local(actor.run(cancelled.clone()));
+    let cancellation_client = identity.endpoint(&cancellation_grant)?;
+    let handshake = transport::connect(&cancellation_client, &cancellation_grant).await?;
+    handshake.close(0_u32.into(), b"cancellation fixture");
+    cancellation_task.abort();
+    ensure!(
+        cancellation_task
+            .await
+            .is_err_and(|error| error.is_cancelled()),
+        "actor was not cancelled"
+    );
+    ensure!(
+        tokio::time::timeout(WAIT, cancelled.accept())
+            .await?
+            .is_none(),
+        "cancelled actor left a listener accepting"
+    );
+    cancelled.wait_idle().await;
+    ensure!(
+        !marker.exists(),
+        "cancelled prepared actor started a command"
+    );
 
     let mut missing = request;
     missing.command = vec![
@@ -1096,7 +1148,7 @@ async fn verify_prepared() -> Result<()> {
         "spawn failure returned to Prepared instead of ending"
     );
     println!(
-        "verified grant/TLS/invalid attaches have no command side effects, competing first attaches spawn once, reconnect keeps the PID, and spawn failure ends the actor"
+        "verified grant/TLS/invalid attaches have no command side effects, competing IPv4/IPv6 first attaches spawn once, cross-family reconnect advances the epoch and keeps the PID, unpolled and running cancellation close all listeners, and spawn failure ends the actor"
     );
     Ok(())
 }

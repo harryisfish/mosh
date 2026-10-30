@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, VarInt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -58,6 +58,24 @@ struct AcceptTask(JoinHandle<()>);
 impl Drop for AcceptTask {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+struct ListenerGuard(Option<transport::ServerListeners>);
+
+impl ListenerGuard {
+    fn close(mut self, code: VarInt, reason: &[u8]) {
+        if let Some(listeners) = self.0.take() {
+            listeners.close(code, reason);
+        }
+    }
+}
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        if let Some(listeners) = &self.0 {
+            listeners.close(0_u32.into(), b"session cancelled");
+        }
     }
 }
 
@@ -212,46 +230,52 @@ impl SessionActor {
         })
     }
 
-    pub async fn run(self, endpoint: Endpoint) -> Result<()> {
-        let mut prepared = self.prepared;
-        let sender = prepared.sender.clone();
-        let accepting = endpoint.clone();
-        let connections = Arc::new(tokio::sync::Semaphore::new(8));
-        let accept_task = AcceptTask(tokio::spawn(async move {
-            while let Some(incoming) = accepting.accept().await {
-                let Ok(permit) = connections.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
+    pub fn run(
+        self,
+        listeners: transport::ServerListeners,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let accepting = listeners.clone();
+        let listeners = ListenerGuard(Some(listeners));
+        async move {
+            let mut prepared = self.prepared;
+            let sender = prepared.sender.clone();
+            let connections = Arc::new(tokio::sync::Semaphore::new(8));
+            let accept_task = AcceptTask(tokio::spawn(async move {
+                while let Some(incoming) = accepting.accept().await {
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        incoming.refuse();
+                        continue;
+                    };
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Ok(Ok(connection)) =
+                            tokio::time::timeout(Duration::from_secs(10), incoming).await
+                        {
+                            let _ = serve_connection(connection, sender).await;
+                        }
+                    });
+                }
+            }));
+            let result = async {
+                let Some(first) = prepared.wait_first().await? else {
+                    return Ok(());
                 };
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Ok(Ok(connection)) =
-                        tokio::time::timeout(Duration::from_secs(10), incoming).await
-                    {
-                        let _ = serve_connection(connection, sender).await;
-                    }
-                });
+                let mut running = prepared.start(first).await?;
+                let result = running.run_actor().await;
+                running.pty.close();
+                result
             }
-        }));
-        let result = async {
-            let Some(first) = prepared.wait_first().await? else {
-                return Ok(());
-            };
-            let mut running = prepared.start(first).await?;
-            let result = running.run_actor().await;
-            running.pty.close();
+            .await;
+            drop(accept_task);
+            if let Err(error) = &result {
+                let reason: String = error.to_string().chars().take(240).collect();
+                listeners.close(1u32.into(), reason.as_bytes());
+            } else {
+                listeners.close(0u32.into(), b"session ended");
+            }
             result
         }
-        .await;
-        drop(accept_task);
-        if let Err(error) = &result {
-            let reason: String = error.to_string().chars().take(240).collect();
-            endpoint.close(1u32.into(), reason.as_bytes());
-        } else {
-            endpoint.close(0u32.into(), b"session ended");
-        }
-        result
     }
 }
 
