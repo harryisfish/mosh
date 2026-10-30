@@ -498,8 +498,13 @@ impl TerminalModel {
 }
 
 fn display_metadata(text: &str, limit: usize) -> String {
-    let mut result = String::new();
-    for c in text.chars().filter(|c| !c.is_control()) {
+    let max = text.len().min(limit);
+    let end = text.as_bytes()[..max]
+        .iter()
+        .position(|b| !(b' '..=b'~').contains(b))
+        .unwrap_or(max);
+    let mut result = text[..end].to_owned();
+    for c in text[end..].chars().filter(|c| !c.is_control()) {
         if result.len() + c.len_utf8() > limit {
             break;
         }
