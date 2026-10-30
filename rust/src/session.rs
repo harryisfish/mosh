@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use quinn::{Connection, Endpoint};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::diagnostics::{self, Context as DiagnosticContext, ProgressSnapshot, Stage};
@@ -20,6 +20,7 @@ enum Event {
         request: Attach,
         connection: Connection,
         output: mpsc::Sender<ServerMessage>,
+        flushed: oneshot::Receiver<()>,
     },
     Message {
         epoch: u64,
@@ -80,6 +81,35 @@ struct Attachment {
     exit_sent: bool,
 }
 
+impl Attachment {
+    fn new(
+        epoch: u64,
+        connection: Connection,
+        output: mpsc::Sender<ServerMessage>,
+        effects_ack: u64,
+    ) -> Self {
+        Self {
+            epoch,
+            connection,
+            output,
+            confirmed: None,
+            sent: BTreeMap::new(),
+            last_sent: 0,
+            display: None,
+            display_started: Instant::now(),
+            display_bytes: 0,
+            checked_revision: 0,
+            cancellations: 0,
+            resources: BTreeMap::new(),
+            known_resources: BTreeSet::new(),
+            effects_ack,
+            effects_sent: effects_ack,
+            floor_sent: 0,
+            exit_sent: false,
+        }
+    }
+}
+
 impl Drop for Attachment {
     fn drop(&mut self) {
         if let Some(task) = self.display.take() {
@@ -93,6 +123,28 @@ impl Drop for Attachment {
 }
 
 pub struct SessionActor {
+    prepared: PreparedSession,
+}
+
+struct PreparedSession {
+    command: Vec<String>,
+    size: Size,
+    terminal: TerminalModel,
+    session: String,
+    events: mpsc::Receiver<Event>,
+    sender: mpsc::Sender<Event>,
+    deadline: tokio::time::Instant,
+    idle: Duration,
+}
+
+struct FirstAttachment {
+    attempt: u64,
+    connection: Connection,
+    output: mpsc::Sender<ServerMessage>,
+    flushed: oneshot::Receiver<()>,
+}
+
+struct RunningSession {
     pty: Pty,
     terminal: TerminalModel,
     session: String,
@@ -121,7 +173,6 @@ pub struct SessionActor {
     effect_sequence: u64,
     queries: BTreeMap<u64, Instant>,
     disconnected_at: Instant,
-    ever_attached: bool,
     idle: Duration,
     exit: Option<(i32, Instant)>,
     eof: bool,
@@ -142,18 +193,143 @@ impl SessionActor {
             (60..=604800).contains(&request.idle_seconds),
             "idle timeout must be 60..=604800 seconds"
         );
-        let pty = Pty::spawn(&request.command, request.size)?;
         let terminal = TerminalModel::new(request.size, request.clipboard_read)?;
         let (sender, events) = mpsc::channel(128);
         Ok(Self {
+            prepared: PreparedSession {
+                command: request.command.clone(),
+                size: request.size,
+                terminal,
+                session,
+                events,
+                sender,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                idle: Duration::from_secs(request.idle_seconds),
+            },
+        })
+    }
+
+    pub async fn run(self, endpoint: Endpoint) -> Result<()> {
+        let mut prepared = self.prepared;
+        let sender = prepared.sender.clone();
+        let accepting = endpoint.clone();
+        let connections = Arc::new(tokio::sync::Semaphore::new(8));
+        let accept_task = AcceptTask(tokio::spawn(async move {
+            while let Some(incoming) = accepting.accept().await {
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Ok(Ok(connection)) =
+                        tokio::time::timeout(Duration::from_secs(10), incoming).await
+                    {
+                        let _ = serve_connection(connection, sender).await;
+                    }
+                });
+            }
+        }));
+        let result = async {
+            let Some(first) = prepared.wait_first().await? else {
+                return Ok(());
+            };
+            let mut running = prepared.start(first).await?;
+            let result = running.run_actor().await;
+            running.pty.close();
+            result
+        }
+        .await;
+        drop(accept_task);
+        if let Err(error) = &result {
+            let reason: String = error.to_string().chars().take(240).collect();
+            endpoint.close(1u32.into(), reason.as_bytes());
+        } else {
+            endpoint.close(0u32.into(), b"session ended");
+        }
+        result
+    }
+}
+
+fn valid_attachment(
+    request: &Attach,
+    session: &str,
+    attempt: u64,
+    committed: u64,
+    effects: u64,
+) -> bool {
+    request.version == PROTOCOL_VERSION
+        && request.session == session
+        && request.attempt > attempt
+        && request.committed <= committed
+        && request.effects <= effects
+}
+
+fn reject_attachment(output: &mpsc::Sender<ServerMessage>, reason: &str) {
+    let _ = output.try_send(ServerMessage::Error {
+        message: reason.into(),
+    });
+}
+
+impl PreparedSession {
+    async fn wait_first(&mut self) -> Result<Option<FirstAttachment>> {
+        loop {
+            let event = tokio::select! {
+                _ = tokio::time::sleep_until(self.deadline) => return Ok(None),
+                event = self.events.recv() => event,
+            };
+            if tokio::time::Instant::now() >= self.deadline {
+                return Ok(None);
+            }
+            let Some(event) = event else {
+                return Ok(None);
+            };
+            if let Event::Attach {
+                request,
+                connection,
+                output,
+                flushed,
+            } = event
+            {
+                if !valid_attachment(&request, &self.session, 0, 0, 0) {
+                    reject_attachment(&output, "invalid or obsolete session attachment");
+                    continue;
+                }
+                if connection.close_reason().is_some() || output.is_closed() {
+                    continue;
+                }
+                return Ok(Some(FirstAttachment {
+                    attempt: request.attempt,
+                    connection,
+                    output,
+                    flushed,
+                }));
+            }
+        }
+    }
+
+    async fn start(self, first: FirstAttachment) -> Result<RunningSession> {
+        let pty = match Pty::spawn(&self.command, self.size) {
+            Ok(pty) => pty,
+            Err(error) => {
+                reject_attachment(
+                    &first.output,
+                    &format!("remote command startup failed: {error:#}"),
+                );
+                let _ = first.flushed.await;
+                return Err(error);
+            }
+        };
+        let mut running = RunningSession {
             pty,
-            terminal,
-            session,
-            events,
-            sender,
-            attachment: None,
-            attempt: 0,
-            epoch: 0,
+            terminal: self.terminal,
+            session: self.session,
+            events: self.events,
+            sender: self.sender,
+            attachment: Some(Attachment::new(1, first.connection, first.output, 0)),
+            attempt: first.attempt,
+            epoch: 1,
             accepted: 0,
             committed: 0,
             notified_commit: 0,
@@ -174,50 +350,24 @@ impl SessionActor {
             effect_sequence: 0,
             queries: BTreeMap::new(),
             disconnected_at: Instant::now(),
-            ever_attached: false,
-            idle: Duration::from_secs(request.idle_seconds),
+            idle: self.idle,
             exit: None,
             eof: false,
             fatal: false,
             resource_sequence: 0,
             exit_acknowledged: false,
             display_cancellations: 0,
-        })
+        };
+        running.send(ServerMessage::Attached {
+            epoch: 1,
+            committed: 0,
+            effect_floor: 0,
+        });
+        Ok(running)
     }
+}
 
-    pub async fn run(mut self, endpoint: Endpoint) -> Result<()> {
-        let sender = self.sender.clone();
-        let accepting = endpoint.clone();
-        let connections = Arc::new(tokio::sync::Semaphore::new(8));
-        let accept_task = AcceptTask(tokio::spawn(async move {
-            while let Some(incoming) = accepting.accept().await {
-                let Ok(permit) = connections.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
-                };
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Ok(Ok(connection)) =
-                        tokio::time::timeout(Duration::from_secs(10), incoming).await
-                    {
-                        let _ = serve_connection(connection, sender).await;
-                    }
-                });
-            }
-        }));
-        let result = self.run_actor().await;
-        drop(accept_task);
-        if let Err(error) = &result {
-            let reason: String = error.to_string().chars().take(240).collect();
-            endpoint.close(1u32.into(), reason.as_bytes());
-        } else {
-            endpoint.close(0u32.into(), b"session ended");
-        }
-        self.pty.close();
-        result
-    }
-
+impl RunningSession {
     async fn run_actor(&mut self) -> Result<()> {
         let mut timer = tokio::time::interval(Duration::from_millis(16));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -307,6 +457,7 @@ impl SessionActor {
                 request,
                 connection,
                 output,
+                ..
             } => self.attach(request, connection, output)?,
             Event::Message { epoch, message } if self.active(epoch) => {
                 if let Err(error) = self.message(epoch, message) {
@@ -372,16 +523,14 @@ impl SessionActor {
         connection: Connection,
         output: mpsc::Sender<ServerMessage>,
     ) -> Result<()> {
-        let valid = request.version == PROTOCOL_VERSION
-            && request.session == self.session
-            && request.attempt > self.attempt
-            && request.committed <= self.committed
-            && request.effects <= self.effect_sequence;
-        if !valid {
-            let _ = output.try_send(ServerMessage::Error {
-                message: "invalid or obsolete session attachment".into(),
-            });
-            connection.close(1u32.into(), b"invalid attachment");
+        if !valid_attachment(
+            &request,
+            &self.session,
+            self.attempt,
+            self.committed,
+            self.effect_sequence,
+        ) {
+            reject_attachment(&output, "invalid or obsolete session attachment");
             return Ok(());
         }
         self.attachment.take();
@@ -391,28 +540,9 @@ impl SessionActor {
             .epoch
             .checked_add(1)
             .context("attachment epoch exhausted")?;
-        self.ever_attached = true;
         self.notified_commit = self.committed;
         let effects_ack = request.effects.max(self.effect_floor);
-        self.attachment = Some(Attachment {
-            epoch: self.epoch,
-            connection,
-            output,
-            confirmed: None,
-            sent: BTreeMap::new(),
-            last_sent: 0,
-            display: None,
-            display_started: Instant::now(),
-            display_bytes: 0,
-            checked_revision: 0,
-            cancellations: 0,
-            resources: BTreeMap::new(),
-            known_resources: BTreeSet::new(),
-            effects_ack,
-            effects_sent: effects_ack,
-            floor_sent: 0,
-            exit_sent: false,
-        });
+        self.attachment = Some(Attachment::new(self.epoch, connection, output, effects_ack));
         self.send(ServerMessage::Attached {
             epoch: self.epoch,
             committed: self.committed,
@@ -796,15 +926,8 @@ impl SessionActor {
                 return Ok(true);
             }
         }
-        if self.attachment.is_none() {
-            let limit = if self.ever_attached {
-                self.idle
-            } else {
-                Duration::from_secs(60)
-            };
-            if self.disconnected_at.elapsed() >= limit {
-                return Ok(true);
-            }
+        if self.attachment.is_none() && self.disconnected_at.elapsed() >= self.idle {
+            return Ok(true);
         }
         Ok(false)
     }
@@ -1002,11 +1125,13 @@ async fn serve_connection(connection: Connection, sender: mpsc::Sender<Event>) -
         bail!("missing attachment request");
     };
     let (send, mut receive) = mpsc::channel(64);
+    let (flushed, flushing) = oneshot::channel();
     sender
         .send(Event::Attach {
             request,
             connection: connection.clone(),
             output: send,
+            flushed: flushing,
         })
         .await?;
     let epoch = match receive
@@ -1015,11 +1140,29 @@ async fn serve_connection(connection: Connection, sender: mpsc::Sender<Event>) -
         .context("session ended before attachment")?
     {
         message @ ServerMessage::Attached { epoch, .. } => {
-            transport::send_message(&mut output, &message).await?;
+            let sent = transport::send_message(&mut output, &message).await;
+            let _ = flushed.send(());
+            sent?;
             epoch
         }
         message => {
-            transport::send_message(&mut output, &message).await?;
+            let reason: String = match &message {
+                ServerMessage::Error { message } => message.as_str(),
+                _ => "session attachment rejected",
+            }
+            .chars()
+            .take(240)
+            .collect();
+            let sent = tokio::time::timeout(Duration::from_secs(10), async {
+                transport::send_message(&mut output, &message).await?;
+                output.finish()?;
+                output.stopped().await?;
+                Result::<()>::Ok(())
+            })
+            .await;
+            let _ = flushed.send(());
+            connection.close(1u32.into(), reason.as_bytes());
+            sent??;
             return Ok(());
         }
     };

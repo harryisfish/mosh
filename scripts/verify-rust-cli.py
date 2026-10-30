@@ -57,6 +57,13 @@ def exact(data, timeout=5):
 def remote_fixture(mode, state):
     tty.setraw(0)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "startup":
+        with Path(state + ".starts").open("a") as marker:
+            marker.write(str(os.getpid()) + "\n")
+        os.write(1, b"\x1b[2J\x1b[HSTARTUP_READY")
+        exact(b"finish\r")
+        os.write(1, b"\r\nSTARTUP_DONE")
+        return 0
     if mode == "prediction":
         os.write(1, b"\x1b[2J\x1b[HPREDICTION_READY\x1b[3;1H")
         for glyph in b"abc":
@@ -150,6 +157,10 @@ def proxy_bootstrap(server, state):
     result = subprocess.run([server, "bootstrap", *diagnostic_args], input=request,
                             stdout=subprocess.PIPE, check=True)
     grant = decode_grant(result.stdout)
+    if Path(state + ".drop").exists():
+        assert not Path(state).exists(), "server bootstrap spawned a command before publishing its grant"
+        assert not Path(state + ".starts").exists(), "server bootstrap created a command marker"
+        Path(state + ".prepared").touch()
     front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     front.bind(("127.0.0.1", 0))
     back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -548,6 +559,8 @@ def verify(bin_dir, network, diagnostics=False, evidence_dir=None):
     server = str(bin_dir / "mosh-rs-server")
     diagnostic_args = ["--diagnostics"] if diagnostics else []
     with tempfile.TemporaryDirectory(prefix="mosh-rs-cli-") as temporary:
+        verify_delayed_spawn(bin_dir, temporary)
+        verify_failed_spawn(bin_dir, temporary)
         verify_prediction(bin_dir, temporary)
         state = str(Path(temporary) / "session.json")
         prefix = [client, *diagnostic_args, "--local", "--server", server, "--graphics", "kitty", "--clipboard-read", "--"]
@@ -687,6 +700,59 @@ else:
         if diagnostics:
             verify_diagnostics(client, server, script, temporary)
             check_diagnostics(evidence_dir)
+
+
+def verify_delayed_spawn(bin_dir, temporary):
+    script = str(Path(__file__).resolve())
+    state = str(Path(temporary) / "startup.json")
+    wrapper = Path(temporary) / "startup-bootstrap-proxy"
+    wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', str(bin_dir / 'mosh-rs-server'), state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+    wrapper.chmod(0o700)
+    Path(state + ".drop").touch()
+    process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server", str(wrapper),
+                               "--", sys.executable, script, "--remote", "startup", state])
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            process.pump(0.01)
+            if Path(state + ".stats").exists():
+                stats = json.loads(Path(state + ".stats").read_text())
+                if stats["dropped"] > 0:
+                    break
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+            assert time.monotonic() < deadline, "initial UDP traffic did not reach the blocking relay"
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            process.pump(0.01)
+        assert not Path(state).exists(), "bootstrap started a user process before authenticated attach"
+        assert not Path(state + ".starts").exists(), "UDP-blocked bootstrap created a command marker"
+        assert Path(state + ".prepared").exists(), "grant publication was not checked before relay startup"
+        Path(state + ".drop").unlink()
+        process.until(b"STARTUP_READY")
+        command = json.loads(Path(state).read_text())["command"]
+        assert Path(state + ".starts").read_text() == f"{command}\n", "first attach started duplicate commands"
+        process.send(b"finish\r")
+        process.until(b"STARTUP_DONE")
+        process.finish(0)
+        assert Path(state + ".starts").read_text() == f"{command}\n", "command restarted during the session"
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI bootstrap completed with blocked UDP and no command marker; restored attach started the command once", flush=True)
+
+
+def verify_failed_spawn(bin_dir, temporary):
+    missing = str(Path(temporary) / "missing-command")
+    process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server",
+                               str(bin_dir / "mosh-rs-server"), "--", missing])
+    try:
+        process.finish(1)
+        assert b"remote command startup failed" in process.output, "spawn failure was not shown to the client"
+        assert b"retrying" not in process.output, "fatal spawn failure entered the retry loop"
+        assert process.output.count(b"remote command startup failed") == 1, "spawn failure was reported repeatedly"
+    finally:
+        process.close()
+    print("CLI missing command exits with its startup error and never retries the dead session", flush=True)
 
 
 def verify_prediction(bin_dir, temporary):

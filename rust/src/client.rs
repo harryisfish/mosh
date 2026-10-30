@@ -26,7 +26,7 @@ use crate::transport::{self, ClientEndpoints, Incoming};
 enum NetworkEvent {
     Opened {
         attempt: u64,
-        result: Result<Link>,
+        result: std::result::Result<Link, OpenFailure>,
     },
     Message {
         attempt: u64,
@@ -41,6 +41,11 @@ enum NetworkEvent {
         reason: String,
         fatal: bool,
     },
+}
+
+struct OpenFailure {
+    error: anyhow::Error,
+    fatal: bool,
 }
 
 struct Link {
@@ -79,7 +84,7 @@ async fn open_link(
     grant: Grant,
     attach: Attach,
     events: mpsc::Sender<NetworkEvent>,
-) -> Result<Link> {
+) -> std::result::Result<Link, OpenFailure> {
     let attempt = attach.attempt;
     let _attach = diagnostics::operation(
         Stage::Attach,
@@ -88,18 +93,36 @@ async fn open_link(
             ..Default::default()
         },
     );
-    let connection = transport::connect(&endpoint, &grant).await?;
-    let (mut output, mut input) = connection.open_bi().await?;
-    transport::send_message(&mut output, &ClientMessage::Attach(attach)).await?;
-    let first = tokio::time::timeout(Duration::from_secs(10), transport::recv_message(&mut input))
-        .await??;
+    let connection = transport::connect(&endpoint, &grant)
+        .await
+        .map_err(|error| OpenFailure {
+            error,
+            fatal: false,
+        })?;
+    let opening: Result<_> = async {
+        let (mut output, mut input) = connection.open_bi().await?;
+        transport::send_message(&mut output, &ClientMessage::Attach(attach)).await?;
+        let first =
+            tokio::time::timeout(Duration::from_secs(10), transport::recv_message(&mut input))
+                .await??;
+        Ok((output, input, first))
+    }
+    .await;
+    let (mut output, mut input, first) = opening.map_err(|error| OpenFailure {
+        error,
+        fatal: fatal_close(&connection),
+    })?;
     let Some(ServerMessage::Attached {
         epoch,
         committed,
         effect_floor,
     }) = first
     else {
-        anyhow::bail!("server rejected session attachment: {first:?}");
+        let error = match first {
+            Some(ServerMessage::Error { message }) => anyhow::anyhow!("server: {message}"),
+            _ => anyhow::anyhow!("server rejected session attachment: {first:?}"),
+        };
+        return Err(OpenFailure { error, fatal: true });
     };
     let (send, mut receive) = mpsc::channel(64);
     let (start, waiting) = watch::channel(false);
@@ -522,7 +545,8 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                     failures = 0;
                                     display.write_status("")?;
                                 }
-                                Err(error) => {
+                                Err(OpenFailure { error, fatal }) => {
+                                    if fatal { return Err(error).context("server rejected session attachment"); }
                                     failures = failures.saturating_add(1);
                                     let delay = Duration::from_millis((250u64 << failures.min(4)).min(5000));
                                     retry_at = Instant::now() + delay;

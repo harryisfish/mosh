@@ -25,6 +25,8 @@ enum Command {
     },
     #[command(hide = true)]
     Worker {
+        #[arg(long, hide = true)]
+        cleanup_dir: Option<PathBuf>,
         #[arg(long)]
         diagnostics: Option<PathBuf>,
     },
@@ -44,7 +46,11 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     match Args::parse().command {
         Command::Bootstrap { diagnostics } => transport::spawn_worker(diagnostics).await,
-        Command::Worker { diagnostics: path } => {
+        Command::Worker {
+            cleanup_dir,
+            diagnostics: path,
+        } => {
+            let _cleanup = cleanup_dir.map(transport::WorkerTempDirGuard::new);
             let _diagnostics = path
                 .as_ref()
                 .map(|path| diagnostics::start(Role::Server, path))
