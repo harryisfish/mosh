@@ -134,6 +134,196 @@ fn feed(decoder: &mut InputDecoder, bytes: &[u8]) -> Result<Vec<LocalEvent>> {
     Ok(events)
 }
 
+fn verify_rxvt_input() -> Result<()> {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(30);
+    let named = |name: &str, modifiers| {
+        InputEvent::Key(Key {
+            code: KeyCode::Named(name.into()),
+            modifiers,
+            phase: KeyPhase::Press,
+            shifted: None,
+            base: None,
+            text: None,
+        })
+    };
+    let check_splits = |sequence: &[u8], key: Option<InputEvent>| -> Result<()> {
+        let mut expected: Vec<_> = key.into_iter().map(LocalEvent::Input).collect();
+        expected.extend([
+            LocalEvent::Input(printable('|')),
+            LocalEvent::Input(printable('x')),
+        ]);
+        for split in 0..=sequence.len() {
+            let mut decoder = InputDecoder::new();
+            let mut events = decoder.feed(&sequence[..split], PasteAdmission::Capture, start)?;
+            let mut tail = sequence[split..].to_vec();
+            tail.extend_from_slice(b"|x");
+            events.extend(decoder.feed(
+                &tail,
+                PasteAdmission::Capture,
+                deadline - Duration::from_nanos(1),
+            )?);
+            assert_eq!(events, expected, "rxvt {sequence:?}, split={split}");
+            assert!(decoder.poll(deadline).is_empty());
+        }
+        Ok(())
+    };
+    for (sequence, name, modifiers) in [
+        (b"\x1b[a".as_slice(), "Up", 1),
+        (b"\x1b[b", "Down", 1),
+        (b"\x1b[c", "Right", 1),
+        (b"\x1b[d", "Left", 1),
+        (b"\x1bOa", "Up", 4),
+        (b"\x1bOb", "Down", 4),
+        (b"\x1bOc", "Right", 4),
+        (b"\x1bOd", "Left", 4),
+    ] {
+        check_splits(sequence, Some(named(name, modifiers)))?;
+    }
+    let numbered: &[([&[u8]; 3], &str)] = &[
+        ([b"\x1b[1$", b"\x1b[1^", b"\x1b[1@"], "Home"),
+        ([b"\x1b[2$", b"\x1b[2^", b"\x1b[2@"], "Insert"),
+        ([b"\x1b[3$", b"\x1b[3^", b"\x1b[3@"], "Delete"),
+        ([b"\x1b[4$", b"\x1b[4^", b"\x1b[4@"], "End"),
+        ([b"\x1b[5$", b"\x1b[5^", b"\x1b[5@"], "PageUp"),
+        ([b"\x1b[6$", b"\x1b[6^", b"\x1b[6@"], "PageDown"),
+        ([b"\x1b[7$", b"\x1b[7^", b"\x1b[7@"], "Home"),
+        ([b"\x1b[8$", b"\x1b[8^", b"\x1b[8@"], "End"),
+        ([b"\x1b[11$", b"\x1b[11^", b"\x1b[11@"], "F1"),
+        ([b"\x1b[12$", b"\x1b[12^", b"\x1b[12@"], "F2"),
+        ([b"\x1b[13$", b"\x1b[13^", b"\x1b[13@"], "F3"),
+        ([b"\x1b[14$", b"\x1b[14^", b"\x1b[14@"], "F4"),
+        ([b"\x1b[15$", b"\x1b[15^", b"\x1b[15@"], "F5"),
+        ([b"\x1b[17$", b"\x1b[17^", b"\x1b[17@"], "F6"),
+        ([b"\x1b[18$", b"\x1b[18^", b"\x1b[18@"], "F7"),
+        ([b"\x1b[19$", b"\x1b[19^", b"\x1b[19@"], "F8"),
+        ([b"\x1b[20$", b"\x1b[20^", b"\x1b[20@"], "F9"),
+        ([b"\x1b[21$", b"\x1b[21^", b"\x1b[21@"], "F10"),
+        ([b"\x1b[23$", b"\x1b[23^", b"\x1b[23@"], "F11"),
+        ([b"\x1b[24$", b"\x1b[24^", b"\x1b[24@"], "F12"),
+        ([b"\x1b[25$", b"\x1b[25^", b"\x1b[25@"], "F13"),
+        ([b"\x1b[26$", b"\x1b[26^", b"\x1b[26@"], "F14"),
+        ([b"\x1b[28$", b"\x1b[28^", b"\x1b[28@"], "F15"),
+        ([b"\x1b[29$", b"\x1b[29^", b"\x1b[29@"], "F16"),
+        ([b"\x1b[31$", b"\x1b[31^", b"\x1b[31@"], "F17"),
+        ([b"\x1b[32$", b"\x1b[32^", b"\x1b[32@"], "F18"),
+        ([b"\x1b[33$", b"\x1b[33^", b"\x1b[33@"], "F19"),
+        ([b"\x1b[34$", b"\x1b[34^", b"\x1b[34@"], "F20"),
+    ];
+    for (sequences, name) in numbered {
+        for (sequence, modifiers) in sequences.iter().zip([1, 4, 5]) {
+            check_splits(sequence, Some(named(name, modifiers)))?;
+        }
+    }
+    for (sequence, name, modifiers) in [
+        (b"\x1b[042~".as_slice(), "F21", 0),
+        (b"\x1b[043~", "F22", 0),
+        (b"\x1b[044~", "F23", 0),
+        (b"\x1b[045~", "F24", 0),
+        (b"\x1b[042;2~", "F21", 1),
+        (b"\x1b[0003~", "Delete", 0),
+    ] {
+        check_splits(sequence, Some(named(name, modifiers)))?;
+    }
+    for sequence in [
+        b"\x1b[4;1$y".as_slice(),
+        b"\x1b[?4;1$y",
+        b"\x1b[24;12R",
+        b"\x1b[?1;2c",
+        b"\x1b[1a",
+        b"\x1bO1;5a",
+        b"\x1b[03$y",
+        b"\x1b[3;2$y",
+        b"\x1b[35$y",
+        b"\x1b[42$y",
+        b"\x1b[42^",
+        b"\x1b[42@",
+        b"\x1b]777;\x1b[d\x1b[3$\x1e?\x1b\\",
+        b"\x1bP\x1b[d\x1b[3$\x1e?\x1b\\",
+        b"\x1b_\x1b[d\x1b[3$\x1e?\x1b\\",
+    ] {
+        check_splits(sequence, None)?;
+    }
+    check_splits(
+        b"\x1b[200~\x1b[d\x1b[3$\x1e?\x1b[201~",
+        Some(InputEvent::Paste("\x1b[d\x1b[3$\x1e?".into())),
+    )?;
+    for (prefix, tail) in [
+        (b"\x1b[3".as_slice(), b"$|x".as_slice()),
+        (b"\x1b[1", b"1$|x"),
+        (b"\x1b[11", b"$|x"),
+        (b"\x1b[23", b"$|x"),
+        (b"\x1b[34", b"$|x"),
+        (b"\x1b[3", b"^|x"),
+        (b"\x1b[3", b"@|x"),
+        (b"\x1b[3", b";1$y|x"),
+        (b"\x1b[?3", b"$y|x"),
+        (b"\x1b[4;", b"1$y|x"),
+        (b"\x1b[35", b"$y|x"),
+    ] {
+        for arrived_at in [deadline, deadline + Duration::from_nanos(1)] {
+            for poll_first in [false, true] {
+                for split in 0..=tail.len() {
+                    let mut decoder = InputDecoder::new();
+                    assert!(
+                        decoder
+                            .feed(prefix, PasteAdmission::Capture, start)?
+                            .is_empty()
+                    );
+                    let mut events = if poll_first {
+                        decoder.poll(deadline)
+                    } else {
+                        Vec::new()
+                    };
+                    events.extend(decoder.feed(
+                        &tail[..split],
+                        PasteAdmission::Capture,
+                        arrived_at,
+                    )?);
+                    events.extend(decoder.feed(
+                        &tail[split..],
+                        PasteAdmission::Capture,
+                        arrived_at,
+                    )?);
+                    assert_eq!(
+                        events,
+                        vec![
+                            LocalEvent::Rejected(InputRejection::SequenceTimeout),
+                            LocalEvent::Input(printable('|')),
+                            LocalEvent::Input(printable('x')),
+                        ],
+                        "late rxvt {prefix:?} {tail:?}, split={split}, poll={poll_first}"
+                    );
+                    assert!(decoder.poll(arrived_at).is_empty());
+                }
+            }
+        }
+    }
+    for (sequence, legacy, kitty) in [
+        (
+            b"\x1b[d".as_slice(),
+            b"\x1b[1;2D".as_slice(),
+            b"\x1b[1;2:1D".as_slice(),
+        ),
+        (b"\x1bOa", b"\x1b[1;5A", b"\x1b[1;5:1A"),
+        (b"\x1b[3$", b"\x1b[3;2~", b"\x1b[3;2:1~"),
+        (b"\x1b[23$", b"\x1b[23;2~", b"\x1b[23;2:1~"),
+        (b"\x1b[11^", b"\x1b[1;5P", b"\x1b[1;5:1P"),
+        (b"\x1b[23@", b"\x1b[23;6~", b"\x1b[23;6:1~"),
+    ] {
+        let mut decoder = InputDecoder::new();
+        let events = decoder.feed(sequence, PasteAdmission::Capture, start)?;
+        let [LocalEvent::Input(event)] = events.as_slice() else {
+            panic!("rxvt key was not decoded: {sequence:?}: {events:?}");
+        };
+        let mut terminal = TerminalModel::new(Size::default(), false)?;
+        assert_eq!(terminal.encode_input(event)?, legacy, "{sequence:?}");
+        terminal.advance(b"\x1b[>31u")?;
+        assert_eq!(terminal.encode_input(event)?, kitty, "{sequence:?}");
+    }
+    Ok(())
+}
+
 fn verify_legacy_input() -> Result<()> {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(30);
@@ -490,6 +680,7 @@ fn verify_legacy_input() -> Result<()> {
         }))]
     );
     assert!(feed(&mut InputDecoder::new(), b"\x1b[24;12R\x1b[?1;2c\x1b[4;1$y")?.is_empty());
+    verify_rxvt_input()?;
     println!(
         "legacy input: absolute deadlines, late tails, Linux F1-F5, F21-F24, keypad, recovery and reply/paste boundaries verified"
     );
