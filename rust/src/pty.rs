@@ -92,7 +92,7 @@ async fn installed_locale_names() -> Result<Vec<String>> {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("cannot discover server locales; install the locale utility or set LC_CTYPE to an installed UTF-8 locale")?;
+        .context("cannot discover server locales; install a locale utility that supports locale -a")?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stdout = child.stdout.take().context("locale stdout missing")?;
         let mut bytes = Vec::new();
@@ -106,7 +106,7 @@ async fn installed_locale_names() -> Result<Vec<String>> {
         );
         ensure!(
             child.wait().await?.success(),
-            "server locale discovery failed; set LC_CTYPE to an installed UTF-8 locale"
+            "server locale discovery failed; check that locale -a succeeds on the server"
         );
         let listing = std::str::from_utf8(&bytes).context("server locale list is not UTF-8")?;
         let mut names = Vec::new();
@@ -128,7 +128,7 @@ async fn installed_locale_names() -> Result<Vec<String>> {
             match result {
                 Ok(Err(error)) => Err(error),
                 Err(_) => anyhow::bail!(
-                    "server locale discovery timed out; set LC_CTYPE to an installed UTF-8 locale"
+                    "server locale discovery timed out; check that locale -a completes on the server"
                 ),
                 Ok(Ok(_)) => unreachable!(),
             }
