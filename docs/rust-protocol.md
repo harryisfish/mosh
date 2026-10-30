@@ -45,8 +45,10 @@ are rejected. Grant framing and postcard messages keep their version 3 shape.
 The worker waits for the first authenticated, valid Attach before selecting a
 locale or starting the command. It tries the client's candidates, the server's
 `LC_ALL`, `LC_CTYPE`, and `LANG`, then `C.UTF-8`, `C.utf8`, `UTF-8`,
-`en_US.UTF-8`, and `en_US.utf8`, skipping duplicate and invalid names. If these
-candidates fail, it runs `locale -a` once and probes the installed names.
+`en_US.UTF-8`, and `en_US.utf8`, skipping duplicate and invalid names. On macOS
+and GNU Linux, if these candidates fail, it runs `locale -a` once and probes
+the installed names. On Linux with musl, it runs `locale -a` before checking
+any candidate, and each candidate must appear in that list.
 Discovery accepts at most 64 KiB and 1024 names and has a five-second deadline.
 On Linux and macOS,
 `newlocale(LC_CTYPE_MASK, ...)` and `nl_langinfo_l(CODESET, ...)` must confirm an
@@ -68,7 +70,8 @@ fatal, and the worker cannot return to its prepared state. Reattachment uses
 the running PTY and does not select a new locale.
 Missing locale utilities, failed discovery, excess output, and discovery
 timeouts have separate startup errors. A configured usable locale avoids the
-discovery process.
+discovery process on macOS and GNU Linux. Linux with musl always requires a
+successful `locale -a`, even when a usable locale is configured.
 
 ## Independent confirmation domains
 
