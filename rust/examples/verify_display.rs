@@ -13,6 +13,13 @@ use mosh_rs::model::*;
 use mosh_rs::{state, terminal::TerminalModel, transport};
 use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
+const VIEWPORT: Size = Size {
+    cols: 16,
+    rows: 4,
+    pixel_width: 160,
+    pixel_height: 80,
+};
+
 #[derive(Debug)]
 struct Config;
 impl TerminalConfiguration for Config {
@@ -71,6 +78,7 @@ fn frame(revision: u64, base: Option<u64>, resources: Vec<ResourceMeta>) -> Fram
                 row: Row {
                     cells: Vec::new(),
                     stable_id: i64::from(y),
+                    wrap: RowWrap::Hard,
                 },
             })
             .collect(),
@@ -1035,7 +1043,7 @@ fn verify_render(graphics: Graphics) -> Result<()> {
         placement: 9,
     });
     first.rows[2].row.cells.push(tile);
-    let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Adaptive);
+    let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Adaptive, VIEWPORT)?;
     display.set_epoch(1)?;
     assert!(display.install(&first, &resources)?);
     assert_eq!(display.screen().unwrap().rows[0], first.rows[0].row);
@@ -1047,6 +1055,7 @@ fn verify_render(graphics: Graphics) -> Result<()> {
         row: Row {
             cells: vec![cell(8, "Y", 1)],
             stable_id: 1,
+            wrap: RowWrap::Hard,
         },
     }];
     assert!(display.install(&second, &resources)?);
@@ -1188,7 +1197,12 @@ impl Write for Capture {
 
 fn verify_prediction_modes() -> Result<()> {
     let capture = Capture::default();
-    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
+    let mut display = Display::new(
+        capture.clone(),
+        Graphics::None,
+        PredictionPolicy::Adaptive,
+        VIEWPORT,
+    )?;
     display.set_epoch(1)?;
     let mut current = frame(1, None, Vec::new());
     current.prediction.echo_enabled = false;
@@ -1215,6 +1229,7 @@ fn verify_prediction_modes() -> Result<()> {
                     .map(|(x, ch)| cell(x as u16 + 8, &ch.to_string(), 1))
                     .collect(),
                 stable_id: 1,
+                wrap: RowWrap::Hard,
             },
         }];
         assert!(display.install(&current, &BTreeMap::new())?);
@@ -1256,7 +1271,12 @@ fn verify_prediction_modes() -> Result<()> {
 
 fn learned_prediction() -> Result<(Display<Capture>, Capture, Frame)> {
     let capture = Capture::default();
-    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
+    let mut display = Display::new(
+        capture.clone(),
+        Graphics::None,
+        PredictionPolicy::Adaptive,
+        VIEWPORT,
+    )?;
     display.set_epoch(1)?;
     let mut current = frame(1, None, Vec::new());
     current.prediction.echo_enabled = false;
@@ -1315,7 +1335,12 @@ fn verify_cached_redraw() -> Result<()> {
 
     for graphics in [Graphics::Kitty, Graphics::Sixel] {
         let capture = Capture::default();
-        let mut display = Display::new(capture.clone(), graphics, PredictionPolicy::Adaptive);
+        let mut display = Display::new(
+            capture.clone(),
+            graphics,
+            PredictionPolicy::Adaptive,
+            VIEWPORT,
+        )?;
         display.set_epoch(1)?;
         let rgba = vec![255, 0, 0, 255];
         let digest = resource_digest(1, 1, &rgba);
@@ -1411,7 +1436,12 @@ fn verify_cached_redraw() -> Result<()> {
     }
 
     let capture = Capture::default();
-    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Never);
+    let mut display = Display::new(
+        capture.clone(),
+        Graphics::None,
+        PredictionPolicy::Never,
+        VIEWPORT,
+    )?;
     display.write_status("Connecting.")?;
     let before = capture.0.lock().unwrap().len();
     display.redraw_cached(Size::default())?;
@@ -1518,7 +1548,12 @@ fn verify_redraw_transcript(arguments: &[String]) -> Result<()> {
 
 fn verify_prediction_boundaries() -> Result<()> {
     let capture = Capture::default();
-    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
+    let mut display = Display::new(
+        capture.clone(),
+        Graphics::None,
+        PredictionPolicy::Adaptive,
+        VIEWPORT,
+    )?;
     display.set_epoch(1)?;
     let mut current = frame(1, None, Vec::new());
     current.prediction.echo_enabled = false;
@@ -1634,7 +1669,12 @@ fn verify_prediction_boundaries() -> Result<()> {
     );
 
     let capture = Capture::default();
-    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Never);
+    let mut display = Display::new(
+        capture.clone(),
+        Graphics::None,
+        PredictionPolicy::Never,
+        VIEWPORT,
+    )?;
     display.set_epoch(1)?;
     assert!(display.install(&frame(1, None, Vec::new()), &BTreeMap::new())?);
     let before = capture.0.lock().unwrap().len();
@@ -1653,7 +1693,7 @@ fn verify_prediction_boundaries() -> Result<()> {
 fn verify_prediction_epoch_context() -> Result<()> {
     for policy in [PredictionPolicy::Adaptive, PredictionPolicy::Conservative] {
         let capture = Capture::default();
-        let mut display = Display::new(capture.clone(), Graphics::None, policy);
+        let mut display = Display::new(capture.clone(), Graphics::None, policy, VIEWPORT)?;
         display.set_epoch(1)?;
         let mut current = frame(1, None, Vec::new());
         assert!(display.install(&current, &BTreeMap::new())?);
@@ -1681,7 +1721,7 @@ fn verify_prediction_epoch_context() -> Result<()> {
         );
 
         let capture = Capture::default();
-        let mut display = Display::new(capture.clone(), Graphics::None, policy);
+        let mut display = Display::new(capture.clone(), Graphics::None, policy, VIEWPORT)?;
         display.set_epoch(1)?;
         let mut current = frame(1, None, Vec::new());
         current.prediction.echo_enabled = false;
@@ -1775,7 +1815,12 @@ fn verify_lifecycle() -> Result<()> {
         placement: 1,
     });
     initial.rows[0].row.cells.push(tile);
-    let mut display = Display::new(Vec::new(), Graphics::Kitty, PredictionPolicy::Never);
+    let mut display = Display::new(
+        Vec::new(),
+        Graphics::Kitty,
+        PredictionPolicy::Never,
+        VIEWPORT,
+    )?;
     display.set_epoch(1)?;
     assert!(display.install(&initial, &resources)?);
     display.write_status("reconnecting")?;
@@ -1936,8 +1981,22 @@ fn main() -> Result<()> {
     {
         return verify_redraw_transcript(&arguments[1..]);
     }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--soft-wrap-transcript")
+    {
+        return verify_soft_wrap_transcript(&arguments[1..]);
+    }
+    if arguments.first().is_some_and(|arg| arg == "--soft-wrap") {
+        return verify_soft_wrap();
+    }
     anyhow::ensure!(arguments.is_empty(), "unknown verify_display arguments");
-    let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
+    let mut display = Display::new(
+        Vec::new(),
+        Graphics::None,
+        PredictionPolicy::Never,
+        VIEWPORT,
+    )?;
     display.write_status("Connect failed")?;
     let mut term = terminal();
     term.advance_bytes(display.into_inner());
@@ -1947,6 +2006,7 @@ fn main() -> Result<()> {
         .collect();
     assert!(status.starts_with("Connect failed"), "{status:?}");
     println!("connection errors render before the first remote screen");
+    verify_soft_wrap()?;
     verify_input()?;
     verify_legacy_roundtrip()?;
     verify_image_layers()?;
@@ -1999,7 +2059,7 @@ fn verify_image_layers() -> Result<()> {
     let frame = state::frame(1, 1, 0, &screen, None)?;
     transport::validate_frame(&frame)?;
     for graphics in [Graphics::None, Graphics::Kitty] {
-        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never, screen.size)?;
         display.set_epoch(1)?;
         assert!(display.install(&frame, &screen.resources)?);
         assert_eq!(
@@ -2016,6 +2076,689 @@ fn verify_image_layers() -> Result<()> {
     }
     println!(
         "65 static image layers in one cell survive core, frame validation, and display installation"
+    );
+    Ok(())
+}
+
+fn soft_size(cols: u16, rows: u16) -> Size {
+    Size {
+        cols,
+        rows,
+        pixel_width: u32::from(cols) * 10,
+        pixel_height: u32::from(rows) * 20,
+    }
+}
+
+fn soft_grid(screen: &Screen, viewport: Size) -> Vec<Vec<Cell>> {
+    (0..viewport.rows)
+        .map(|y| {
+            let mut result = Vec::new();
+            let mut x = 0;
+            while x < viewport.cols {
+                let source = screen
+                    .rows
+                    .get(usize::from(y))
+                    .and_then(|row| row.cells.iter().find(|cell| cell.x == x));
+                let mut projected = source.cloned().unwrap_or_else(|| cell(x, " ", 1));
+                if x + u16::from(projected.width) > viewport.cols {
+                    projected.text = " ".into();
+                    projected.width = 1;
+                }
+                x += u16::from(projected.width);
+                result.push(projected);
+            }
+            result
+        })
+        .collect()
+}
+
+struct SoftDisplay {
+    display: Display<Capture>,
+    capture: Capture,
+    local: TerminalModel,
+    offset: usize,
+    source: Option<Screen>,
+    viewport: Size,
+}
+
+impl SoftDisplay {
+    fn new(size: Size) -> Result<Self> {
+        let capture = Capture::default();
+        let mut display = Display::new(
+            capture.clone(),
+            Graphics::None,
+            PredictionPolicy::Adaptive,
+            size,
+        )?;
+        display.set_epoch(1)?;
+        Ok(Self {
+            display,
+            capture,
+            local: TerminalModel::new(size, false)?,
+            offset: 0,
+            source: None,
+            viewport: size,
+        })
+    }
+
+    fn install(&mut self, source: &Screen) -> Result<Frame> {
+        let frame = state::frame(
+            1,
+            self.display.revision() + 1,
+            0,
+            source,
+            self.source
+                .as_ref()
+                .map(|old| (self.display.revision(), old)),
+        )?;
+        let encoded = postcard::to_allocvec(&frame)?;
+        let decoded: Frame = postcard::from_bytes(&encoded)?;
+        transport::validate_frame(&decoded)?;
+        assert_eq!(decoded.rows, frame.rows);
+        assert!(self.display.install(&decoded, &source.resources)?);
+        assert_eq!(self.display.screen().unwrap().rows, source.rows);
+        self.source = Some(source.clone());
+        Ok(decoded)
+    }
+
+    fn check(&mut self, label: &str, expected: &Screen, wraps: &[bool]) -> Result<()> {
+        let bytes = self.capture.0.lock().unwrap()[self.offset..].to_vec();
+        self.offset += bytes.len();
+        let change = self.local.advance(&bytes)?;
+        assert!(change.effects.is_empty(), "{label}: paint replayed effects");
+        let actual = self.local.snapshot()?;
+        assert_eq!(
+            soft_grid(&actual, self.viewport),
+            soft_grid(expected, self.viewport),
+            "{label}: cells/styles"
+        );
+        assert_eq!(
+            actual
+                .rows
+                .iter()
+                .map(|row| row.wrap.is_soft())
+                .collect::<Vec<_>>(),
+            wraps,
+            "{label}: wrap"
+        );
+        assert_eq!(
+            actual.rows.iter().map(|row| row.wrap).collect::<Vec<_>>(),
+            expected
+                .rows
+                .iter()
+                .zip(wraps)
+                .map(|(row, soft)| { if *soft { row.wrap } else { RowWrap::Hard } })
+                .collect::<Vec<_>>(),
+            "{label}: wrap provenance"
+        );
+        assert_eq!(
+            (actual.cursor.x, actual.cursor.y),
+            (
+                expected.cursor.x.min(self.viewport.cols - 1),
+                expected.cursor.y.min(self.viewport.rows - 1)
+            ),
+            "{label}: cursor"
+        );
+        if let Some(directory) = std::env::var_os("MOSH_VERIFY_EVIDENCE_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join(format!("{label}.tty")), &bytes)?;
+            std::fs::write(
+                directory.join(format!("{label}.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "viewport": self.viewport, "cells": actual.rows, "cursor": actual.cursor,
+                    "tty_bytes": bytes.len(), "canonical_rows": expected.rows,
+                }))?,
+            )?;
+        }
+        println!("soft-wrap {label}: {} TTY bytes", bytes.len());
+        Ok(())
+    }
+}
+
+fn verify_soft_wrap() -> Result<()> {
+    for cols in [8, 16, 32] {
+        let size = soft_size(cols, 8);
+        let url = format!("https://example.test/{}", "x".repeat(usize::from(cols) * 2));
+        let mut source = TerminalModel::new(size, false)?;
+        source.advance(url.as_bytes())?;
+        let screen = source.snapshot()?;
+        let mut wraps = vec![false; 8];
+        for wrapped in wraps.iter_mut().take((url.len() - 1) / usize::from(cols)) {
+            *wrapped = true;
+        }
+        assert_eq!(
+            screen
+                .rows
+                .iter()
+                .map(|row| row.wrap.is_soft())
+                .collect::<Vec<_>>(),
+            wraps
+        );
+        let mut view = SoftDisplay::new(size)?;
+        view.install(&screen)?;
+        view.check(&format!("url-soft-{cols}"), &screen, &wraps)?;
+        let mut hard = TerminalModel::new(size, false)?;
+        for (index, chunk) in url.as_bytes().chunks(usize::from(cols)).enumerate() {
+            if index != 0 {
+                hard.advance(b"\r\n")?;
+            }
+            hard.advance(chunk)?;
+        }
+        let screen = hard.snapshot()?;
+        assert!(screen.rows.iter().all(|row| !row.wrap.is_soft()));
+        view.install(&screen)?;
+        view.check(&format!("url-hard-{cols}"), &screen, &[false; 8])?;
+    }
+    for (label, cols, trace, wraps) in [
+        ("pending", 4, "ABCD", vec![false, false, false, false]),
+        ("wide-tail", 4, "ab界Z", vec![true, false, false, false]),
+        (
+            "wide-overwrite",
+            4,
+            "1234\r\x1b[2Kab界Z",
+            vec![true, false, false, false],
+        ),
+        ("wide-padding", 4, "abc界Z", vec![true, false, false, false]),
+        (
+            "wide-padding-color",
+            4,
+            "abc\x1b[44m界Z",
+            vec![true, false, false, false],
+        ),
+        (
+            "wide-padding-real-space",
+            4,
+            "abc 界Z",
+            vec![true, false, false, false],
+        ),
+        (
+            "wide-padding-overwrite",
+            4,
+            "abc界Z\x1b[1;4H ",
+            vec![true, false, false, false],
+        ),
+        (
+            "wide-padding-narrow-successor",
+            4,
+            "abc界Z\x1b[2;1H\x1b[2KAZ",
+            vec![true, false, false, false],
+        ),
+        ("one-column", 1, "ABC", vec![true, true, false, false]),
+        ("two-columns", 2, "界界Z", vec![true, true, false, false]),
+        (
+            "regional",
+            4,
+            "abc🇦X\x1b[2;1H🇧",
+            vec![true, false, false, false],
+        ),
+        (
+            "styled",
+            4,
+            "\x1b[38;2;11;22;33mab界\x1b[48;2;44;55;66mZ",
+            vec![true, false, false, false],
+        ),
+        (
+            "scroll",
+            4,
+            "abcdefghijklmnopq",
+            vec![true, true, true, false],
+        ),
+    ] {
+        let size = soft_size(cols, 4);
+        let mut source = TerminalModel::new(size, false)?;
+        source.advance(trace.as_bytes())?;
+        let screen = source.snapshot()?;
+        assert_eq!(
+            screen
+                .rows
+                .iter()
+                .map(|row| row.wrap.is_soft())
+                .collect::<Vec<_>>(),
+            wraps,
+            "{label}: source"
+        );
+        let mut view = SoftDisplay::new(size)?;
+        view.install(&screen)?;
+        view.check(label, &screen, &wraps)?;
+        view.display.redraw_cached(size)?;
+        view.check(&format!("{label}-cached"), &screen, &wraps)?;
+    }
+    let size = soft_size(4, 4);
+    let mut source = TerminalModel::new(size, false)?;
+    source.advance("abc\x1b[48;2;17;34;51m界Z".as_bytes())?;
+    let mut screen = source.snapshot()?;
+    assert_eq!(screen.rows[0].wrap, RowWrap::WidePadding);
+    assert_eq!(
+        screen.rows[0].cells.last().unwrap().style.bg,
+        Color::Rgb([17, 34, 51])
+    );
+    let mut view = SoftDisplay::new(size)?;
+    view.install(&screen)?;
+    view.check(
+        "padding-color-initial",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    source.advance(b"\x1b[2;1H\x1b[2KAZ")?;
+    screen = source.snapshot()?;
+    assert_eq!(screen.rows[0].wrap, RowWrap::WidePadding);
+    let delta = view.install(&screen)?;
+    assert_eq!(
+        delta.rows.iter().map(|row| row.y).collect::<Vec<_>>(),
+        vec![1]
+    );
+    view.check(
+        "padding-narrow-delta",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    view.display.redraw_cached(size)?;
+    view.check(
+        "padding-narrow-cached",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    source.advance(b"\x1b[1;4H ")?;
+    screen = source.snapshot()?;
+    assert_eq!(screen.rows[0].wrap, RowWrap::Soft);
+    view.install(&screen)?;
+    view.check(
+        "padding-to-user-space",
+        &screen,
+        &[true, false, false, false],
+    )?;
+    let mut clipped = SoftDisplay::new(soft_size(3, 4))?;
+    clipped.install(&source.snapshot()?)?;
+    clipped.check("padding-clipped", &screen, &[false; 4])?;
+    let deletion_size = soft_size(16, 6);
+    let mut deletion = TerminalModel::new(deletion_size, false)?;
+    deletion.advance("\x1b[4;1Hhttps://e.test/界Z".as_bytes())?;
+    let mut deletion_view = SoftDisplay::new(deletion_size)?;
+    deletion_view.install(&deletion.snapshot()?)?;
+    deletion_view.check(
+        "partial-delete-initial",
+        &deletion.snapshot()?,
+        &[false, false, false, true, false, false],
+    )?;
+    deletion.advance(b"\x1b[?69h\x1b[1;4s\x1b[4;1H\x1b[P\x1b[?69l")?;
+    let deleted = deletion.snapshot()?;
+    assert_eq!(deleted.rows[3].wrap, RowWrap::Hard);
+    let delta = deletion_view.install(&deleted)?;
+    assert_eq!(delta.rows.len(), 1);
+    assert_eq!(delta.rows[0].y, 3);
+    deletion_view.check("partial-delete-hard", &deleted, &[false; 6])?;
+    let mut insertion = TerminalModel::new(deletion_size, false)?;
+    insertion.advance("\x1b[4;1Hhttps://e.test/界Z".as_bytes())?;
+    let mut insertion_view = SoftDisplay::new(deletion_size)?;
+    insertion_view.install(&insertion.snapshot()?)?;
+    insertion_view.check(
+        "partial-insert-initial",
+        &insertion.snapshot()?,
+        &[false, false, false, true, false, false],
+    )?;
+    insertion.advance(b"\x1b[?69h\x1b[1;4s\x1b[4;2H\x1b[@\x1b[?69l")?;
+    let inserted = insertion.snapshot()?;
+    assert_eq!(inserted.rows[3].wrap, RowWrap::WidePadding);
+    let delta = insertion_view.install(&inserted)?;
+    assert_eq!(delta.rows.len(), 1);
+    assert_eq!(delta.rows[0].y, 3);
+    insertion_view.check(
+        "partial-insert-keeps-padding",
+        &inserted,
+        &[false, false, false, true, false, false],
+    )?;
+    let size = soft_size(8, 4);
+    let mut source = TerminalModel::new(size, false)?;
+    source.advance(b"abcdefghijklmnopq\x1b[2;2H")?;
+    let mut screen = source.snapshot()?;
+    screen.prediction.echo_enabled = true;
+    screen.prediction.eligible = true;
+    let mut view = SoftDisplay::new(size)?;
+    view.install(&screen)?;
+    view.check("delta-initial", &screen, &[true, true, false, false])?;
+    for soft in [false, true] {
+        screen.rows[0].wrap = if soft { RowWrap::Soft } else { RowWrap::Hard };
+        let delta = view.install(&screen)?;
+        assert_eq!(delta.rows.len(), 1);
+        assert_eq!(delta.rows[0].y, 0);
+        let wire_bytes = postcard::to_allocvec(&delta)?.len();
+        let row_bytes = postcard::to_allocvec(&delta.rows[0].row)?.len();
+        println!(
+            "wrap-only delta soft={soft}: {wire_bytes} frame bytes, {row_bytes} complete Row bytes, 1 wrap metadata byte"
+        );
+        view.check(
+            if soft {
+                "delta-hard-to-soft"
+            } else {
+                "delta-soft-to-hard"
+            },
+            &screen,
+            &[soft, true, false, false],
+        )?;
+    }
+    screen.rows[1].cells[0].text = "J".into();
+    let delta = view.install(&screen)?;
+    assert_eq!(delta.rows.len(), 1);
+    assert_eq!(delta.rows[0].y, 1);
+    view.check("next-head-only", &screen, &[true, true, false, false])?;
+    view.display.predict(1, &printable('P'))?;
+    let mut predicted = screen.clone();
+    predicted.rows[1].cells[1].text = "P".into();
+    predicted.rows[1].cells[1].style = Style {
+        underline: 1,
+        ..Style::default()
+    };
+    predicted.cursor.x += 1;
+    view.check("active-prediction", &predicted, &[true, true, false, false])?;
+    view.display.redraw_cached(size)?;
+    view.check("prediction-ctrl-l", &screen, &[true, true, false, false])?;
+    view.display.predict(2, &printable('Q'))?;
+    view.check(
+        "active-prediction-again",
+        &{
+            let mut s = predicted.clone();
+            s.rows[1].cells[1].text = "Q".into();
+            s
+        },
+        &[true, true, false, false],
+    )?;
+    view.display.predict(3, &InputEvent::Focus(true))?;
+    view.check("prediction-rollback", &screen, &[true, true, false, false])?;
+    view.display.write_status("!!")?;
+    let mut status = screen.clone();
+    for x in [6, 7] {
+        status.rows[0].cells[x].text = "!".into();
+        status.rows[0].cells[x].style = Style {
+            flags: 16,
+            ..Style::default()
+        };
+    }
+    view.check("status-on", &status, &[false, true, false, false])?;
+    assert!(view.display.screen().unwrap().rows[0].wrap.is_soft());
+    view.display.write_status("")?;
+    view.check("status-off", &screen, &[true, true, false, false])?;
+    for cols in [6, 10, 8] {
+        let viewport = soft_size(cols, 4);
+        view.local.resize(viewport)?;
+        view.viewport = viewport;
+        view.display.set_viewport(viewport)?;
+        view.display.write_status("!")?;
+        view.display.write_status("")?;
+        view.display.redraw_cached(viewport)?;
+        let before = view.capture.0.lock().unwrap().len();
+        if cols != 8 {
+            view.display.predict(4, &printable('R'))?;
+            assert_eq!(view.capture.0.lock().unwrap().len(), before);
+        }
+        view.check(
+            &format!("viewport-{cols}"),
+            &screen,
+            &[cols == 8, cols == 8, false, false],
+        )?;
+        assert_eq!(view.display.screen().unwrap().size, size);
+    }
+    let viewport = soft_size(8, 1);
+    view.local.resize(viewport)?;
+    view.viewport = viewport;
+    view.display.redraw_cached(viewport)?;
+    view.check("viewport-bottom", &screen, &[false])?;
+    let before = view.capture.0.lock().unwrap().len();
+    view.display.predict(5, &printable('R'))?;
+    assert_eq!(view.capture.0.lock().unwrap().len(), before);
+    let canonical = view.display.screen().unwrap().rows.clone();
+    let (cache, _) = view.display.into_cached();
+    view.display = cache.bind(view.capture.clone());
+    view.local.resize(size)?;
+    view.viewport = size;
+    view.display.redraw_cached(size)?;
+    view.check("rebind-cache", &screen, &[true, true, false, false])?;
+    assert_eq!(view.display.screen().unwrap().rows, canonical);
+    let mut rejected = state::frame(0, 99, 0, &screen, None)?;
+    let before = view.capture.0.lock().unwrap().len();
+    assert!(!view.display.install(&rejected, &screen.resources)?);
+    rejected.epoch = 1;
+    rejected.base = Some(999);
+    assert!(!view.display.install(&rejected, &screen.resources)?);
+    rejected.base = None;
+    rejected.rows[0].row.cells[0].width = 0;
+    assert!(view.display.install(&rejected, &screen.resources).is_err());
+    assert_eq!(view.capture.0.lock().unwrap().len(), before);
+    assert!(
+        view.display
+            .redraw_cached(Size { cols: 0, ..size })
+            .is_err()
+    );
+    assert!(
+        Display::new(
+            Vec::new(),
+            Graphics::None,
+            PredictionPolicy::Never,
+            Size { rows: 0, ..size }
+        )
+        .is_err()
+    );
+    let mut synthetic = screen.clone();
+    synthetic.rows[0].cells = vec![cell(2, "G", 1)];
+    synthetic.rows[1].cells.clear();
+    synthetic.rows[3].wrap = RowWrap::Soft;
+    let mut view = SoftDisplay::new(size)?;
+    view.install(&synthetic)?;
+    view.check("gap-short-bottom", &synthetic, &[true, true, false, false])?;
+    assert!(view.display.screen().unwrap().rows[3].wrap.is_soft());
+    let mut wide = TerminalModel::new(size, false)?;
+    wide.advance("123456界Z".as_bytes())?;
+    let wide = wide.snapshot()?;
+    let mut view = SoftDisplay::new(soft_size(7, 4))?;
+    view.install(&wide)?;
+    view.check("wide-clip", &wide, &[false; 4])?;
+    for graphics in [Graphics::Kitty, Graphics::Sixel] {
+        let mut model = TerminalModel::new(size, false)?;
+        model.advance(
+            b"abcdefghijklmnopq\x1b[3;3H\x1b_Ga=T,f=32,s=1,v=1,i=9,c=1,r=1,C=1;/wAA/w==\x1b\\\x1b[4;2H\x1b[2 q",
+        )?;
+        let source = model.snapshot()?;
+        let capture = Capture::default();
+        let mut display = Display::new(capture.clone(), graphics, PredictionPolicy::Never, size)?;
+        display.set_epoch(1)?;
+        display.install(&state::frame(1, 1, 0, &source, None)?, &source.resources)?;
+        let mut local = TerminalModel::new(size, false)?;
+        local.advance(&capture.0.lock().unwrap())?;
+        for (id, kind) in [
+            EffectKind::Bell,
+            EffectKind::ClipboardWrite {
+                selection: "c".into(),
+                data: "once".into(),
+            },
+            EffectKind::Notification {
+                title: "".into(),
+                body: "once".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            display.apply_effect(
+                &Effect {
+                    id: id as u64 + 1,
+                    after: 1,
+                    kind,
+                },
+                false,
+            )?;
+        }
+        let before = capture.0.lock().unwrap().len();
+        display.redraw_cached(size)?;
+        let bytes = capture.0.lock().unwrap()[before..].to_vec();
+        assert!(local.advance(&bytes)?.effects.is_empty());
+        assert!(!String::from_utf8_lossy(&bytes).contains("\x1b]133;"));
+        let actual = local.snapshot()?;
+        let strip_images = |screen: &Screen| {
+            soft_grid(screen, size)
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|mut cell| {
+                            cell.images.clear();
+                            cell
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            strip_images(&actual),
+            strip_images(&source),
+            "{graphics:?} cells/styles"
+        );
+        assert_eq!(
+            actual
+                .rows
+                .iter()
+                .map(|row| row.wrap.is_soft())
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+        assert_eq!(actual.cursor, source.cursor);
+        assert!(!actual.resources.is_empty());
+        assert!(actual.resources.values().all(|resource| {
+            resource
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [255, 0, 0, 255])
+        }));
+        assert_eq!(display.effects_applied(), 3);
+        println!(
+            "soft-wrap cached {graphics:?}: cells/styles/cursor/wrap/image pixels and no one-shot effect replay passed; {} TTY bytes",
+            bytes.len()
+        );
+    }
+    let mut view = SoftDisplay::new(size)?;
+    view.install(&screen)?;
+    view.check("expiry-base", &screen, &[true, true, false, false])?;
+    view.display.predict(9, &printable('P'))?;
+    view.check("expiry-active", &predicted, &[true, true, false, false])?;
+    std::thread::sleep(Duration::from_millis(760));
+    view.display.tick()?;
+    view.check("expiry-rollback", &screen, &[true, true, false, false])?;
+    view.display.set_epoch(2)?;
+    let checkpoint = state::frame(2, view.display.revision() + 1, 0, &screen, None)?;
+    view.display.install(&checkpoint, &screen.resources)?;
+    view.check("reconnect-checkpoint", &screen, &[true, true, false, false])?;
+    let mut history = screen.clone();
+    history.size = soft_size(8, 2);
+    history.rows.truncate(2);
+    history.rows[0].stable_id = 10;
+    history.rows[1].stable_id = 11;
+    history.markers = vec![
+        ShellMarker {
+            row: 0,
+            column: 0,
+            kind: "A".into(),
+            status: None,
+        },
+        ShellMarker {
+            row: 11,
+            column: 2,
+            kind: "B".into(),
+            status: None,
+        },
+    ];
+    let mut view = SoftDisplay::new(size)?;
+    view.install(&history)?;
+    let output = view.capture.0.lock().unwrap().clone();
+    assert!(
+        !String::from_utf8_lossy(&output).contains("\x1b]133;A"),
+        "padding must not match historical marker row zero"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output)
+            .matches("\x1b]133;B")
+            .count(),
+        1
+    );
+    view.install(&history)?;
+    view.display.redraw_cached(size)?;
+    assert_eq!(
+        String::from_utf8_lossy(&view.capture.0.lock().unwrap())
+            .matches("\x1b]133;B")
+            .count(),
+        1
+    );
+    println!(
+        "soft-wrap production painter: exact cells/styles/cursor and outgoing connections passed; native selection/clipboard unverified"
+    );
+    Ok(())
+}
+
+fn verify_soft_wrap_transcript(arguments: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        arguments.len() == 2,
+        "expected transcript and soft-wrap specification"
+    );
+    let bytes = std::fs::read(&arguments[0])?;
+    let spec: serde_json::Value = serde_json::from_slice(&std::fs::read(&arguments[1])?)?;
+    let source_steps = spec["source_steps"].as_array().unwrap();
+    let source_size: Size = serde_json::from_value(source_steps[0]["size"].clone())?;
+    let mut local = TerminalModel::new(Size::default(), false)?;
+    let mut offset = 0;
+    let mut viewport = Size::default();
+    for resize in spec["resizes"].as_array().unwrap() {
+        let next = resize["offset"].as_u64().unwrap() as usize;
+        anyhow::ensure!(
+            next >= offset && next <= bytes.len(),
+            "invalid transcript resize offset"
+        );
+        local.advance(&bytes[offset..next])?;
+        viewport = serde_json::from_value(resize["size"].clone())?;
+        local.resize(viewport)?;
+        offset = next;
+    }
+    local.advance(&bytes[offset..])?;
+    let actual = local.snapshot()?;
+    let mut model = TerminalModel::new(source_size, false)?;
+    for step in source_steps {
+        model.resize(serde_json::from_value(step["size"].clone())?)?;
+        if let Some(path) = step["source_file"].as_str() {
+            model.advance(&std::fs::read(path)?)?;
+        }
+    }
+    let expected = model.snapshot()?;
+    let start = usize::from(spec["status"].as_bool().unwrap_or(false));
+    assert_eq!(
+        &soft_grid(&actual, viewport)[start..],
+        &soft_grid(&expected, viewport)[start..],
+        "CLI cells/styles"
+    );
+    assert_eq!(
+        (actual.cursor.x, actual.cursor.y),
+        (
+            expected.cursor.x.min(viewport.cols - 1),
+            expected.cursor.y.min(viewport.rows - 1)
+        ),
+        "CLI cursor"
+    );
+    let flags: Vec<bool> = serde_json::from_value(spec["wraps"].clone())?;
+    assert_eq!(
+        actual
+            .rows
+            .iter()
+            .map(|row| row.wrap.is_soft())
+            .collect::<Vec<_>>(),
+        flags,
+        "CLI local wraps"
+    );
+    let frame = state::frame(1, 1, 0, &expected, None)?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "tty_bytes": bytes.len(), "reconstructed_frame_bytes": postcard::to_allocvec(&frame)?.len(),
+            "reconstructed_row_metadata_bytes": frame.rows.len(), "source_rows": expected.rows,
+            "local_rows": actual.rows, "cursor": actual.cursor, "viewport": viewport,
+            "native_selection_clipboard": "unverified",
+        }))?
     );
     Ok(())
 }

@@ -916,7 +916,8 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut hangup = signal(SignalKind::hangup())?;
     let mut continued = signal(SignalKind::from_raw(libc::SIGCONT))?;
     let continue_flag = ContinueFlag::new()?;
-    let mut display = Display::new(io::sink(), options.graphics, options.prediction);
+    let mut size = LocalTerminal::size()?;
+    let mut display = Display::new(io::sink(), options.graphics, options.prediction, size)?;
     display.write_status("Connecting.")?;
     let mut ui = LocalUi::Parked {
         display: display.into_cached().0,
@@ -945,7 +946,6 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut effects = BTreeMap::<u64, Effect>::new();
     let mut clipboard_queries = VecDeque::<(u64, String, Instant)>::new();
     let mut resize_generation = 1u64;
-    let mut size = LocalTerminal::size()?;
     let mut remote_exit: Option<(i32, u64, u64)> = None;
     let mut resync_pending = false;
     let mut requested_resources = Instant::now() - Duration::from_secs(1);
@@ -1022,6 +1022,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 }
                 if resumed { terminal.reassert_owned_modes()?; }
                 read_size(&mut size, &mut resize_generation)?;
+                display.set_viewport(size)?;
                 refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
                 display.redraw_cached(size)?;
             }
@@ -1044,6 +1045,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 _ = hangup.recv() => return Ok(SessionAction::Detach),
                 _ = resize_signal.recv() => {
                     read_size(&mut size, &mut resize_generation)?;
+                    display.redraw_cached(size)?;
                 }
                 _ = continued.recv() => {
                     resumed |= continue_flag.restart_observation(&mut link);
@@ -1178,6 +1180,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             if pending.paused || pending.is_closing() { decoder.discard_active_paste(); }
                             if redraw {
                                 read_size(&mut size, &mut resize_generation)?;
+                                display.set_viewport(size)?;
                                 refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
                                 display.redraw_cached(size)?;
                             }
@@ -1270,6 +1273,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
             if resumed {
                 terminal.reassert_owned_modes()?;
                 read_size(&mut size, &mut resize_generation)?;
+                display.set_viewport(size)?;
                 refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
                 display.redraw_cached(size)?;
             }

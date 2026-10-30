@@ -122,8 +122,52 @@ def exact(data, timeout=5):
 
 
 def remote_fixture(mode, state):
-    tty.setraw(0, termios.TCSANOW if mode in ["redraw", "combining"] else termios.TCSAFLUSH)
+    tty.setraw(0, termios.TCSANOW if mode in ["redraw", "combining", "soft-wrap"] else termios.TCSAFLUSH)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "soft-wrap":
+        observed = []
+        received = Path(state + ".received")
+        received.write_bytes(b"")
+        Path(state + ".raw").write_bytes(b"")
+        for index, kind in enumerate(["soft", "soft", "hard", "wide", "regional", "soft"]):
+            rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8)))
+            url = ("https://example.test/" + "x" * (cols * 3))[:cols * 2 + 3]
+            text = url
+            if kind == "hard":
+                text = "\r\n".join(url[start:start + cols] for start in range(0, len(url), cols))
+            elif kind == "wide":
+                text = "w" * (cols - 2) + "界Z"
+            elif kind == "regional":
+                text = "r" * (cols - 1) + "🇦X\x1b[3;1H🇧"
+            chunks = [b"\x1b[0m\x1b[2J\x1b[2;1H", text.encode(),
+                      b"\x1b[6;1H\x1b]2;SOFT_WRAP_" + str(index).encode() + b"\x1b\\"]
+            Path(state + f".{index}.raw").write_bytes(b"".join(chunks))
+            for chunk in chunks:
+                assert os.write(1, chunk) == len(chunk)
+                observed.append({"case": index, "kind": kind, "cols": cols, "rows": rows, "hex": chunk.hex()})
+                with Path(state + ".raw").open("ab") as output:
+                    output.write(chunk)
+                Path(state + ".chunks").write_text(json.dumps(observed))
+            if index != 5:
+                exact(b"next\r", timeout=30)
+                with received.open("ab") as output:
+                    output.write(b"next\r")
+        sizes = []
+        while True:
+            current = os.get_terminal_size(0)
+            measured = {"cols": current.columns, "rows": current.lines}
+            if not sizes or sizes[-1] != measured:
+                sizes.append(measured)
+                pending = Path(state + ".sizes.new")
+                pending.write_text(json.dumps(sizes))
+                pending.replace(state + ".sizes")
+            if not select.select([0], [], [], 0.02)[0]:
+                continue
+            chunk = os.read(0, 65536)
+            if not chunk:
+                return 0
+            with received.open("ab") as output:
+                output.write(chunk)
     if mode == "combining":
         observed = []
         received = Path(state + ".received")
@@ -1078,6 +1122,152 @@ def verify_combining(bin_dir, temporary, evidence_dir=None, core_example=None):
         cleanup(state)
 
 
+def verify_soft_wrap(bin_dir, temporary, evidence_dir=None, display_example=None):
+    script = str(Path(__file__).resolve())
+    client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
+    replay = display_example or (bin_dir / "examples" / "verify_display")
+    assert replay.is_file(), "build verify_display before CLI soft-wrap verification"
+    run = evidence_dir / "soft-wrap" if evidence_dir is not None else Path(temporary) / "soft-wrap-evidence"
+    run.mkdir(parents=True, exist_ok=True)
+    state = str(Path(temporary) / "soft-wrap.json")
+    wrapper = Path(temporary) / "soft-wrap-proxy"
+    wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+    wrapper.chmod(0o700)
+    process = TerminalProcess([client, "--local", "--server", str(wrapper), "--predict", "never", "--graphics", "none",
+                               "--", sys.executable, script, "--remote", "soft-wrap", state])
+    facts = {"client": process.process.pid, "cases": [], "native_selection_clipboard": "unverified"}
+    resizes = []
+    source_resizes = []
+    source_cols, source_rows = 80, 24
+    viewport_cols, viewport_rows = 80, 24
+    stage = 0
+
+    def pump_for(duration):
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            process.pump(0.01)
+            assert process.process.poll() is None, bytes(process.output[-2000:])
+
+    def size(cols, rows):
+        return {"cols": cols, "rows": rows, "pixel_width": cols * 10, "pixel_height": rows * 20}
+
+    def resize(cols, rows):
+        nonlocal viewport_cols, viewport_rows
+        resizes.append({"offset": len(process.output), "size": size(cols, rows)})
+        viewport_cols, viewport_rows = cols, rows
+        fcntl.ioctl(process.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, cols * 10, rows * 20))
+        pump_for(0.2)
+
+    def wait_remote_size(cols, rows):
+        deadline = time.monotonic() + 15
+        while True:
+            path = Path(state + ".sizes")
+            measured = json.loads(path.read_text()) if path.exists() else []
+            if measured and measured[-1] == {"cols": cols, "rows": rows}:
+                return measured
+            process.pump(0.02)
+            assert time.monotonic() < deadline, ("remote resize did not arrive", cols, measured)
+
+    def inspect(name, outgoing, start=0, status=False):
+        raw = run / (name + ".remote.raw")
+        raw.write_bytes(Path(state + f".{stage}.raw").read_bytes())
+        chunks = json.loads(Path(state + ".chunks").read_text())
+        source_steps = []
+        for source_stage in range(stage + 1):
+            recorded = [chunk for chunk in chunks if chunk["case"] == source_stage]
+            dimensions = {(chunk["cols"], chunk["rows"]) for chunk in recorded}
+            assert len(dimensions) == 1, (source_stage, dimensions)
+            cols, rows = dimensions.pop()
+            source_file = run / f"source-{source_stage}.raw"
+            source_file.write_bytes(Path(state + f".{source_stage}.raw").read_bytes())
+            source_steps.append({"size": size(cols, rows), "source_file": str(source_file)})
+        source_steps.extend({"size": dimensions} for dimensions in source_resizes)
+        transcript = run / (name + ".tty")
+        transcript.write_bytes(process.output)
+        wraps = [False] * viewport_rows
+        if viewport_cols == source_cols:
+            for y in outgoing:
+                if y + 1 < min(source_rows, viewport_rows):
+                    wraps[y] = True
+        spec = {"source_steps": source_steps, "resizes": resizes,
+                "wraps": wraps, "status": status}
+        spec_path = run / (name + ".spec.json")
+        spec_path.write_text(json.dumps(spec, indent=2) + "\n")
+        result = subprocess.run([str(replay), "--soft-wrap-transcript", str(transcript), str(spec_path)],
+                                text=True, capture_output=True)
+        (run / (name + ".replay.log")).write_text(result.stdout + result.stderr)
+        assert result.returncode == 0, (name, result.stdout, result.stderr)
+        measured = json.loads(result.stdout)
+        facts["cases"].append({"case": name, "offset": start, "end": len(process.output),
+                               "tty_bytes": len(process.output) - start, "reconstructed_frame_bytes": measured["reconstructed_frame_bytes"],
+                               "reconstructed_row_metadata_bytes": measured["reconstructed_row_metadata_bytes"], "wraps": wraps})
+        assert json.loads(Path(state).read_text()) == facts["remote"], "soft-wrap replaced the remote command"
+
+    try:
+        process.until(b"\x1b]2;SOFT_WRAP_0\x1b\\")
+        pump_for(0.1)
+        facts["remote"] = json.loads(Path(state).read_text())
+        inspect("initial", [1, 2])
+        for stage, cols, kind, outgoing in [(1, 8, "soft", [1, 2]), (2, 8, "hard", []),
+                                             (3, 16, "wide", [1]), (4, 2, "regional", [1]), (5, 32, "soft", [1, 2])]:
+            start = len(process.output)
+            resize(cols, 8)
+            pump_for(0.15)
+            source_cols, source_rows = cols, 8
+            process.send(b"next\r")
+            process.until(b"\x1b]2;SOFT_WRAP_" + str(stage).encode() + b"\x1b\\", start=start)
+            pump_for(0.1)
+            inspect(f"{kind}-{cols}", outgoing, start)
+        wait_remote_size(32, 8)
+        Path(state + ".drop").touch()
+        pump_for(0.1)
+        start = len(process.output)
+        process.send(b"\x0c")
+        process.until(b"\x1b[2J", start=start)
+        pump_for(0.1)
+        inspect("outage-ctrl-l", [1, 2], start, True)
+        assert Path(state + ".received").read_bytes() == b"next\r" * 5
+        start = len(process.output)
+        resize(20, 8)
+        inspect("outage-resize", [], start, True)
+        start = len(process.output)
+        os.write(process.slave, b"\x1b[?69h\x1b[2;10s\x1b[2;6r\x1b[?6h")
+        process.pump(0.05)
+        os.kill(process.process.pid, signal.SIGCONT)
+        pump_for(0.2)
+        inspect("sigcont-modes", [], start, True)
+        Path(state + ".drop").unlink()
+        for cols in [20, 32]:
+            if cols == 32:
+                resize(cols, 8)
+            measured = wait_remote_size(cols, 8)
+            source_resizes.append(size(cols, 8))
+        assert measured == [{"cols": 32, "rows": 8}, {"cols": 20, "rows": 8}, {"cols": 32, "rows": 8}], measured
+        deadline = time.monotonic() + 15
+        while Path(state + ".received").read_bytes() != b"next\r" * 5 + b"\x0c":
+            process.pump(0.02)
+            assert time.monotonic() < deadline, "Ctrl-L did not reach original PTY exactly once"
+        pump_for(0.2)
+        inspect("recovered", [2, 3], status=True)
+        facts["passed"] = True
+        process.send(b"\x1e.")
+        process.finish(0)
+        print("CLI soft-wrap: production PTY/UDP, exact cells/styles/cursor/wrap, cached Ctrl-L, resize, SIGCONT modes and original PID passed; native selection/clipboard unverified", flush=True)
+    except Exception as error:
+        facts["error"] = str(error)
+        raise
+    finally:
+        (run / "complete.tty").write_bytes(process.output)
+        (run / "cases.json").write_text(json.dumps(facts, indent=2) + "\n")
+        for suffix, name in [("", "pids.json"), (".raw", "remote.raw"), (".chunks", "remote-chunks.json"),
+                              (".received", "received.bin"), (".stats", "relay.json"), (".sizes", "remote-sizes.json")]:
+            path = Path(state + suffix)
+            if path.exists():
+                (run / name).write_bytes(path.read_bytes())
+        process.close()
+        cleanup(state)
+
+
 def verify_redraw(bin_dir, temporary, evidence_dir=None, display_example=None):
     script = str(Path(__file__).resolve())
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
@@ -1222,6 +1412,15 @@ def verify_redraw(bin_dir, temporary, evidence_dir=None, display_example=None):
             assert Path(state + ".received").read_bytes() == b"\x0c", "input crossed blocked UDP relay"
         resize_offset = len(process.output)
         fcntl.ioctl(process.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 64, 640, 240))
+        process.until(b"\x1b[?2026l", start=resize_offset)
+        pump_for(process, 0.1)
+        delta = bytes(process.output[resize_offset:])
+        assert delta.count(b"\x1b[2J") == 1, ("sigwinch", delta)
+        for effect in [b"\x07", b"\x1b]52;", b"\x1b]777;", b"\x1b]133;"]:
+            assert effect not in delta, ("sigwinch repeated effect", effect)
+        inspect(process, run, "sigwinch", True, (64, 12, resize_offset))
+        facts.append({"case": "sigwinch", "offset": resize_offset, "end": len(process.output),
+                      "tty_bytes": len(delta), "full_redraws": 1, "input_hex": "", "effects_replayed": 0})
         local_action(process, run, facts, "resize", b"\x0c", 1, (64, 12, resize_offset))
         expected.extend(b"\x1b[108;5:1u")
         Path(state + ".drop").unlink()
@@ -1630,6 +1829,7 @@ else:
         print("CLI running background clients exit on TERM/HUP without touching the terminal or ending the remote command", flush=True)
 
         if network:
+            verify_soft_wrap(bin_dir, temporary, evidence_dir, display_example)
             verify_combining(bin_dir, temporary, evidence_dir, core_example)
             verify_legacy_input(bin_dir, temporary, evidence_dir)
             verify_redraw(bin_dir, temporary, evidence_dir, display_example)
@@ -2077,12 +2277,17 @@ if __name__ == "__main__":
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
     parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
     parser.add_argument("--redraw", action="store_true", help="exercise cached Ctrl-L redraw, key identity, images, effects and rejected input")
+    parser.add_argument("--soft-wrap", action="store_true", help="exercise soft-wrap metadata, exact cells and resize/recovery over real PTY/UDP")
     parser.add_argument("--combining", action="store_true", help="exercise orphan combining marks with exact cell and cursor transcript roundtrips")
     parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
     arguments = parser.parse_args()
-    if arguments.combining:
+    if arguments.soft_wrap:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-soft-wrap-") as temporary:
+            verify_soft_wrap(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
+                             arguments.display_example.resolve() if arguments.display_example else None)
+    elif arguments.combining:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-combining-") as temporary:
             verify_combining(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
                              arguments.core_example.resolve() if arguments.core_example else None)

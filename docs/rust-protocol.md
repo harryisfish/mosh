@@ -3,9 +3,9 @@
 This is the implementation contract for the Rust client and server. The protocol
 is not compatible with the original Mosh wire protocol.
 
-The current Rust protocol is version 5, with ALPN `mosh-rs/5`. Both endpoints
-must use this version. Earlier Rust workers cannot resume with a version 5 client.
-Version 4 peers are rejected by bootstrap, grant, Attach, and ALPN validation.
+The current Rust protocol is version 7, with ALPN `mosh-rs/7`. Both endpoints
+must use this version. Earlier Rust workers cannot resume with a version 7 client.
+Version 6 and older peers are rejected by bootstrap, grant, Attach, and ALPN validation.
 
 ## Ownership and authentication
 
@@ -130,7 +130,7 @@ The deadline does not apply inside paste, OSC/DCS/APC strings, or an identified
 X10 mouse event's three payload bytes. These bodies cannot execute local escape
 commands. The captured input tail is processed before a clock-only expiry.
 Suspension does not refresh keyboard deadlines. Refusals allocate no input seq
-and cannot be replayed later. The wire remains version 5; Linux F1-F5,
+and cannot be replayed later. The wire uses version 7; Linux F1-F5,
 xterm F21-F24, Keypad Begin, and Keypad Equal use existing semantic keys.
 
 Empty-parameter rxvt `CSI a` through `CSI d` encode Shift arrows, and `SS3 a`
@@ -238,6 +238,29 @@ frame. Server input encoding uses its current keyboard, mouse, focus, and paste
 modes. Key press, repeat, release, alternate key codes, and associated text remain
 distinct semantic fields. Paste is UTF-8 text, with nested paste markers removed.
 
+Each row carries a `RowWrap` value: `Hard`, `Soft`, or `WidePadding`.
+`Soft` connects to the next physical row after consuming pending wrap.
+`WidePadding` also connects, but its final single-column blank was synthesized
+when a wide grapheme did not fit. The core records that provenance at the print
+operation and preserves it through scroll and reflow. A real space typed at the
+same position remains `Soft`. Deltas compare the entire row, including its wrap
+kind. Version 7 requires this representation and rejects version 6 peers.
+
+The display retains the canonical rows and the last observed local viewport.
+It redraws complete connected groups across old and new boundaries. Ordinary
+soft wraps use an ASCII sentinel after the full row. Wide-padding rows omit the
+synthetic last blank and use a double-width sentinel, so the local terminal
+creates its own wide-wrap padding. The next row overwrites either sentinel.
+This prevents adjacent regional indicators from combining across the boundary
+and preserves genuine spaces. Automatic wrapping is disabled outside these
+draws. The bottom row never consumes pending wrap. Different source and local
+column counts, a hidden successor, or a status overlay on row zero temporarily
+produce hard boundaries without changing the canonical wrap kind.
+
+Source, serialized frame, cached redraw, and native terminal selection checks
+must distinguish synthetic padding from user spaces. Native clipboard evidence
+is recorded separately from terminal-core replay and remains terminal-specific.
+
 Static Kitty direct-data, SIXEL, and inline image data are decoded under limits
 before display projection. Files and shared memory are never forwarded or read.
 Parser accumulation, decompression, decoding, unplaced uploads, live resources,
@@ -261,6 +284,9 @@ Windows are at most 512 columns by 256 rows. A control message is at most 512 Ki
 a decoded or compressed frame is at most 16 MiB. An image is at most 16 MiB RGBA.
 Each cell contains at most 4096 image tiles, and a screen at most 262144 tiles.
 The frame byte budget can require a smaller tile limit.
+Snapshot encoding counts each complete row, including its metadata, against
+the 16 MiB frame limit with 1 MiB reserved for the frame envelope. Text and
+hyperlinks retain their separate 4 MiB snapshot budget.
 Each current screen, the core's decoded image store, and the adapter's exported
 cache have separate 64 MiB limits. The actor retains at most 128 MiB of unique
 resources across display roots plus two independent resource transfers. A client

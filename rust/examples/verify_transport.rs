@@ -8,7 +8,7 @@ use mosh_rs::model::{
     Attach, BootstrapRequest, ClientMessage, Cursor as ScreenCursor, Effect, EffectKind, Frame,
     Grant, InputEvent, InputRecord, Key, KeyCode, KeyPhase, MAX_CONTROL, MAX_EFFECTS, MAX_FRAME,
     MAX_LOCALE_CANDIDATES, Mouse, MouseKind, PROTOCOL_VERSION, PredictionContext, Resource,
-    ResourceMeta, Row, RowPatch, ServerMessage, Size, resource_digest,
+    ResourceMeta, Row, RowPatch, RowWrap, ServerMessage, Size, resource_digest,
 };
 use mosh_rs::transport::{
     ClientEndpoints, ClientIdentity, EncodedFrame, Incoming, ServerListeners, bootstrap_local,
@@ -380,7 +380,7 @@ async fn main() -> Result<()> {
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, protocol v5, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v7, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
     );
     Ok(())
 }
@@ -469,7 +469,7 @@ fn bootstrap_fixture(mode: &str) -> Result<()> {
         }
         "invalid-grant" => {
             let mut old = grant;
-            old.version = 4;
+            old.version = 5;
             stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
             serde_json::to_writer(&mut stdout, &old)?;
             stdout.write_all(b"\n\x1eMOSH-RS-GRANT-END\n")?;
@@ -765,16 +765,16 @@ async fn verify() -> Result<()> {
     let identity = ClientIdentity::generate()?;
     let request = request(&identity);
     let mut legacy_request = request.clone();
-    legacy_request.version = 4;
+    legacy_request.version = 5;
     let mut legacy_json = serde_json::to_vec(&legacy_request)?;
     legacy_json.push(b'\n');
     ensure!(
         read_request(Cursor::new(legacy_json)).is_err(),
-        "v4 bootstrap request was accepted"
+        "v5 bootstrap request was accepted"
     );
     ensure!(
         listen(&legacy_request).is_err(),
-        "v4 listener request was accepted"
+        "v5 listener request was accepted"
     );
     let mut invalid_locale = request.clone();
     invalid_locale.locale_candidates = vec!["bad/name".into()];
@@ -822,14 +822,14 @@ async fn verify() -> Result<()> {
     let (server, grant) = listen(&request)?;
     let client = identity.endpoint(&grant)?;
     let mut legacy_grant = grant.clone();
-    legacy_grant.version = 4;
+    legacy_grant.version = 5;
     ensure!(
         identity.endpoint(&legacy_grant).is_err(),
-        "v4 server grant was accepted"
+        "v5 server grant was accepted"
     );
     ensure!(
         connect(&client, &legacy_grant).await.is_err(),
-        "v4 connection grant was accepted"
+        "v5 connection grant was accepted"
     );
     let mut hostname_grant = grant.clone();
     hostname_grant.address = "localhost".into();
@@ -849,7 +849,7 @@ async fn verify() -> Result<()> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
     ensure!(
-        handshake.protocol.as_deref() == Some(&b"mosh-rs/5"[..]),
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/7"[..]),
         "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");
@@ -989,16 +989,49 @@ async fn verify() -> Result<()> {
     cancelled.write_all(&[1]).await?;
     cancelled.write_all(b"incomplete frame").await?;
     cancelled.reset(VarInt::from_u32(0x10))?;
+    let mut wrapped_frame = frame();
+    wrapped_frame.rows[0].row.wrap = RowWrap::WidePadding;
+    wrapped_frame.rows[0].row.cells.push(mosh_rs::model::Cell {
+        x: 19,
+        text: " ".into(),
+        width: 1,
+        style: Default::default(),
+        images: Vec::new(),
+    });
     let frame_sender = tokio::spawn({
         let connection = server_connection.clone();
-        async move { EncodedFrame::new(&frame())?.send(&connection).await }
+        let frame = wrapped_frame.clone();
+        async move { EncodedFrame::new(&frame)?.send(&connection).await }
     });
-    let incoming = receive_uni(&client_connection).await?;
+    let Incoming::Frame(received) = receive_uni(&client_connection).await? else {
+        anyhow::bail!("superseded stream prevented next frame");
+    };
     ensure!(
-        matches!(incoming, Incoming::Frame(Frame { revision: 1, .. })),
-        "superseded stream prevented next frame"
+        received.rows[0].row.wrap == RowWrap::WidePadding
+            && postcard::to_allocvec(&received)? == postcard::to_allocvec(&wrapped_frame)?,
+        "soft-wrapped checkpoint changed in transit"
     );
     frame_sender.await??;
+    wrapped_frame.base = Some(1);
+    wrapped_frame.revision = 2;
+    wrapped_frame.rows.truncate(1);
+    wrapped_frame.rows[0].row.wrap = RowWrap::Hard;
+    let frame_sender = tokio::spawn({
+        let connection = server_connection.clone();
+        let frame = wrapped_frame.clone();
+        async move { EncodedFrame::new(&frame)?.send(&connection).await }
+    });
+    let Incoming::Frame(received) = receive_uni(&client_connection).await? else {
+        anyhow::bail!("expected wrap-only delta");
+    };
+    ensure!(
+        postcard::to_allocvec(&received)? == postcard::to_allocvec(&wrapped_frame)?,
+        "wrap-only delta changed in transit"
+    );
+    frame_sender.await??;
+    println!(
+        "QUIC preserves a soft-wrapped checkpoint and a wrap-only hard-boundary delta byte-for-byte after decoding"
+    );
 
     let rgba: Arc<[u8]> = vec![42; 4 * 1024 * 1024].into();
     let resource = Resource {

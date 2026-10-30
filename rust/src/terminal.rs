@@ -433,13 +433,40 @@ impl TerminalModel {
                     },
                     images,
                 };
-                postcard::to_io(&projected, &mut encoded_budget)?;
                 cells.push(projected);
             }
-            rows.push(Row {
+            let blank = Style::default();
+            cells.dedup_by(|next, kept| {
+                let plain_space = |cell: &Cell| {
+                    cell.width == 1
+                        && cell.text == " "
+                        && cell.style == blank
+                        && cell.images.is_empty()
+                };
+                if kept.x + 1 == next.x && plain_space(kept) && plain_space(next) {
+                    kept.x = next.x;
+                    true
+                } else {
+                    false
+                }
+            });
+            let row = Row {
                 cells,
                 stable_id: screen.visible_row_to_stable_row(y as i64) as i64,
-            });
+                wrap: if !line.last_cell_was_wrapped() {
+                    RowWrap::Hard
+                } else if line
+                    .get_cell(usize::from(self.size.cols) - 1)
+                    .is_some_and(|cell| cell.attrs().wide_wrap_padding())
+                    && y + 1 < usize::from(self.size.rows)
+                {
+                    RowWrap::WidePadding
+                } else {
+                    RowWrap::Soft
+                },
+            };
+            postcard::to_io(&row, &mut encoded_budget)?;
+            rows.push(row);
         }
         let live: BTreeSet<_> = self.terminal.live_image_keys().into_iter().collect();
         self.resources

@@ -24,7 +24,7 @@ use crate::model::{
     validate_locale_candidates,
 };
 
-const ALPN: &[u8] = b"mosh-rs/5";
+const ALPN: &[u8] = b"mosh-rs/7";
 const FRAME_STREAM: u8 = 1;
 const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;
@@ -1283,6 +1283,7 @@ pub fn validate_frame(frame: &Frame) -> Result<()> {
     let mut rows = BTreeSet::new();
     let mut image_tiles = 0usize;
     for patch in &frame.rows {
+        patch.row.validate_wrap(frame.size, patch.y)?;
         ensure!(
             patch.y < frame.size.rows && rows.insert(patch.y),
             "invalid or duplicate display row"

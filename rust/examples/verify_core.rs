@@ -67,6 +67,10 @@ fn main() -> Result<()> {
     {
         return verify_combining_transcript(&arguments[1..]);
     }
+    if arguments.first().is_some_and(|arg| arg == "--soft-wrap") {
+        return verify_soft_wrap_metadata();
+    }
+    verify_soft_wrap_metadata()?;
     verify_default_colors()?;
     verify_terminal_boundaries()?;
     verify_png_metadata()?;
@@ -115,9 +119,32 @@ fn main() -> Result<()> {
         prediction: screen.prediction,
         resources: Vec::new(),
     };
+    let rows_bytes = frame
+        .rows
+        .iter()
+        .map(|patch| postcard::to_io(&patch.row, CountBytes::default()).map(|count| count.0))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
+    let legacy_rows_bytes = frame
+        .rows
+        .iter()
+        .map(|patch| {
+            postcard::to_io(
+                &(&patch.row.cells, patch.row.stable_id),
+                CountBytes::default(),
+            )
+            .map(|count| count.0)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
+    assert_eq!(rows_bytes - legacy_rows_bytes, 256);
     let bytes = postcard::to_io(&frame, CountBytes::default())?.0;
     assert!(bytes <= MAX_FRAME);
-    println!("maximum 512x256 full RGB text frame: {bytes} postcard bytes");
+    println!(
+        "maximum 512x256 full RGB text frame: {bytes} postcard bytes, {rows_bytes} Row bytes including 256 wrap metadata bytes"
+    );
     drop(frame);
     drop(large);
 
@@ -563,7 +590,9 @@ fn verify_terminal_boundaries() -> Result<()> {
             );
             let original = screen.rows.clone();
             let mut displays = [Graphics::Kitty, Graphics::Sixel].map(|graphics| {
-                let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+                let mut display =
+                    Display::new(Vec::new(), graphics, PredictionPolicy::Never, screen.size)
+                        .expect("display viewport");
                 display.set_epoch(1).expect("set display epoch");
                 display
             });
@@ -844,7 +873,12 @@ fn checked(model: &mut TerminalModel) -> Result<Screen> {
         format!("\x1b[{};{}R", screen.cursor.y + 1, screen.cursor.x + 1).as_bytes()
     );
     let frame = state::frame(1, 1, 0, &screen, None)?;
-    let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
+    let mut display = Display::new(
+        Vec::new(),
+        Graphics::None,
+        PredictionPolicy::Never,
+        screen.size,
+    )?;
     display.set_epoch(1)?;
     assert!(display.install(&frame, &screen.resources)?);
     Ok(screen)
@@ -939,7 +973,7 @@ fn verify_projection_regressions() -> Result<()> {
     assert_eq!(tiles.len(), 8);
     assert!(tiles.iter().all(|tile| tile.source == [0, 0, 1, 1]));
     for graphics in [Graphics::Kitty, Graphics::Sixel] {
-        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
+        let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never, screen.size)?;
         display.set_epoch(1)?;
         display.install(&state::frame(1, 1, 0, &screen, None)?, &screen.resources)?;
     }
@@ -1408,6 +1442,402 @@ fn verify_scrollback_wrap() -> Result<()> {
     assert_eq!(last_line.trim_end(), "Done");
     println!(
         "2048 scrolling lines with split combining text, snapshots, continuation and DSR passed"
+    );
+    Ok(())
+}
+
+fn verify_soft_wrap_metadata() -> Result<()> {
+    verify_wide_padding_provenance()?;
+    #[derive(Debug)]
+    struct WrapConfig;
+    impl tattoy_wezterm_term::TerminalConfiguration for WrapConfig {
+        fn color_palette(&self) -> tattoy_wezterm_term::color::ColorPalette {
+            Default::default()
+        }
+    }
+    let core = |cols, rows| {
+        tattoy_wezterm_term::Terminal::new(
+            tattoy_wezterm_term::TerminalSize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::new(WrapConfig),
+            "wrap-verification",
+            "0",
+            Box::new(std::io::sink()),
+        )
+    };
+    let mut dangling = core(2, 2);
+    dangling.advance_bytes(b"ABCD");
+    let last = dangling.screen().phys_row(1);
+    dangling
+        .screen_mut()
+        .line_mut(last)
+        .set_last_cell_was_wrapped(true, 100);
+    dangling.resize(tattoy_wezterm_term::TerminalSize {
+        cols: 4,
+        rows: 2,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    });
+    let first = dangling.screen().phys_row(0);
+    assert_eq!(
+        dangling.screen().lines_in_phys_range(first..first + 1)[0].as_str(),
+        "ABCD"
+    );
+    let mut stale = core(4, 4);
+    stale.advance_bytes("abc界Z".as_bytes());
+    let mut padding = tattoy_wezterm_term::CellAttributes::default();
+    padding.set_wide_wrap_padding(true);
+    stale
+        .screen_mut()
+        .set_cell_grapheme(1, 0, " ", 1, padding.clone(), 100);
+    stale.resize(tattoy_wezterm_term::TerminalSize {
+        cols: 8,
+        rows: 4,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    });
+    let first = stale.screen().phys_row(0);
+    assert_eq!(
+        stale.screen().lines_in_phys_range(first..first + 1)[0].as_str(),
+        "a c界Z"
+    );
+    let mut repeated = core(4, 4);
+    repeated.advance_bytes(b"ABC");
+    repeated
+        .screen_mut()
+        .set_cell_grapheme(2, 0, " ", 1, padding, 100);
+    repeated.advance_bytes(b"\x1b[1b");
+    assert!(
+        !repeated
+            .screen_mut()
+            .get_cell(3, 0)
+            .unwrap()
+            .attrs()
+            .wide_wrap_padding()
+    );
+    for cols in [4, 512] {
+        let mut core = tattoy_wezterm_term::Terminal::new(
+            tattoy_wezterm_term::TerminalSize {
+                cols,
+                rows: 4,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::new(WrapConfig),
+            "wrap-verification",
+            "0",
+            Box::new(std::io::sink()),
+        );
+        core.advance_bytes(format!(
+            "{}\r\x1b[2K\x1b[38;2;11;22;33m{}界",
+            "0".repeat(cols),
+            "a".repeat(cols - 2)
+        ));
+        let physical = core.screen().phys_row(0);
+        let before = core
+            .screen()
+            .lines_in_phys_range(physical..physical + 1)
+            .remove(0);
+        assert!(!before.last_cell_was_wrapped());
+        let seqno = before.current_seqno();
+        let style = before.visible_cells().last().unwrap().attrs().clone();
+        core.advance_bytes(b"Z");
+        let mut wrapped = core
+            .screen()
+            .lines_in_phys_range(physical..physical + 1)
+            .remove(0);
+        assert!(wrapped.current_seqno() > seqno);
+        assert!(wrapped.last_cell_was_wrapped());
+        let raw = wrapped.cells_mut_for_attr_changes_only();
+        assert!(raw[cols - 2].attrs().wrapped() && raw[cols - 1].attrs().wrapped());
+        assert_eq!(raw[cols - 2].attrs().foreground(), style.foreground());
+        let mut logical = tattoy_wezterm_term::Line::new(100);
+        for x in 0..cols - 2 {
+            logical.set_cell_grapheme(x, "a", 1, style.clone(), 100);
+        }
+        logical.set_cell_grapheme(cols - 2, "界", 2, style.clone(), 100);
+        let mut next = tattoy_wezterm_term::Line::new(100);
+        next.set_cell_grapheme(0, "Z", 1, style.clone(), 100);
+        logical.append_line(next, 101);
+        let lines = logical.wrap(cols, 102);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.last_cell_was_wrapped())
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert!(lines.iter().all(|line| line.current_seqno() >= 102));
+        assert_eq!(lines[0].visible_cells().last().unwrap().str(), "界");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.visible_cells())
+                .all(|cell| cell.attrs().foreground() == style.foreground())
+        );
+    }
+    for cols in [4, 512] {
+        let size = Size {
+            cols,
+            rows: 4,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        for overwritten in [false, true] {
+            let mut model = TerminalModel::new(size, false)?;
+            if overwritten {
+                model.advance(format!("{}\r\x1b[2K", "0".repeat(usize::from(cols))).as_bytes())?;
+            }
+            let prefix = "a".repeat(usize::from(cols) - 2);
+            model.advance(format!("{prefix}界").as_bytes())?;
+            let full = model.snapshot()?;
+            assert!(
+                !full.rows[0].wrap.is_soft(),
+                "pending wrap is not an outgoing connection"
+            );
+            model.advance(b"Z")?;
+            let wrapped = model.snapshot()?;
+            assert!(
+                wrapped.rows[0].wrap.is_soft(),
+                "wide leader must carry consumed wrap"
+            );
+            assert_eq!(wrapped.rows[0].cells.last().unwrap().text, "界");
+            assert_eq!(wrapped.rows[1].cells[0].text, "Z");
+            model.resize(Size {
+                cols: cols / 2,
+                ..size
+            })?;
+            let narrow = model.snapshot()?;
+            assert!(narrow.rows[0].wrap.is_soft());
+            assert!(narrow.rows[1].wrap.is_soft());
+            model.resize(size)?;
+            let restored = model.snapshot()?;
+            assert_eq!(restored.rows[0].cells, wrapped.rows[0].cells);
+            assert_eq!(restored.rows[1].cells[0].text, "Z");
+            assert!(restored.rows[0].wrap.is_soft());
+            assert!(
+                !restored.rows[1].wrap.is_soft(),
+                "reflow must clear the old wide spacer flag"
+            );
+            println!(
+                "core soft-wrap cols={cols}, overwritten={overwritten}: pending, wide leader/spacer, narrow/wide reflow passed"
+            );
+        }
+    }
+    let mut old_row = serde_json::json!({"cells": [], "stable_id": 0});
+    assert!(
+        serde_json::from_value::<Row>(old_row.clone()).is_err(),
+        "old Row must not silently default wrap kind"
+    );
+    old_row["wrap"] = "Soft".into();
+    assert!(serde_json::from_value::<Row>(old_row)?.wrap.is_soft());
+    Ok(())
+}
+
+fn verify_wide_padding_provenance() -> Result<()> {
+    let size = Size {
+        cols: 4,
+        rows: 4,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let logical = |screen: &Screen| {
+        let mut text = String::new();
+        for row in &screen.rows {
+            let mut x = 0;
+            for cell in &row.cells {
+                for _ in x..cell.x {
+                    text.push(' ');
+                }
+                if row.wrap != RowWrap::WidePadding || cell.x != screen.size.cols - 1 {
+                    text.push_str(&cell.text);
+                }
+                x = cell.x + u16::from(cell.width);
+            }
+            if !row.wrap.is_soft() {
+                break;
+            }
+        }
+        text.trim_end_matches(' ').to_owned()
+    };
+    for (text, kind) in [
+        ("abc界Z", RowWrap::WidePadding),
+        ("abc 界Z", RowWrap::Soft),
+        ("ab 界Z", RowWrap::WidePadding),
+    ] {
+        let mut model = TerminalModel::new(size, false)?;
+        model.advance(text.as_bytes())?;
+        let screen = model.snapshot()?;
+        assert_eq!(screen.rows[0].wrap, kind, "{text}: source");
+        assert_eq!(logical(&screen), text);
+        assert_eq!((screen.cursor.x, screen.cursor.y), (3, 1));
+        model.resize(Size { cols: 8, ..size })?;
+        let screen = model.snapshot()?;
+        assert_eq!(logical(&screen), text, "{text}: wider");
+        assert_eq!(
+            (screen.cursor.x, screen.cursor.y),
+            (
+                text.chars()
+                    .map(|c| if c == '界' { 2 } else { 1 })
+                    .sum::<u16>(),
+                0
+            )
+        );
+        model.resize(size)?;
+        let screen = model.snapshot()?;
+        assert_eq!(screen.rows[0].wrap, kind, "{text}: restored");
+        assert_eq!(logical(&screen), text, "{text}: restored");
+        assert_eq!((screen.cursor.x, screen.cursor.y), (3, 1));
+    }
+    for (trace, expected) in [
+        (b"\x1b[1;1HX".as_slice(), RowWrap::WidePadding),
+        (b"\x1b[1;4H ", RowWrap::Soft),
+        (b"\x1b[1;4H\x1b[X", RowWrap::Soft),
+        (b"\x1b[1;1H\x1b[@", RowWrap::Hard),
+        (b"\x1b[1;1H\x1b[P", RowWrap::Hard),
+    ] {
+        let mut model = TerminalModel::new(size, false)?;
+        model.advance("abc界Z".as_bytes())?;
+        model.advance(trace)?;
+        assert_eq!(model.snapshot()?.rows[0].wrap, expected, "{trace:?}");
+        if trace == b"\x1b[1;4H " {
+            assert_eq!(logical(&model.snapshot()?), "abc 界Z");
+        }
+    }
+    let mut split = TerminalModel::new(size, false)?;
+    split.advance("\x1b]1337;UnicodeVersion=14\x07abc☺".as_bytes())?;
+    split.advance("\u{fe0f}Z".as_bytes())?;
+    assert_eq!(split.snapshot()?.rows[0].wrap, RowWrap::WidePadding);
+    let mut alternate = TerminalModel::new(size, false)?;
+    alternate.advance("\x1b[?1049habc界Z".as_bytes())?;
+    assert_eq!(alternate.snapshot()?.rows[0].wrap, RowWrap::WidePadding);
+    alternate.resize(Size { cols: 8, ..size })?;
+    alternate.resize(size)?;
+    assert_ne!(alternate.snapshot()?.rows[0].wrap, RowWrap::WidePadding);
+    let mut pending = TerminalModel::new(size, false)?;
+    pending.advance(b"ABCD")?;
+    pending.resize(Size { cols: 2, ..size })?;
+    assert_eq!(
+        (pending.snapshot()?.cursor.x, pending.snapshot()?.cursor.y),
+        (1, 1)
+    );
+    pending.advance(b"E")?;
+    assert_eq!(pending.snapshot()?.rows[2].cells[0].text, "E");
+    let mut sparse = TerminalModel::new(Size { cols: 16, ..size }, false)?;
+    sparse.advance(b"A\x1b[1;12H")?;
+    sparse.resize(Size { cols: 8, ..size })?;
+    assert_eq!(sparse.advance(b"\x1b[6n")?.replies, b"\x1b[2;4R");
+    sparse.advance(b"X")?;
+    assert_eq!(sparse.advance(b"\x1b[6n")?.replies, b"\x1b[2;5R");
+    let screen = sparse.snapshot()?;
+    assert_eq!(screen.rows[0].cells[0].text, "A");
+    assert_eq!(
+        screen.rows[1]
+            .cells
+            .iter()
+            .find(|cell| cell.x == 3)
+            .unwrap()
+            .text,
+        "X"
+    );
+    for (position, narrow, restored) in [
+        (b"\x1b[1;4H".as_slice(), (1, 1), (3, 0)),
+        (b"\x1b[2;1H", (0, 2), (0, 1)),
+    ] {
+        let mut model = TerminalModel::new(size, false)?;
+        model.advance("abc界Z".as_bytes())?;
+        model.advance(position)?;
+        model.resize(Size { cols: 2, ..size })?;
+        let screen = model.snapshot()?;
+        assert_eq!((screen.cursor.x, screen.cursor.y), narrow);
+        model.resize(size)?;
+        let screen = model.snapshot()?;
+        assert_eq!((screen.cursor.x, screen.cursor.y), restored);
+    }
+    let mut scrolled = TerminalModel::new(size, false)?;
+    scrolled.advance("\x1b[2;1Habc界Z\x1b[4;1H\r\n".as_bytes())?;
+    assert_eq!(scrolled.snapshot()?.rows[0].wrap, RowWrap::WidePadding);
+    let mut partial = TerminalModel::new(size, false)?;
+    partial.advance("abc界Z\x1b[?69h\x1b[2;4s\x1b[S".as_bytes())?;
+    assert!(
+        partial
+            .snapshot()?
+            .rows
+            .iter()
+            .all(|row| row.wrap != RowWrap::WidePadding)
+    );
+    let mut deletion = TerminalModel::new(
+        Size {
+            cols: 16,
+            rows: 6,
+            ..size
+        },
+        false,
+    )?;
+    deletion.advance("\x1b[4;1Hhttps://e.test/界Z".as_bytes())?;
+    assert_eq!(deletion.snapshot()?.rows[3].wrap, RowWrap::WidePadding);
+    deletion.advance(b"\x1b[?69h\x1b[1;4s\x1b[4;1H\x1b[P\x1b[?69l")?;
+    let deleted = deletion.snapshot()?;
+    assert_eq!(deleted.rows[3].wrap, RowWrap::Hard);
+    assert_eq!(
+        deleted.rows[3]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .trim_end(),
+        "ttp s://e.test/"
+    );
+    assert_eq!(
+        deleted.rows[4]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .trim_end(),
+        "界Z"
+    );
+    let mut insertion = TerminalModel::new(
+        Size {
+            cols: 16,
+            rows: 6,
+            ..size
+        },
+        false,
+    )?;
+    insertion.advance("\x1b[4;1Hhttps://e.test/界Z".as_bytes())?;
+    insertion.advance(b"\x1b[?69h\x1b[1;4s\x1b[4;2H\x1b[@\x1b[?69l")?;
+    let inserted = insertion.snapshot()?;
+    assert_eq!(inserted.rows[3].wrap, RowWrap::WidePadding);
+    assert_eq!(
+        inserted.rows[3]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .trim_end(),
+        "h tts://e.test/"
+    );
+    assert_eq!(
+        inserted.rows[4]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .trim_end(),
+        "界Z"
+    );
+    println!(
+        "wide padding distinguishes typed spaces, edits, split growth, reflow, scroll and cursor affinity"
     );
     Ok(())
 }

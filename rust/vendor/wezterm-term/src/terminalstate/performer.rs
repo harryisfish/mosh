@@ -199,9 +199,11 @@ impl<'a> Performer<'a> {
                     let width = grapheme_column_width(&joined, Some(&self.unicode_version));
                     if x + width > self.left_and_right_margins.end && self.dec_auto_wrap {
                         let y = self.cursor.y;
-                        self.screen_mut().set_cell_grapheme(x, y, " ", 1, attrs.clone(), seqno);
+                        let mut padding = attrs.clone();
+                        padding.set_wide_wrap_padding(width <= self.left_and_right_margins.len());
+                        self.screen_mut().set_cell_grapheme(x, y, " ", 1, padding, seqno);
                         let row = self.screen().phys_row(y);
-                        self.screen_mut().line_mut(row).set_last_cell_was_wrapped(true, seqno);
+                        crate::screen::set_line_wrapped(self.screen_mut().line_mut(row), true, seqno);
                         self.new_line(true);
                         x = self.cursor.x;
                     }
@@ -252,8 +254,9 @@ impl<'a> Performer<'a> {
             if !self.wrap_next && self.dec_auto_wrap && self.cursor.x + print_width > self.left_and_right_margins.end {
                 let x = self.cursor.x;
                 let y = self.cursor.y;
-                let pen = self.pen.clone();
-                self.screen_mut().set_cell_grapheme(x, y, " ", 1, pen, seqno);
+                let mut padding = self.pen.clone();
+                padding.set_wide_wrap_padding(print_width <= self.left_and_right_margins.len());
+                self.screen_mut().set_cell_grapheme(x, y, " ", 1, padding, seqno);
                 self.wrap_next = true;
             }
             if self.wrap_next {
@@ -283,7 +286,7 @@ impl<'a> Performer<'a> {
                             .map(|cell| makes_sense_to_wrap(cell.str()))
                             .unwrap_or(false);
                     if should_mark_wrapped {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+                        crate::screen::set_line_wrapped(screen.line_mut(y), true, seqno);
                     }
                 }
                 self.new_line(true);

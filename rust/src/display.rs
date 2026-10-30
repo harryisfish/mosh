@@ -112,6 +112,7 @@ struct PreparedGraphics {
 
 pub struct Display<W> {
     writer: W,
+    viewport: Size,
     epoch: u64,
     revision: u64,
     installed_echo_through: Option<u64>,
@@ -136,6 +137,7 @@ impl<W> Display<W> {
         (
             Display {
                 writer,
+                viewport: self.viewport,
                 epoch: self.epoch,
                 revision: self.revision,
                 installed_echo_through: self.installed_echo_through,
@@ -163,9 +165,16 @@ impl Display<()> {
 }
 
 impl<W: Write> Display<W> {
-    pub fn new(writer: W, graphics: Graphics, prediction: PredictionPolicy) -> Self {
-        Self {
+    pub fn new(
+        writer: W,
+        graphics: Graphics,
+        prediction: PredictionPolicy,
+        viewport: Size,
+    ) -> Result<Self> {
+        viewport.validate()?;
+        Ok(Self {
             writer,
+            viewport,
             epoch: 0,
             revision: 0,
             installed_echo_through: None,
@@ -180,7 +189,13 @@ impl<W: Write> Display<W> {
             status: String::new(),
             emitted_markers: VecDeque::new(),
             checkpoint_required: true,
-        }
+        })
+    }
+
+    pub fn set_viewport(&mut self, viewport: Size) -> Result<()> {
+        viewport.validate()?;
+        self.viewport = viewport;
+        Ok(())
     }
 
     pub fn set_epoch(&mut self, epoch: u64) -> Result<()> {
@@ -253,7 +268,6 @@ impl<W: Write> Display<W> {
             return Ok(false);
         }
         let mut screen = self.assemble(frame, resources)?;
-        let graphics = prepare_graphics(&screen, self.graphics)?;
         let stamp = PredictionStamp::from(screen.prediction);
         let mode_changed = self.predictions.remote != Some(stamp);
         let mut repaint = BTreeSet::new();
@@ -312,33 +326,12 @@ impl<W: Write> Display<W> {
         {
             self.predictions.clear();
         }
-        self.writer.write_all(b"\x1b[?2026h\x1b[?25l")?;
-        if checkpoint || self.graphics == Graphics::Sixel {
-            self.writer.write_all(b"\x1b[0m\x1b[2J")?;
-        }
-        self.writer.write_all(if screen.reverse_video {
-            b"\x1b[?5h"
-        } else {
-            b"\x1b[?5l"
-        })?;
-        for y in repaint {
-            render_row(&mut self.writer, &screen, y)?;
-        }
-        self.render_graphics(&graphics)?;
-        self.render_metadata(&screen)?;
-        render_guesses(
-            &mut self.writer,
-            &self.predictions.tokens,
-            self.predictions.local_epoch,
+        self.paint(
             &screen,
+            repaint,
+            checkpoint || self.graphics == Graphics::Sixel,
+            true,
         )?;
-        if !self.status.is_empty() {
-            render_status(&mut self.writer, &screen, &self.status)?;
-        }
-        let cursor = self.overlay_cursor(&screen);
-        render_cursor(&mut self.writer, &screen, cursor)?;
-        self.writer.write_all(b"\x1b[?2026l")?;
-        self.writer.flush().context("flush terminal frame")?;
         screen
             .resources
             .retain(|digest, _| frame.resources.iter().any(|meta| &meta.digest == digest));
@@ -421,7 +414,8 @@ impl<W: Write> Display<W> {
             pinned.insert(meta.digest, resource.clone());
         }
         let mut tiles = 0usize;
-        for row in &rows {
+        for (y, row) in rows.iter().enumerate() {
+            row.validate_wrap(frame.size, y as u16)?;
             ensure!(
                 row.cells.len() <= usize::from(frame.size.cols),
                 "too many cells in row"
@@ -518,7 +512,10 @@ impl<W: Write> Display<W> {
             return Ok(());
         };
         let stamp = PredictionStamp::from(screen.prediction);
-        if !screen.prediction.eligible || self.predictions.remote != Some(stamp) {
+        if !screen.prediction.eligible
+            || screen.size.cols != self.viewport.cols
+            || self.predictions.remote != Some(stamp)
+        {
             return Ok(());
         };
         if self.predictions.tokens.len() >= 256 {
@@ -531,7 +528,7 @@ impl<W: Write> Display<W> {
             .back()
             .map(|token| (token.x + 1, token.y))
             .unwrap_or((screen.cursor.x, screen.cursor.y));
-        if x >= screen.size.cols.saturating_sub(1) {
+        if x >= screen.size.cols.saturating_sub(1) || y >= self.viewport.rows {
             return Ok(());
         }
         if screen.rows.get(usize::from(y)).is_none_or(|row| {
@@ -556,17 +553,8 @@ impl<W: Write> Display<W> {
         };
         self.predictions.tokens.push_back(token);
         if shown {
-            self.writer.write_all(b"\x1b[?2026h")?;
-            render_guesses(
-                &mut self.writer,
-                &self.predictions.tokens,
-                self.predictions.local_epoch,
-                screen,
-            )?;
-            let cursor = self.overlay_cursor(screen);
-            render_cursor(&mut self.writer, screen, cursor)?;
-            self.writer.write_all(b"\x1b[?2026l")?;
-            self.writer.flush()?;
+            let screen = screen.clone();
+            self.paint(&screen, BTreeSet::from([y]), false, false)?;
         }
         Ok(())
     }
@@ -595,22 +583,7 @@ impl<W: Write> Display<W> {
         if !rows.is_empty()
             && let Some(screen) = self.screen.clone()
         {
-            let graphics = prepare_graphics(&screen, self.graphics)?;
-            self.writer.write_all(b"\x1b[?2026h")?;
-            for y in rows {
-                render_row(&mut self.writer, &screen, y)?;
-            }
-            self.render_graphics(&graphics)?;
-            if !self.status.is_empty() {
-                render_status(&mut self.writer, &screen, &self.status)?;
-            }
-            render_cursor(
-                &mut self.writer,
-                &screen,
-                (screen.cursor.x, screen.cursor.y),
-            )?;
-            self.writer.write_all(b"\x1b[?2026l")?;
-            self.writer.flush()?;
+            self.paint(&screen, rows, false, false)?;
         }
         Ok(())
     }
@@ -636,27 +609,27 @@ impl<W: Write> Display<W> {
             text.len() <= 4096 && safe_text(text),
             "invalid connection status"
         );
-        self.clear_guesses()?;
+        let mut rows: BTreeSet<_> = self
+            .predictions
+            .tokens
+            .iter()
+            .filter(|token| token.shown)
+            .map(|token| token.y)
+            .collect();
+        rows.insert(0);
+        self.predictions.clear();
         self.status = text.into();
         if let Some(screen) = self.screen.clone() {
-            let graphics = prepare_graphics(&screen, self.graphics)?;
-            self.writer.write_all(b"\x1b[?2026h")?;
-            render_row(&mut self.writer, &screen, 0)?;
-            self.render_graphics(&graphics)?;
-            if !self.status.is_empty() {
-                render_status(&mut self.writer, &screen, &self.status)?;
-            }
-            render_cursor(
-                &mut self.writer,
-                &screen,
-                (screen.cursor.x, screen.cursor.y),
-            )?;
-            self.writer.write_all(b"\x1b[?2026l")?;
-            self.writer.flush()?;
+            self.paint(&screen, rows, false, false)?;
         } else {
+            let text: String = text
+                .chars()
+                .map(|ch| if ch.is_ascii() { ch } else { '?' })
+                .take(usize::from(self.viewport.cols))
+                .collect();
             write!(
                 self.writer,
-                "\x1b[?2026h\x1b[H\x1b[2K\x1b[0;7m{text}\x1b[0m\x1b[?2026l"
+                "\x1b[?2026h\x1b[?7l\x1b[H\x1b[2K\x1b[0;7m{text}\x1b[0m\x1b[?2026l"
             )?;
             self.writer.flush()?;
         }
@@ -664,59 +637,163 @@ impl<W: Write> Display<W> {
     }
 
     pub fn redraw_cached(&mut self, size: Size) -> Result<()> {
-        let Some(mut screen) = self.screen.clone() else {
+        self.set_viewport(size)?;
+        self.predictions.clear();
+        let Some(screen) = self.screen.clone() else {
             return self.write_status(&self.status.clone());
         };
-        self.predictions.clear();
         self.image_ids.clear();
         self.placements.clear();
-        screen.size.cols = screen.size.cols.min(size.cols);
-        screen.size.rows = screen.size.rows.min(size.rows);
-        screen.size.pixel_width =
-            size.pixel_width / u32::from(size.cols) * u32::from(screen.size.cols);
-        screen.size.pixel_height =
-            size.pixel_height / u32::from(size.rows) * u32::from(screen.size.rows);
-        screen.rows.truncate(usize::from(screen.size.rows));
-        for row in &mut screen.rows {
-            row.cells.retain(|cell| cell.x < screen.size.cols);
+        self.paint(&screen, BTreeSet::new(), true, false)
+    }
+
+    fn paint(
+        &mut self,
+        source: &Screen,
+        mut rows: BTreeSet<u16>,
+        reset: bool,
+        metadata: bool,
+    ) -> Result<()> {
+        let mut screen = source.clone();
+        screen.size = self.viewport;
+        screen.rows.truncate(usize::from(self.viewport.rows));
+        for (y, row) in screen.rows.iter_mut().enumerate() {
+            if source.size.cols != self.viewport.cols
+                || y + 1 >= usize::from(source.size.rows.min(self.viewport.rows))
+                || (y == 0 && !self.status.is_empty())
+            {
+                row.wrap = RowWrap::Hard;
+            }
+            row.cells.retain(|cell| cell.x < self.viewport.cols);
             for cell in &mut row.cells {
-                if cell.x + u16::from(cell.width) > screen.size.cols {
+                if cell.x + u16::from(cell.width) > self.viewport.cols {
                     cell.width = 1;
                     cell.text = " ".into();
                 }
             }
         }
-        screen.cursor.x = screen.cursor.x.min(screen.size.cols - 1);
-        screen.cursor.y = screen.cursor.y.min(screen.size.rows - 1);
+        screen
+            .rows
+            .resize_with(usize::from(self.viewport.rows), Row::default);
+        screen.cursor.x = screen.cursor.x.min(self.viewport.cols - 1);
+        screen.cursor.y = screen.cursor.y.min(self.viewport.rows - 1);
         let graphics = prepare_graphics(&screen, self.graphics)?;
-        self.writer
-            .write_all(b"\x1b[?2026h\x1b[?25l\x1b[0m\x1b[2J")?;
+        if reset || self.graphics == Graphics::Sixel {
+            rows.extend(0..self.viewport.rows);
+        }
+        rows.retain(|y| *y < self.viewport.rows);
+        for start in 0..self.viewport.rows {
+            if !rows.contains(&start) {
+                continue;
+            }
+            let connected = |y: u16| {
+                screen.rows[usize::from(y)].wrap.is_soft()
+                    || self
+                        .screen
+                        .as_ref()
+                        .and_then(|old| old.rows.get(usize::from(y)))
+                        .is_some_and(|row| row.wrap.is_soft())
+            };
+            let mut y = start;
+            while y > 0 && connected(y - 1) {
+                y -= 1;
+                rows.insert(y);
+            }
+            y = start;
+            while y + 1 < self.viewport.rows && connected(y) {
+                y += 1;
+                rows.insert(y);
+            }
+        }
+        self.writer.write_all(b"\x1b[?2026h\x1b[?25l")?;
+        if reset
+            || !rows.is_empty()
+            || !self.predictions.tokens.is_empty()
+            || !self.status.is_empty()
+        {
+            self.writer.write_all(b"\x1b[?7l")?;
+        }
+        if reset {
+            self.writer.write_all(b"\x1b[0m\x1b[2J")?;
+        }
         self.writer.write_all(if screen.reverse_video {
             b"\x1b[?5h"
         } else {
             b"\x1b[?5l"
         })?;
-        if self.graphics == Graphics::Kitty {
+        if reset && !metadata && self.graphics == Graphics::Kitty {
             self.writer.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")?;
         }
-        for y in 0..screen.size.rows {
-            render_row(&mut self.writer, &screen, y)?;
+        for &y in &rows {
+            cup(&mut self.writer, 0, y)?;
+            self.writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2K")?;
+        }
+        for y in rows {
+            let connected = {
+                let soft = |index: u16| {
+                    screen.rows[usize::from(index)].wrap.is_soft()
+                        || self
+                            .screen
+                            .as_ref()
+                            .and_then(|old| old.rows.get(usize::from(index)))
+                            .is_some_and(|row| row.wrap.is_soft())
+                };
+                soft(y) || (y > 0 && soft(y - 1))
+            };
+            let row = &screen.rows[usize::from(y)];
+            let end = if connected {
+                screen.size.cols - u16::from(row.wrap == RowWrap::WidePadding)
+            } else {
+                row.cells
+                    .last()
+                    .map_or(0, |cell| cell.x + u16::from(cell.width))
+            };
+            if end == 0 {
+                continue;
+            }
+            cup(&mut self.writer, 0, y)?;
+            if y > 0 && screen.rows[usize::from(y - 1)].wrap == RowWrap::WidePadding {
+                self.writer.write_all(b"\x1b[2K")?;
+            }
+            if connected {
+                self.writer.write_all(b"\x1b[?7h")?;
+            }
+            render_row(&mut self.writer, &screen, y, end)?;
+            match screen.rows[usize::from(y)].wrap {
+                RowWrap::Hard => (),
+                RowWrap::Soft => self.writer.write_all(b" ")?,
+                RowWrap::WidePadding => {
+                    let padding = screen.rows[usize::from(y)].cells.last().unwrap();
+                    render_style(&mut self.writer, &padding.style)?;
+                    self.writer.write_all("界".as_bytes())?;
+                }
+            }
+            if connected {
+                self.writer.write_all(b"\x1b[?7l")?;
+            }
         }
         self.render_graphics(&graphics)?;
-        write!(
-            self.writer,
-            "\x1b]2;{}\x1b\\\x1b]7;{}\x1b\\",
-            screen.title,
-            screen.directory.as_deref().unwrap_or("")
+        if metadata {
+            self.render_metadata(source)?;
+        } else if reset {
+            write!(
+                self.writer,
+                "\x1b]2;{}\x1b\\\x1b]7;{}\x1b\\",
+                screen.title,
+                screen.directory.as_deref().unwrap_or("")
+            )?;
+        }
+        render_guesses(
+            &mut self.writer,
+            &self.predictions.tokens,
+            self.predictions.local_epoch,
+            &screen,
         )?;
         if !self.status.is_empty() {
             render_status(&mut self.writer, &screen, &self.status)?;
         }
-        render_cursor(
-            &mut self.writer,
-            &screen,
-            (screen.cursor.x, screen.cursor.y),
-        )?;
+        let cursor = self.overlay_cursor(&screen);
+        render_cursor(&mut self.writer, &screen, cursor)?;
         self.writer.write_all(b"\x1b[?2026l")?;
         self.writer.flush()?;
         Ok(())
@@ -803,6 +880,9 @@ impl<W: Write> Display<W> {
                 .rows
                 .iter()
                 .position(|row| row.stable_id == marker.row)
+                .filter(|y| {
+                    *y < usize::from(self.viewport.rows) && marker.column < self.viewport.cols
+                })
             {
                 cup(&mut self.writer, marker.column, y as u16)?;
                 let kind = match marker.kind.as_str() {
@@ -915,25 +995,24 @@ fn cup(writer: &mut impl Write, x: u16, y: u16) -> Result<()> {
     Ok(())
 }
 
-fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
+fn render_row(writer: &mut impl Write, screen: &Screen, y: u16, end: u16) -> Result<()> {
     let row = screen
         .rows
         .get(usize::from(y))
         .context("render row out of range")?;
-    cup(writer, 0, y)?;
-    writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2K")?;
     let mut x = 0;
     let mut style = None;
-    let end = row
-        .cells
-        .iter()
-        .rposition(|cell| {
-            cell.text != " " || cell.style != Style::default() || !cell.images.is_empty()
-        })
-        .map_or(0, |index| index + 1);
-    for cell in &row.cells[..end] {
-        if cell.x != x {
-            cup(writer, cell.x, y)?;
+    let blank = Style::default();
+    for cell in &row.cells {
+        if cell.x >= end {
+            break;
+        }
+        if cell.x > x {
+            render_style(writer, &blank)?;
+            for _ in x..cell.x {
+                writer.write_all(b" ")?;
+            }
+            style = Some(&blank);
         }
         if style != Some(&cell.style) {
             render_style(writer, &cell.style)?;
@@ -941,6 +1020,12 @@ fn render_row(writer: &mut impl Write, screen: &Screen, y: u16) -> Result<()> {
         }
         writer.write_all(cell.text.as_bytes())?;
         x = cell.x + u16::from(cell.width);
+    }
+    if x < end {
+        render_style(writer, &blank)?;
+        for _ in x..end {
+            writer.write_all(b" ")?;
+        }
     }
     writer.write_all(b"\x1b]8;;\x1b\\\x1b[0m")?;
     Ok(())
@@ -1202,7 +1287,12 @@ fn render_guesses(
 ) -> Result<()> {
     let stamp = PredictionStamp::from(screen.prediction);
     for token in tokens {
-        if !token.shown || token.local_epoch != local_epoch || token.remote != stamp {
+        if !token.shown
+            || token.local_epoch != local_epoch
+            || token.remote != stamp
+            || token.x >= screen.size.cols.saturating_sub(1)
+            || token.y >= screen.size.rows
+        {
             continue;
         }
         cup(writer, token.x, token.y)?;

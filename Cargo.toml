@@ -1,7 +1,8 @@
 [workspace]
 members = ["rust"]
-exclude = ["rust/vendor/wezterm-term"]
+exclude = ["rust/vendor/wezterm-term", "rust/vendor/wezterm-cell"]
 resolver = "2"
 
 [patch.crates-io]
 tattoy-wezterm-term = { path = "rust/vendor/wezterm-term" }
+tattoy-wezterm-cell = { path = "rust/vendor/wezterm-cell" }
