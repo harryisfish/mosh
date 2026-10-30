@@ -143,8 +143,11 @@ An SSH jump host alone does not provide a UDP route.
 The remote command requires a usable UTF-8 locale on the server. The client
 sends its `LC_ALL`, `LC_CTYPE`, and `LANG` values as candidates. The server checks
 their actual encoding, then tries its own environment and common UTF-8 locales.
-If those fail, it reads the server's installed names with `locale -a` under
-output and runtime limits.
+On macOS and GNU Linux, if those fail, it reads the server's installed names
+with `locale -a`. On Linux with musl, it runs `locale -a` first and requires
+each candidate to appear in that list. Discovery has output and runtime limits.
+Musl requires a working locale utility even when a usable UTF-8 locale is
+already configured.
 It removes `LC_ALL` from the command's environment and sets `LC_CTYPE` and `LANG`
 to the selected locale. If startup reports `no usable UTF-8 locale found`,
 use `locale -a` on the server to find an installed UTF-8 locale, or install or
