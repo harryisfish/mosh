@@ -1,6 +1,4 @@
 //! Colors for attributes
-// for FromPrimitive
-#![allow(clippy::useless_attribute)]
 
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
