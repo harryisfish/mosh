@@ -31,7 +31,6 @@ use wezterm_escape_parser::{
 };
 
 fn orphan_combining_fallback(g: &str) -> Option<String> {
-    // Default-ignorable marks from the locked Unicode 16 property tables.
     let has_visible_mark = g.chars().any(|c| {
         (c.is_mark_nonspacing() || c.is_mark_enclosing())
             && !matches!(
