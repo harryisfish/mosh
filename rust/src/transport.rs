@@ -13,7 +13,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarIn
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::diagnostics::{self, Context as DiagnosticContext, Stage};
@@ -22,13 +22,29 @@ use crate::model::{
     MAX_RESOURCE, MAX_RESOURCES, PROTOCOL_VERSION, Resource, ResourceMeta,
 };
 
-const ALPN: &[u8] = b"mosh-rs/2";
+const ALPN: &[u8] = b"mosh-rs/3";
 const FRAME_STREAM: u8 = 1;
 const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;
 const CONNECTION_WINDOW: u32 = 4 * STREAM_WINDOW;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const GRANT_BEGIN: &[u8] = b"\x1eMOSH-RS-GRANT\n";
+const GRANT_END: &[u8] = b"\x1eMOSH-RS-GRANT-END\n";
+const MAX_BOOTSTRAP_DIAGNOSTICS: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum GrantReadEnd {
+    Frame,
+    Eof,
+}
+
+enum GrantPhase {
+    Seeking,
+    Body,
+    End(Grant),
+    Finished(Grant),
+}
 
 pub struct ClientIdentity {
     certificate: Vec<u8>,
@@ -358,22 +374,35 @@ async fn run_bootstrap(mut command: Command, request: &BootstrapRequest) -> Resu
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut child = command.spawn().context("cannot start session bootstrap")?;
-    tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
+    let result = tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
         let mut stdin = child.stdin.take().context("bootstrap stdin missing")?;
-        stdin.write_all(&bytes).await?;
-        stdin.shutdown().await?;
-        drop(stdin);
         let stdout = child.stdout.take().context("bootstrap stdout missing")?;
-        let grant: Grant = read_async_line(stdout)
-            .await
-            .context("server did not return a valid bootstrap grant")?;
+        let ((), grant) = tokio::try_join!(
+            async {
+                stdin.write_all(&bytes).await?;
+                stdin.shutdown().await?;
+                drop(stdin);
+                Ok::<_, anyhow::Error>(())
+            },
+            read_grant(stdout, GrantReadEnd::Eof),
+        )?;
         let status = child.wait().await?;
         ensure!(status.success(), "session bootstrap exited with {status}");
-        validate_grant(&grant)?;
         Ok(grant)
     })
-    .await
-    .context("SSH bootstrap timed out")?
+    .await;
+    match result {
+        Ok(Ok(grant)) => Ok(grant),
+        result => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            match result {
+                Ok(Err(error)) => Err(error),
+                Err(_) => bail!("session bootstrap timed out"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
 }
 
 pub fn read_request<R: Read>(reader: R) -> Result<BootstrapRequest> {
@@ -384,7 +413,10 @@ pub fn read_request<R: Read>(reader: R) -> Result<BootstrapRequest> {
 
 pub fn write_grant<W: Write>(mut writer: W, grant: &Grant) -> Result<()> {
     validate_grant(grant)?;
-    writer.write_all(&json_line(grant)?)?;
+    let body = json_line(grant)?;
+    writer.write_all(GRANT_BEGIN)?;
+    writer.write_all(&body)?;
+    writer.write_all(GRANT_END)?;
     writer.flush()?;
     Ok(())
 }
@@ -423,10 +455,18 @@ pub async fn spawn_worker(diagnostics_enabled: bool) -> Result<()> {
         .context("cannot start detached session worker")?;
     let grant = tokio::time::timeout(Duration::from_secs(30), async {
         let mut stdin = child.stdin.take().context("worker stdin missing")?;
-        stdin.write_all(&json_line(&request)?).await?;
-        stdin.shutdown().await?;
-        drop(stdin);
-        read_async_line::<_, Grant>(child.stdout.take().context("worker stdout missing")?).await
+        let bytes = json_line(&request)?;
+        let stdout = child.stdout.take().context("worker stdout missing")?;
+        let ((), grant) = tokio::try_join!(
+            async {
+                stdin.write_all(&bytes).await?;
+                stdin.shutdown().await?;
+                drop(stdin);
+                Ok::<_, anyhow::Error>(())
+            },
+            read_grant(stdout, GrantReadEnd::Frame),
+        )?;
+        Ok::<_, anyhow::Error>(grant)
     })
     .await;
     match grant {
@@ -475,22 +515,110 @@ fn read_line<R: Read, T: DeserializeOwned>(reader: R) -> Result<T> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn read_async_line<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: R) -> Result<T> {
+async fn read_grant<R: AsyncRead + Unpin>(reader: R, end: GrantReadEnd) -> Result<Grant> {
     let mut reader = BufReader::new(reader);
+    let mut phase = GrantPhase::Seeking;
+    let mut diagnostic_bytes = 0;
+    loop {
+        let limit = match phase {
+            GrantPhase::Body => MAX_CONTROL,
+            GrantPhase::End(_) => GRANT_END.len(),
+            _ => MAX_BOOTSTRAP_DIAGNOSTICS - diagnostic_bytes + GRANT_BEGIN.len(),
+        };
+        let Some(line) = read_bootstrap_line(&mut reader, limit).await? else {
+            return match phase {
+                GrantPhase::Finished(grant) => Ok(grant),
+                GrantPhase::Seeking => bail!("bootstrap stream ended without a grant frame"),
+                _ => bail!("bootstrap grant frame is incomplete"),
+            };
+        };
+        phase = match phase {
+            GrantPhase::Seeking if line.ends_with(GRANT_BEGIN) => {
+                write_bootstrap_diagnostic(
+                    &line[..line.len() - GRANT_BEGIN.len()],
+                    &mut diagnostic_bytes,
+                )?;
+                GrantPhase::Body
+            }
+            GrantPhase::Seeking | GrantPhase::Finished(_) if line.ends_with(GRANT_END) => {
+                bail!("unexpected bootstrap grant frame end")
+            }
+            GrantPhase::Finished(_) if line.ends_with(GRANT_BEGIN) => {
+                bail!("duplicate bootstrap grant frame")
+            }
+            GrantPhase::Body => {
+                ensure!(
+                    line.last() == Some(&b'\n'),
+                    "bootstrap grant body is incomplete"
+                );
+                let grant = serde_json::from_slice(&line)
+                    .map_err(|_| anyhow::anyhow!("invalid bootstrap grant JSON"))?;
+                validate_grant(&grant)?;
+                GrantPhase::End(grant)
+            }
+            GrantPhase::End(grant) => {
+                ensure!(line == GRANT_END, "invalid bootstrap grant frame end");
+                if matches!(end, GrantReadEnd::Frame) {
+                    return Ok(grant);
+                }
+                GrantPhase::Finished(grant)
+            }
+            phase => {
+                write_bootstrap_diagnostic(&line, &mut diagnostic_bytes)?;
+                phase
+            }
+        };
+    }
+}
+
+fn write_bootstrap_diagnostic(bytes: &[u8], total: &mut usize) -> Result<()> {
+    ensure!(
+        !is_unframed_grant(bytes),
+        "unframed bootstrap grant; update both Rust endpoints"
+    );
+    *total += bytes.len();
+    ensure!(
+        *total <= MAX_BOOTSTRAP_DIAGNOSTICS,
+        "bootstrap diagnostics exceed limit"
+    );
+    std::io::stderr().write_all(bytes)?;
+    Ok(())
+}
+
+fn is_unframed_grant(line: &[u8]) -> bool {
+    let sensitive_fields = [b"\"session\"".as_slice(), b"\"server_cert\"".as_slice()];
+    if sensitive_fields
+        .iter()
+        .any(|key| line.windows(key.len()).any(|part| part == *key))
+    {
+        return true;
+    }
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(line) {
+        return fields.contains_key("session") || fields.contains_key("server_cert");
+    }
+    line.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{')
+}
+
+async fn read_bootstrap_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
-        ensure!(!available.is_empty(), "bootstrap stream ended before grant");
+        if available.is_empty() {
+            return Ok((!bytes.is_empty()).then_some(bytes));
+        }
         let end = available.iter().position(|byte| *byte == b'\n');
-        let count = end.unwrap_or(available.len());
+        let count = end.map_or(available.len(), |index| index + 1);
         ensure!(
-            bytes.len() + count < MAX_CONTROL,
-            "bootstrap message exceeds limit"
+            bytes.len() + count <= limit,
+            "bootstrap output line exceeds limit"
         );
         bytes.extend_from_slice(&available[..count]);
-        reader.consume(count + usize::from(end.is_some()));
+        reader.consume(count);
         if end.is_some() {
-            return Ok(serde_json::from_slice(&bytes)?);
+            return Ok(Some(bytes));
         }
     }
 }
