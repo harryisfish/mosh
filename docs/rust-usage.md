@@ -219,6 +219,15 @@ ending the remote command. Run `fg` to restore the session, including its cached
 text and images. Ordinary Ctrl-Z goes to the remote program. A client resumed
 with `bg` waits for `fg` before reading or drawing on the terminal.
 
+Press Ctrl-L to redraw the cached remote screen immediately, even during a
+network outage or input refusal. This clears local predictions and restores
+cached text, images, title, and directory without repeating bells, clipboard
+writes, notifications, or shell markers. The original key still follows normal
+input admission; a refused key is never sent later. Kitty press and repeat
+events with primary `l` or `L` and Ctrl trigger redraw. Shift and Caps/Num lock
+are allowed; other modifiers and release events do not trigger it. Paste text
+does not trigger redraw.
+
 `Ctrl-^ q` stops accepting new remote input and requests closure after the server
 confirms the PTY writes for all previously accepted events. This does not
 confirm that the remote application has processed every event. The client keeps
@@ -351,6 +360,7 @@ target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
 python3 scripts/verify-rust-cli.py --saturated-input
 python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
+python3 scripts/verify-rust-cli.py --redraw --evidence-dir /tmp/mosh-rs-redraw
 python3 scripts/verify-rust-cli.py --liveness --evidence-dir /tmp/mosh-rs-liveness
 ```
 
@@ -364,12 +374,22 @@ separate upstream and downstream loss, input confirmation, and SIGCONT cases.
 The relay checks `drop_up` and `drop_down` on both packet enqueue and dequeue.
 Its per-direction counters describe encrypted UDP traffic, not actor replies.
 `--evidence-dir` saves raw TTY output and relay observations for these cases.
+The SIGCONT case checks a fresh six-second warning window. It retains the
+original eight-second recovery result and separately observes recovery for up
+to 30 seconds from restoring the relay. This cap only bounds the fixture
+observation.
 `verify_session --verify-liveness` separately pauses only actor polling while
 Quinn continues, then records raw probe replies and QUIC ACK counts.
 `--network` also runs the legacy-input cases. `--legacy-input` checks real PTY
 bytes for prefix deadlines, function and keypad keys, late-tail refusal,
 management recovery, reply filters, UTF-8, Kitty phases, and SIGCONT.
 Its evidence directory contains the TTY transcript and exact received bytes.
+`--network` also runs the redraw cases. `--redraw` damages local cells and a
+cached Kitty image while UDP is blocked, then checks Ctrl-L restores cells,
+styles, cursor, and image through the terminal core. It checks key identity and
+phase, group counts, resize, input refusal, closing, and the first-frame boundary.
+It compares exact remote bytes and confirms one-time effects are not repeated.
+These transcript checks do not verify native terminal visuals or selection.
 
 To verify diagnostics, including a blocked local terminal and a healthy idle
 session, run:

@@ -1282,6 +1282,240 @@ fn learned_prediction() -> Result<(Display<Capture>, Capture, Frame)> {
     Ok((display, capture, current))
 }
 
+fn verify_cached_redraw() -> Result<()> {
+    let (mut display, capture, current) = learned_prediction()?;
+    let canonical = display.screen().unwrap().clone();
+    let before = capture.0.lock().unwrap().len();
+    display.redraw_cached(current.size)?;
+    let redraw = capture.0.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        redraw
+            .windows(4)
+            .filter(|bytes| *bytes == b"\x1b[2J")
+            .count(),
+        1
+    );
+    assert_eq!(display.screen().unwrap().rows, canonical.rows);
+    assert_eq!(display.screen().unwrap().size, canonical.size);
+    assert_eq!(display.screen().unwrap().cursor, canonical.cursor);
+    assert_eq!(display.epoch(), 1);
+    assert_eq!(display.revision(), current.revision);
+    assert_eq!(display.installed_echo_through(), Some(3));
+    let mut term = terminal();
+    term.advance_bytes(&*capture.0.lock().unwrap());
+    assert_eq!(visible(&term)[1].get_cell(11).unwrap().str(), " ");
+    assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (11, 1));
+    let before = capture.0.lock().unwrap().len();
+    display.predict(5, &printable('S'))?;
+    assert_eq!(capture.0.lock().unwrap().len(), before);
+    println!(
+        "direct cached redraw cleared active prediction and confidence; full redraw bytes={}",
+        redraw.len()
+    );
+
+    for graphics in [Graphics::Kitty, Graphics::Sixel] {
+        let capture = Capture::default();
+        let mut display = Display::new(capture.clone(), graphics, PredictionPolicy::Adaptive);
+        display.set_epoch(1)?;
+        let rgba = vec![255, 0, 0, 255];
+        let digest = resource_digest(1, 1, &rgba);
+        let resource = Resource {
+            meta: ResourceMeta {
+                digest,
+                width: 1,
+                height: 1,
+                bytes: 4,
+            },
+            rgba: rgba.into(),
+        };
+        let mut current = frame(1, None, vec![resource.meta.clone()]);
+        let mut tile = cell(0, " ", 1);
+        tile.images.push(ImageTile {
+            resource: digest,
+            source: [0, 0, 1, 1],
+            padding: [0; 4],
+            z: 1,
+            placement: 1,
+        });
+        current.rows[2].row.cells.push(tile);
+        let resources = BTreeMap::from([(digest, resource)]);
+        assert!(display.install(&current, &resources)?);
+        for (id, kind) in [
+            EffectKind::Bell,
+            EffectKind::ClipboardWrite {
+                selection: "c".into(),
+                data: "redraw".into(),
+            },
+            EffectKind::Notification {
+                title: "redraw".into(),
+                body: "once".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            display.apply_effect(
+                &Effect {
+                    id: id as u64 + 1,
+                    after: 1,
+                    kind,
+                },
+                false,
+            )?;
+        }
+        display.predict(1, &printable('X'))?;
+        let canonical = display.screen().unwrap().clone();
+        let before = capture.0.lock().unwrap().len();
+        display.redraw_cached(current.size)?;
+        let redraw = capture.0.lock().unwrap()[before..].to_vec();
+        for forbidden in [b"\x07".as_slice(), b"\x1b]52;", b"\x1b]777;", b"\x1b]133;"] {
+            assert!(
+                !redraw
+                    .windows(forbidden.len())
+                    .any(|bytes| bytes == forbidden)
+            );
+        }
+        assert!(redraw.windows(4).any(|bytes| bytes == b"\x1b]2;"));
+        assert!(redraw.windows(4).any(|bytes| bytes == b"\x1b]7;"));
+        assert_eq!(display.screen().unwrap().rows, canonical.rows);
+        assert_eq!(display.screen().unwrap().size, canonical.size);
+        assert_eq!(display.screen().unwrap().cursor, canonical.cursor);
+        assert_eq!(display.effects_applied(), 3);
+        assert_eq!(display.installed_echo_through(), Some(0));
+        let mut term = terminal();
+        term.advance_bytes(&redraw);
+        let lines = visible(&term);
+        assert_eq!(
+            lines[1]
+                .get_cell(8)
+                .map(|cell| cell.str().to_owned())
+                .unwrap_or_else(|| " ".into()),
+            " "
+        );
+        let image = &lines[2].get_cell(0).unwrap().attrs().images().unwrap()[0];
+        assert_eq!(image.image_data().data().dimensions()?, (10, 20));
+        match image.image_data().data().clone().decode() {
+            tattoy_wezterm_term::image::ImageDataType::Rgba8 { data, .. } => assert!(
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel == [255, 0, 0, 255])
+            ),
+            other => panic!("unexpected cached image {other:?}"),
+        }
+        assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (8, 1));
+        println!(
+            "direct cached {graphics:?} redraw restored image and cursor without effects; bytes={}",
+            redraw.len()
+        );
+    }
+
+    let capture = Capture::default();
+    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Never);
+    display.write_status("Connecting.")?;
+    let before = capture.0.lock().unwrap().len();
+    display.redraw_cached(Size::default())?;
+    let redraw = capture.0.lock().unwrap()[before..].to_vec();
+    assert!(!redraw.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+    assert!(display.screen().is_none());
+    assert_eq!(display.revision(), 0);
+    let mut term = terminal();
+    term.advance_bytes(&redraw);
+    assert_eq!(visible(&term)[0].get_cell(0).unwrap().str(), "C");
+    Ok(())
+}
+
+fn verify_redraw_transcript(arguments: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        arguments.len() == 2 || arguments.len() == 5,
+        "expected transcript, fixed|broken, optional columns rows resize-offset"
+    );
+    let bytes = std::fs::read(&arguments[0])?;
+    let fixed = match arguments[1].as_str() {
+        "fixed" => true,
+        "broken" => false,
+        _ => anyhow::bail!("expected fixed or broken transcript"),
+    };
+    let size = TerminalSize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 800,
+        pixel_height: 480,
+        dpi: 96,
+    };
+    let mut term = Terminal::new(
+        size,
+        Arc::new(Config),
+        "mosh-redraw-replay",
+        "0",
+        Box::new(io::sink()),
+    );
+    if arguments.len() == 5 {
+        let cols = arguments[2].parse()?;
+        let rows = arguments[3].parse()?;
+        let offset: usize = arguments[4].parse()?;
+        anyhow::ensure!(offset <= bytes.len(), "resize offset outside transcript");
+        term.advance_bytes(&bytes[..offset]);
+        term.resize(TerminalSize {
+            cols,
+            rows,
+            pixel_width: cols * 10,
+            pixel_height: rows * 20,
+            ..size
+        });
+        term.advance_bytes(&bytes[offset..]);
+    } else {
+        term.advance_bytes(&bytes);
+    }
+    let lines = visible(&term);
+    let expected = if fixed { "REDRAW_BASE" } else { "BROKEN!!!!!" };
+    for (x, glyph) in expected.chars().enumerate() {
+        let cell = lines[3].get_cell(x).unwrap();
+        assert_eq!(cell.str(), glyph.to_string());
+        let expected_fg = if fixed {
+            (11, 22, 33, 255)
+        } else {
+            (99, 88, 77, 255)
+        };
+        match cell.attrs().foreground() {
+            tattoy_wezterm_term::color::ColorAttribute::TrueColorWithDefaultFallback(color) => {
+                assert_eq!(color.to_srgb_u8(), expected_fg)
+            }
+            other => panic!("unexpected redraw foreground {other:?}"),
+        }
+        if fixed {
+            match cell.attrs().background() {
+                tattoy_wezterm_term::color::ColorAttribute::TrueColorWithDefaultFallback(color) => {
+                    assert_eq!(color.to_srgb_u8(), (44, 55, 66, 255))
+                }
+                other => panic!("unexpected redraw background {other:?}"),
+            }
+        }
+    }
+    let image_cell = lines[5].get_cell(2).unwrap();
+    let images = image_cell.attrs().images();
+    if fixed {
+        let image = &images.unwrap()[0];
+        assert_eq!(image.image_data().data().dimensions()?, (10, 20));
+        match image.image_data().data().clone().decode() {
+            tattoy_wezterm_term::image::ImageDataType::Rgba8 { data, .. } => assert!(
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel == [255, 0, 0, 255])
+            ),
+            other => panic!("unexpected replay image {other:?}"),
+        }
+    } else {
+        assert!(images.is_none_or(|images| images.is_empty()));
+    }
+    assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (5, 8));
+    println!(
+        "redraw transcript: exact cells, style, cursor and image fixed={fixed}; native visual unverified"
+    );
+    Ok(())
+}
+
 fn verify_prediction_boundaries() -> Result<()> {
     let capture = Capture::default();
     let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
@@ -1695,6 +1929,14 @@ fn verify_escape_sequences() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--redraw-transcript")
+    {
+        return verify_redraw_transcript(&arguments[1..]);
+    }
+    anyhow::ensure!(arguments.is_empty(), "unknown verify_display arguments");
     let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
     display.write_status("Connect failed")?;
     let mut term = terminal();
@@ -1712,6 +1954,7 @@ fn main() -> Result<()> {
     verify_render(Graphics::Kitty)?;
     verify_render(Graphics::Sixel)?;
     verify_prediction_modes()?;
+    verify_cached_redraw()?;
     verify_prediction_boundaries()?;
     verify_prediction_epoch_context()?;
     verify_lifecycle()?;

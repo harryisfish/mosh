@@ -867,6 +867,18 @@ fn connection_notice(prefix: &str, reason: &str) -> String {
     format!("Ctrl-^ . to detach. {prefix} {reason}")
 }
 
+fn requests_local_redraw(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::Key(Key {
+            code: KeyCode::Char('l' | 'L'),
+            modifiers,
+            phase: KeyPhase::Press | KeyPhase::Repeat,
+            ..
+        }) if modifiers & 4 != 0 && modifiers & !(1 | 4 | 64 | 128) == 0
+    )
+}
+
 fn refresh_status(
     display: &mut Display<TtyOutput>,
     pending: &PendingInput,
@@ -1159,10 +1171,16 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 match event {
                     LocalEvent::Input(event) => match escape.feed(event) {
                         EscapeAction::Send(events) => {
+                            let redraw = events.iter().any(requests_local_redraw);
                             if pending.admit(events, true, display)? {
                                 help_visible = false;
                             }
                             if pending.paused || pending.is_closing() { decoder.discard_active_paste(); }
+                            if redraw {
+                                read_size(&mut size, &mut resize_generation)?;
+                                refresh_status(display, &pending, &mut link, help_visible, &connection_status, &mut shown_status)?;
+                                display.redraw_cached(size)?;
+                            }
                         }
                         EscapeAction::Detach => return Ok(SessionAction::Detach),
                         EscapeAction::Suspend => return Ok(SessionAction::Suspend),
