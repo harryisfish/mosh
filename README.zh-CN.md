@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh 
 ```
 
 脚本会识别操作系统、CPU 和 Linux libc，校验 release 的 checksum 后再安装两个二进制文件。
-使用 `--version 0.1.2` 指定版本，或用 `--install-dir DIRECTORY` 指定安装目录。
+使用 `--version 0.1.3` 指定版本，或用 `--install-dir DIRECTORY` 指定安装目录。
 需要先审阅脚本时，参考[使用指南](docs/rust-usage.md#install-a-release)。
 
 在本机安装 `mosh-rs`，在远程主机安装 `mosh-rs-server`，两端必须使用同一版本。
@@ -51,19 +51,19 @@ sha256sum --ignore-missing -c SHA256SUMS
 Debian 或 Ubuntu 的 x86_64 主机：
 
 ```sh
-sudo apt install ./mosh-rs_0.1.2-1_amd64.deb
+sudo apt install ./mosh-rs_0.1.3-1_amd64.deb
 ```
 
 Fedora 的 x86_64 主机：
 
 ```sh
-sudo dnf install ./mosh-rs-0.1.2-1.x86_64.rpm
+sudo dnf install ./mosh-rs-0.1.3-1.x86_64.rpm
 ```
 
 openSUSE 的 x86_64 主机：
 
 ```sh
-sudo zypper install --allow-unsigned-rpm ./mosh-rs-0.1.2-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./mosh-rs-0.1.3-1.x86_64.rpm
 ```
 
 arm64 主机改用文件名以 `arm64.deb` 或 `aarch64.rpm` 结尾的安装包。
@@ -89,13 +89,13 @@ arm64 主机改用文件名以 `arm64.deb` 或 `aarch64.rpm` 结尾的安装包�
 - macOS：`shasum -a 256 --ignore-missing -c SHA256SUMS`
 - Linux：`sha256sum --ignore-missing -c SHA256SUMS`
 
-例如，在 Apple Silicon Mac 上安装 0.1.2：
+例如，在 Apple Silicon Mac 上安装 0.1.3：
 
 ```sh
-tar -xzf mosh-rs-0.1.2-aarch64-apple-darwin.tar.gz
+tar -xzf mosh-rs-0.1.3-aarch64-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 755 mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs \
-	mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
+install -m 755 mosh-rs-0.1.3-aarch64-apple-darwin/bin/mosh-rs \
+	mosh-rs-0.1.3-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
