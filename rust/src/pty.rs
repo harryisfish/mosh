@@ -92,7 +92,9 @@ async fn installed_locale_names() -> Result<Vec<String>> {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("cannot discover server locales; install a locale utility that supports locale -a")?;
+        .context(
+            "cannot discover server locales; install a locale utility that supports locale -a",
+        )?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stdout = child.stdout.take().context("locale stdout missing")?;
         let mut bytes = Vec::new();
