@@ -30,6 +30,23 @@ DIAGNOSTIC_FILES = set()
 GRANT_BEGIN = b"\x1eMOSH-RS-GRANT\n"
 GRANT_END = b"\x1eMOSH-RS-GRANT-END\n"
 SSH_LITERAL_ARG = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line"
+LEGACY_SHIFT_KEYS = [
+    ("LEFT", b"\x1b[1;2D|END!", b"\x1b[d|END!"),
+    ("RIGHT", b"\x1b[1;2C|END!", b"\x1b[c|END!"),
+    ("DELETE", b"\x1b[3;2~|END!", b"\x1b[3$|END!"),
+    ("INSERT", b"\x1b[2;2~|END!", b"\x1b[2$|END!"),
+    ("HOME", b"\x1b[1;2H|END!", b"\x1b[7$|END!"),
+    ("END", b"\x1b[1;2F|END!", b"\x1b[8$|END!"),
+    ("PAGE_DOWN", b"\x1b[6;2~|END!", b"\x1b[6$|END!"),
+    ("PAGE_UP", b"\x1b[5;2~|END!", b"\x1b[5$|END!"),
+]
+LEGACY_RXVT_DELAYED = [
+    ("RXVT_LATE", b"\x1b[3", b"$", b"|late-rxvt\r"),
+    ("RXVT_REPLY_PARAMS", b"\x1b[3", b";1$y", b"|reply-params\r"),
+    ("RXVT_REPLY_PRIVATE", b"\x1b[?3", b"$y", b"|reply-private\r"),
+    ("RXVT_REPLY_SPLIT", b"\x1b[4;", b"1$y", b"|reply-split\r"),
+]
+LEGACY_KITTY_END = b"\x1b[124;1:1u\x1b[69;1:1u\x1b[78;1:1u\x1b[68;1:1u\x1b[33;1:1u"
 LEGACY_INPUT_EXPECTED = [
     ("ESCAPE", b"\x1b"),
     ("BRACKET", b"\x1b["),
@@ -37,6 +54,15 @@ LEGACY_INPUT_EXPECTED = [
     ("LATE", b"\x1b[x"),
     ("FUNCTIONS", b"\x1b[42~\x1b[43~\x1b[44~\x1b[45~\x1bOP\x1bOQ\x1bOR\x1bOS\x1b[15~"),
     ("KEYPAD", b"\x1b[E\x1b[E="),
+] + [
+    (f"{profile}_{name}", expected)
+    for profile in ("XTERM", "RXVT")
+    for name, expected, _ in LEGACY_SHIFT_KEYS
+] + [
+    ("RXVT_CTRL", b"\x1b[1;5A|\x1b[1;5D|"),
+    ("RXVT_FUNCTIONS", b"\x1b[23;2~|\x1b[24;2~|\x1b[1;5P|\x1b[23;6~|"),
+    ("RXVT_REPLY", b"|live-reply\r"),
+] + [(name, expected) for name, _, _, expected in LEGACY_RXVT_DELAYED] + [
     ("UTF8", "中".encode()),
     ("PHASES", b"aa"),
     ("TIMEOUT", b"after-timeout\r"),
@@ -46,6 +72,17 @@ LEGACY_INPUT_EXPECTED = [
     ("SUSPEND", b"after-suspend\r"),
     ("APPLICATION", b"\x1bOX\x1b[E"),
     ("KITTY", b"\x1b[57384;1:1u\x1b[1;1:1P\x1b[57415;1:1u\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u"),
+    ("RXVT_KITTY", b"\x1b[1;2:1D" + LEGACY_KITTY_END
+                   + b"\x1b[1;2:1C" + LEGACY_KITTY_END
+                   + b"\x1b[3;2:1~" + LEGACY_KITTY_END
+                   + b"\x1b[2;2:1~" + LEGACY_KITTY_END
+                   + b"\x1b[1;2:1H" + LEGACY_KITTY_END
+                   + b"\x1b[1;2:1F" + LEGACY_KITTY_END
+                   + b"\x1b[6;2:1~" + LEGACY_KITTY_END
+                   + b"\x1b[5;2:1~" + LEGACY_KITTY_END
+                   + b"\x1b[1;5:1A\x1b[124;1:1u\x1b[1;5:1D\x1b[124;1:1u"
+                     b"\x1b[23;2:1~\x1b[124;1:1u\x1b[24;2:1~\x1b[124;1:1u"
+                     b"\x1b[1;5:1P\x1b[124;1:1u\x1b[23;6:1~\x1b[124;1:1u"),
 ]
 
 
@@ -858,6 +895,27 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         confirmed("FUNCTIONS")
         process.send(b"\x1b[E\x1bOE\x1bOX")
         confirmed("KEYPAD")
+        for profile in ("XTERM", "RXVT"):
+            for name, xterm, rxvt in LEGACY_SHIFT_KEYS:
+                process.send(xterm if profile == "XTERM" else rxvt)
+                confirmed(f"{profile}_{name}")
+        process.send(b"\x1bOa|\x1bOd|")
+        confirmed("RXVT_CTRL")
+        process.send(b"\x1b[23$|\x1b[24$|\x1b[11^|\x1b[23@|")
+        confirmed("RXVT_FUNCTIONS")
+        process.send(b"\x1b[4;1$")
+        process.send(b"y\x1b[?4;1$y|live-reply\r")
+        confirmed("RXVT_REPLY")
+        for name, prefix, tail, expected in LEGACY_RXVT_DELAYED:
+            before = observed.read_bytes()
+            start = len(process.output)
+            process.send(prefix)
+            process.until(b"Input sequence timed out", timeout=3, start=start)
+            process.send(tail)
+            pump_for(0.05)
+            assert observed.read_bytes() == before, (name, "late prefix or reply reached the PTY")
+            process.send(expected)
+            confirmed(name)
         process.send(b"\xe4")
         pump_for(0.08)
         process.send(b"\xb8\xad")
@@ -907,11 +965,14 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         process.until(b"LEGACY_KITTY_READY")
         process.send(b"\x1b[42~\x1b[[A\x1bOX\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:3u")
         confirmed("KITTY")
+        process.send(b"".join(rxvt for _, _, rxvt in LEGACY_SHIFT_KEYS)
+                     + b"\x1bOa|\x1bOd|\x1b[23$|\x1b[24$|\x1b[11^|\x1b[23@|")
+        confirmed("RXVT_KITTY")
         process.until(b"LEGACY_INPUT_DONE")
         process.finish(9)
         assert observed.read_bytes() == b"".join(expected for _, expected in LEGACY_INPUT_EXPECTED)
         assert json.loads(Path(state).read_text()) == original, "legacy input replaced the command"
-        print("CLI legacy input exact bytes, deadlines, late tails, Linux/F21/keypad, UTF-8, Kitty, filters, management recovery and SIGCONT passed "
+        print("CLI legacy input exact bytes, rxvt modifiers, deadlines, late tails, Linux/F21/keypad, UTF-8, Kitty, filters, management recovery and SIGCONT passed "
               + json.dumps({"received_bytes": observed.stat().st_size, "cases": facts}, sort_keys=True), flush=True)
     finally:
         if evidence_dir is not None:

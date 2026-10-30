@@ -17,6 +17,121 @@ pub const MAX_INPUT_CHUNK: usize = 256;
 const MAX_CAPTURED_EVENTS: usize = MAX_INPUT_CHUNK + 1;
 const MAX_CAPTURED_BYTES: usize = MAX_CLIPBOARD + MAX_SEQUENCE + 32 * MAX_INPUT_CHUNK;
 
+struct NumberedKey {
+    code: u8,
+    name: &'static str,
+    rxvt: bool,
+}
+
+const NUMBERED_KEYS: [NumberedKey; 32] = [
+    NumberedKey::new(1, "Home", true),
+    NumberedKey::new(2, "Insert", true),
+    NumberedKey::new(3, "Delete", true),
+    NumberedKey::new(4, "End", true),
+    NumberedKey::new(5, "PageUp", true),
+    NumberedKey::new(6, "PageDown", true),
+    NumberedKey::new(7, "Home", true),
+    NumberedKey::new(8, "End", true),
+    NumberedKey::new(11, "F1", true),
+    NumberedKey::new(12, "F2", true),
+    NumberedKey::new(13, "F3", true),
+    NumberedKey::new(14, "F4", true),
+    NumberedKey::new(15, "F5", true),
+    NumberedKey::new(17, "F6", true),
+    NumberedKey::new(18, "F7", true),
+    NumberedKey::new(19, "F8", true),
+    NumberedKey::new(20, "F9", true),
+    NumberedKey::new(21, "F10", true),
+    NumberedKey::new(23, "F11", true),
+    NumberedKey::new(24, "F12", true),
+    NumberedKey::new(25, "F13", true),
+    NumberedKey::new(26, "F14", true),
+    NumberedKey::new(28, "F15", true),
+    NumberedKey::new(29, "F16", true),
+    NumberedKey::new(31, "F17", true),
+    NumberedKey::new(32, "F18", true),
+    NumberedKey::new(33, "F19", true),
+    NumberedKey::new(34, "F20", true),
+    NumberedKey::new(42, "F21", false),
+    NumberedKey::new(43, "F22", false),
+    NumberedKey::new(44, "F23", false),
+    NumberedKey::new(45, "F24", false),
+];
+
+impl NumberedKey {
+    const fn new(code: u8, name: &'static str, rxvt: bool) -> Self {
+        assert!(code > 0 && code < 100);
+        Self { code, name, rxvt }
+    }
+
+    fn digit(&self, position: u8) -> Option<u8> {
+        match position {
+            0 if self.code >= 10 => Some(b'0' + self.code / 10),
+            0 => Some(b'0' + self.code),
+            1 if self.code >= 10 => Some(b'0' + self.code % 10),
+            _ => None,
+        }
+    }
+}
+
+enum RxvtCursor {
+    Candidates { mask: u32, digits: u8 },
+    Other,
+}
+
+impl RxvtCursor {
+    fn from_body(body: &[u8]) -> Self {
+        let mask = NUMBERED_KEYS
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| key.rxvt)
+            .fold(0, |mask, (index, _)| mask | (1 << index));
+        let mut cursor = Self::Candidates { mask, digits: 0 };
+        for &byte in body {
+            cursor.advance(byte);
+        }
+        cursor
+    }
+
+    fn advance(&mut self, byte: u8) {
+        let Self::Candidates { mask, digits } = self else {
+            return;
+        };
+        *mask = NUMBERED_KEYS
+            .iter()
+            .enumerate()
+            .filter(|(index, key)| *mask & (1 << index) != 0 && key.digit(*digits) == Some(byte))
+            .fold(0, |mask, (index, _)| mask | (1 << index));
+        *digits += 1;
+        if *mask == 0 {
+            *self = Self::Other;
+        }
+    }
+
+    fn complete(&self) -> Option<&'static NumberedKey> {
+        let Self::Candidates { mask, digits } = self else {
+            return None;
+        };
+        NUMBERED_KEYS.iter().enumerate().find_map(|(index, key)| {
+            (*mask & (1 << index) != 0 && key.digit(*digits).is_none()).then_some(key)
+        })
+    }
+
+    fn is_final(&mut self, byte: u8) -> bool {
+        if (0x40..=0x7e).contains(&byte) || (byte == b'$' && self.complete().is_some()) {
+            true
+        } else {
+            self.advance(byte);
+            false
+        }
+    }
+}
+
+fn csi_end(body: &[u8]) -> Option<usize> {
+    let mut rxvt = RxvtCursor::from_body(&[]);
+    body.iter().position(|&byte| rxvt.is_final(byte))
+}
+
 #[derive(Clone, Copy)]
 pub enum PasteAdmission {
     Capture,
@@ -213,7 +328,9 @@ enum EscapeState {
     Waiting {
         deadline: Instant,
     },
-    DiscardCsi,
+    DiscardCsi {
+        rxvt: RxvtCursor,
+    },
 }
 
 enum PasteState {
@@ -298,8 +415,13 @@ impl InputDecoder {
                 return;
             }
             _ => {
+                let rxvt = self
+                    .pending
+                    .strip_prefix(b"\x1b[")
+                    .map(RxvtCursor::from_body)
+                    .unwrap_or(RxvtCursor::Other);
                 self.pending.clear();
-                self.escape = EscapeState::DiscardCsi;
+                self.escape = EscapeState::DiscardCsi { rxvt };
                 events.push(LocalEvent::Rejected(InputRejection::SequenceTimeout));
                 return;
             }
@@ -315,11 +437,11 @@ impl InputDecoder {
         received_at: Instant,
     ) -> Result<()> {
         loop {
-            if matches!(self.escape, EscapeState::DiscardCsi) {
+            if let EscapeState::DiscardCsi { rxvt } = &mut self.escape {
                 let end = self
                     .pending
                     .iter()
-                    .position(|byte| matches!(*byte, ESC | 0x1e) || (0x40..=0x7e).contains(byte));
+                    .position(|&byte| matches!(byte, ESC | 0x1e) || rxvt.is_final(byte));
                 let Some(end) = end else {
                     self.pending.clear();
                     break;
@@ -430,10 +552,7 @@ impl InputDecoder {
                         }
                         continue;
                     }
-                    let end = self.pending[2..]
-                        .iter()
-                        .position(|b| (0x40..=0x7e).contains(b))
-                        .map(|i| i + 2);
+                    let end = csi_end(&self.pending[2..]).map(|i| i + 2);
                     let Some(end) = end else {
                         ensure!(
                             self.pending.len() <= MAX_SEQUENCE,
@@ -595,6 +714,11 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
         ("", b'O') => return Ok(Some(InputEvent::Focus(false))),
         _ => (),
     }
+    if let Some(event) = decode_rxvt_arrow(body, final_byte, 1)
+        .or_else(|| decode_rxvt_numeric(body.as_bytes(), final_byte))
+    {
+        return Ok(Some(event));
+    }
     if body.starts_with(['?', '>', '<', '='])
         || !matches!(
             final_byte,
@@ -655,40 +779,10 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
                     .context("invalid modifyOtherKeys codepoint")?;
                 return Ok(Some(key_with_phase(KeyCode::Char(ch), modifiers, phase)));
             }
-            match code {
-                1 | 7 => "Home",
-                2 => "Insert",
-                3 => "Delete",
-                4 | 8 => "End",
-                5 => "PageUp",
-                6 => "PageDown",
-                11 => "F1",
-                12 => "F2",
-                13 => "F3",
-                14 => "F4",
-                15 => "F5",
-                17 => "F6",
-                18 => "F7",
-                19 => "F8",
-                20 => "F9",
-                21 => "F10",
-                23 => "F11",
-                24 => "F12",
-                25 => "F13",
-                26 => "F14",
-                28 => "F15",
-                29 => "F16",
-                31 => "F17",
-                32 => "F18",
-                33 => "F19",
-                34 => "F20",
-                42 => "F21",
-                43 => "F22",
-                44 => "F23",
-                45 => "F24",
-                201 => return Ok(None),
-                _ => return Ok(None),
-            }
+            let Some(key) = NUMBERED_KEYS.iter().find(|key| u16::from(key.code) == code) else {
+                return Ok(None);
+            };
+            key.name
         }
         _ => return Ok(None),
     };
@@ -699,7 +793,35 @@ fn decode_csi(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
     )))
 }
 
+fn decode_rxvt_numeric(body: &[u8], final_byte: u8) -> Option<InputEvent> {
+    let modifiers = match final_byte {
+        b'$' => 1,
+        b'^' => 4,
+        b'@' => 5,
+        _ => return None,
+    };
+    let key = RxvtCursor::from_body(body).complete()?;
+    Some(named(key.name, modifiers))
+}
+
+fn decode_rxvt_arrow(body: &str, final_byte: u8, modifiers: u16) -> Option<InputEvent> {
+    if !body.is_empty() {
+        return None;
+    }
+    let name = match final_byte {
+        b'a' => "Up",
+        b'b' => "Down",
+        b'c' => "Right",
+        b'd' => "Left",
+        _ => return None,
+    };
+    Some(named(name, modifiers))
+}
+
 fn decode_ss3(body: &str, final_byte: u8) -> Result<Option<InputEvent>> {
+    if let Some(event) = decode_rxvt_arrow(body, final_byte, 4) {
+        return Ok(Some(event));
+    }
     let modifiers = numeric_fields(body, ';')?
         .get(1)
         .copied()
