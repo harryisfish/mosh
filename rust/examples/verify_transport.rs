@@ -160,6 +160,10 @@ async fn verify_control_messages(
         ClientMessage::Detach { epoch: 1 },
         ClientMessage::Close { epoch: 1 },
         ClientMessage::ExitAck { epoch: 1 },
+        ClientMessage::Probe {
+            epoch: u64::MAX,
+            nonce: u64::MAX,
+        },
     ]);
     for expected in messages {
         send_message(&mut client.0, &expected).await?;
@@ -213,6 +217,10 @@ async fn verify_control_messages(
         },
         ServerMessage::Error {
             message: "error 中文🙂\0".into(),
+        },
+        ServerMessage::ProbeReply {
+            epoch: u64::MAX,
+            nonce: u64::MAX,
         },
     ] {
         send_message(&mut server.0, &expected).await?;
@@ -372,7 +380,7 @@ async fn main() -> Result<()> {
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, protocol v4, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v5, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
     );
     Ok(())
 }
@@ -461,7 +469,7 @@ fn bootstrap_fixture(mode: &str) -> Result<()> {
         }
         "invalid-grant" => {
             let mut old = grant;
-            old.version = 3;
+            old.version = 4;
             stdout.write_all(b"\x1eMOSH-RS-GRANT\n")?;
             serde_json::to_writer(&mut stdout, &old)?;
             stdout.write_all(b"\n\x1eMOSH-RS-GRANT-END\n")?;
@@ -757,16 +765,16 @@ async fn verify() -> Result<()> {
     let identity = ClientIdentity::generate()?;
     let request = request(&identity);
     let mut legacy_request = request.clone();
-    legacy_request.version = 3;
+    legacy_request.version = 4;
     let mut legacy_json = serde_json::to_vec(&legacy_request)?;
     legacy_json.push(b'\n');
     ensure!(
         read_request(Cursor::new(legacy_json)).is_err(),
-        "v3 bootstrap request was accepted"
+        "v4 bootstrap request was accepted"
     );
     ensure!(
         listen(&legacy_request).is_err(),
-        "v3 listener request was accepted"
+        "v4 listener request was accepted"
     );
     let mut invalid_locale = request.clone();
     invalid_locale.locale_candidates = vec!["bad/name".into()];
@@ -814,14 +822,14 @@ async fn verify() -> Result<()> {
     let (server, grant) = listen(&request)?;
     let client = identity.endpoint(&grant)?;
     let mut legacy_grant = grant.clone();
-    legacy_grant.version = 3;
+    legacy_grant.version = 4;
     ensure!(
         identity.endpoint(&legacy_grant).is_err(),
-        "v3 server grant was accepted"
+        "v4 server grant was accepted"
     );
     ensure!(
         connect(&client, &legacy_grant).await.is_err(),
-        "v3 connection grant was accepted"
+        "v4 connection grant was accepted"
     );
     let mut hostname_grant = grant.clone();
     hostname_grant.address = "localhost".into();
@@ -841,7 +849,7 @@ async fn verify() -> Result<()> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
     ensure!(
-        handshake.protocol.as_deref() == Some(&b"mosh-rs/4"[..]),
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/5"[..]),
         "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");

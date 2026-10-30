@@ -114,6 +114,7 @@ pub struct Display<W> {
     writer: W,
     epoch: u64,
     revision: u64,
+    installed_echo_through: Option<u64>,
     effects: u64,
     screen: Option<Screen>,
     graphics: Graphics,
@@ -137,6 +138,7 @@ impl<W> Display<W> {
                 writer,
                 epoch: self.epoch,
                 revision: self.revision,
+                installed_echo_through: self.installed_echo_through,
                 effects: self.effects,
                 screen: self.screen,
                 graphics: self.graphics,
@@ -166,6 +168,7 @@ impl<W: Write> Display<W> {
             writer,
             epoch: 0,
             revision: 0,
+            installed_echo_through: None,
             effects: 0,
             screen: None,
             graphics,
@@ -184,6 +187,7 @@ impl<W: Write> Display<W> {
         if epoch != self.epoch {
             self.clear_guesses()?;
             self.epoch = epoch;
+            self.installed_echo_through = None;
             self.checkpoint_required = true;
             self.predictions.bump_epoch();
             self.predictions.remote = None;
@@ -193,6 +197,9 @@ impl<W: Write> Display<W> {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+    pub fn installed_echo_through(&self) -> Option<u64> {
+        self.installed_echo_through
     }
     pub fn needs_checkpoint(&self) -> bool {
         self.checkpoint_required
@@ -337,6 +344,7 @@ impl<W: Write> Display<W> {
             .retain(|digest, _| frame.resources.iter().any(|meta| &meta.digest == digest));
         self.screen = Some(screen);
         self.revision = frame.revision;
+        self.installed_echo_through = Some(frame.echo_through);
         self.checkpoint_required = false;
         Ok(true)
     }

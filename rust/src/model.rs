@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CELL_IMAGES: usize = 4096;
@@ -453,6 +453,10 @@ pub enum ClientMessage {
     ExitAck {
         epoch: u64,
     },
+    Probe {
+        epoch: u64,
+        nonce: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -480,6 +484,10 @@ pub enum ServerMessage {
     },
     Error {
         message: String,
+    },
+    ProbeReply {
+        epoch: u64,
+        nonce: u64,
     },
 }
 

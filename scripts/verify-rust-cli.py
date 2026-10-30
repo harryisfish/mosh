@@ -131,6 +131,34 @@ def remote_fixture(mode, state):
         exact(b"resume-once\r", timeout=60)
         os.write(1, b"\r\nNETWORK_ONCE_OK\r\n")
         return 9
+    if mode == "liveness":
+        os.write(1, b"\x1b[2J\x1b[HLIVENESS_READY\r\n")
+        received = bytearray()
+        inputs = []
+        traffic = 0
+        next_output = 0
+        while True:
+            now = time.monotonic()
+            if Path(state + ".traffic").exists() and now >= next_output:
+                traffic += 1
+                os.write(1, f"\x1b[3;1HLIVENESS_TRAFFIC_{traffic}".encode())
+                next_output = now + 0.5
+            if not select.select([0], [], [], 0.05)[0]:
+                continue
+            chunk = os.read(0, 4096)
+            assert chunk, "liveness fixture input ended early"
+            received.extend(chunk)
+            while b"\r" in received:
+                line, _, tail = received.partition(b"\r")
+                received[:] = tail
+                if line == b"finish":
+                    assert inputs == ["pending-up", "pending-down"], inputs
+                    os.write(1, b"\r\nLIVENESS_DONE\r\n")
+                    return 9
+                assert line.decode() == ["pending-up", "pending-down"][len(inputs)], inputs
+                inputs.append(line.decode())
+                Path(state + ".inputs").write_text(json.dumps(inputs))
+                os.write(1, b"\r\nLIVENESS_" + line.upper().replace(b"-", b"_") + b"_ONCE\r\n")
     if mode in ["saturation", "atomic-admission", "paste-refusal"]:
         os.write(1, b"\x1b[2J\x1b[HSATURATION_READY\r\n")
         if mode in ["saturation", "atomic-admission"]:
@@ -223,12 +251,25 @@ def proxy_bootstrap(server, state):
         rng = random.Random(12345)
         queue = []
         queued_bytes = 0
+        queued_packets = [0, 0]
+        directional_bytes = [0, 0]
         serial = 0
         last_forwarded = [0, 0]
         profile = {}
         refresh = 0
         stats = {"received": 0, "dropped": 0, "duplicated": 0, "forwarded": 0,
                  "reordered": 0, "overflow": 0}
+        directional_stats = dict(stats, peak_queued=0, peak_bytes=0)
+        stats["up"] = directional_stats.copy()
+        stats["down"] = directional_stats.copy()
+
+        def count(field, to_front, amount=1):
+            stats[field] += amount
+            stats["down" if to_front else "up"][field] += amount
+
+        def dropping(to_front):
+            return Path(state + ".drop").exists() or profile.get("drop_down" if to_front else "drop_up", False)
+
         while True:
             now = time.monotonic()
             if now >= refresh:
@@ -238,44 +279,55 @@ def proxy_bootstrap(server, state):
                     profile = {}
                 stats["profile"] = profile
                 stats["queued"] = len(queue)
+                for index, direction in enumerate(["up", "down"]):
+                    stats[direction]["queued"] = queued_packets[index]
                 updated = Path(state + ".stats.new")
                 updated.write_text(json.dumps(stats))
                 updated.replace(state + ".stats")
                 refresh = now + 0.05
-            if Path(state + ".drop").exists():
-                queue.clear()
-                queued_bytes = 0
             while queue and queue[0][0] <= now:
                 _, order, to_front, packet, target = heapq.heappop(queue)
                 queued_bytes -= len(packet)
-                (front if to_front else back).sendto(packet, target)
-                stats["forwarded"] += 1
                 direction = int(to_front)
-                stats["reordered"] += int(order < last_forwarded[direction])
+                queued_packets[direction] -= 1
+                directional_bytes[direction] -= len(packet)
+                if dropping(to_front):
+                    count("dropped", to_front)
+                    continue
+                (front if to_front else back).sendto(packet, target)
+                count("forwarded", to_front)
+                count("reordered", to_front, int(order < last_forwarded[direction]))
                 last_forwarded[direction] = max(order, last_forwarded[direction])
             for source in select.select([front, back], [], [], 0.01)[0]:
                 packet, address = source.recvfrom(65536)
-                stats["received"] += 1
+                to_front = source is back
+                direction = int(to_front)
+                count("received", to_front)
                 if source is front:
                     peer = address
                 target = peer if source is back else destination
                 if target is None:
                     continue
-                if Path(state + ".drop").exists() or rng.random() < profile.get("loss", 0):
-                    stats["dropped"] += 1
+                if dropping(to_front) or rng.random() < profile.get("loss", 0):
+                    count("dropped", to_front)
                     continue
                 delay = max(0, profile.get("delay_ms", 0)
                             + rng.uniform(-profile.get("jitter_ms", 0), profile.get("jitter_ms", 0))) / 1000
                 duplicate = rng.random() < profile.get("duplicate", 0)
                 for copy in range(1 + int(duplicate)):
                     if len(queue) >= 4096 or queued_bytes + len(packet) > 8 * 1024 * 1024:
-                        stats["overflow"] += 1
+                        count("overflow", to_front)
                         continue
                     serial += 1
                     heapq.heappush(queue, (now + delay + copy * 0.007, serial,
-                                           source is back, packet, target))
+                                           to_front, packet, target))
                     queued_bytes += len(packet)
-                    stats["duplicated"] += copy
+                    queued_packets[direction] += 1
+                    directional_bytes[direction] += len(packet)
+                    directional = stats["down" if to_front else "up"]
+                    directional["peak_queued"] = max(directional["peak_queued"], queued_packets[direction])
+                    directional["peak_bytes"] = max(directional["peak_bytes"], directional_bytes[direction])
+                    count("duplicated", to_front, copy)
     Path(state + ".proxy").write_text(str(pid))
     sys.stdout.buffer.write(encode_grant(grant))
     sys.stdout.buffer.flush()
@@ -710,6 +762,161 @@ def verify_background_exit(command, state, termination):
         cleanup(state)
 
 
+def verify_liveness(bin_dir, temporary, evidence_dir=None):
+    client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
+    script = str(Path(__file__).resolve())
+    state = str(Path(temporary) / "liveness.json")
+    wrapper = Path(temporary) / "liveness-bootstrap-proxy"
+    wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+    wrapper.chmod(0o700)
+    process = TerminalProcess([client, "--local", "--server", str(wrapper), "--predict", "never", "--",
+                               sys.executable, script, "--remote", "liveness", state])
+
+    def set_profile(profile):
+        updated = Path(state + ".profile.new")
+        updated.write_text(json.dumps(profile))
+        updated.replace(state + ".profile")
+        deadline = time.monotonic() + 5
+        while True:
+            process.pump(0.01)
+            if Path(state + ".stats").exists():
+                stats = json.loads(Path(state + ".stats").read_text())
+                if stats["profile"] == profile:
+                    return stats
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+            assert time.monotonic() < deadline, "liveness relay did not install profile"
+
+    def pump_for(duration):
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            process.pump(min(0.05, max(0, deadline - time.monotonic())))
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+
+    def save(name, start, facts):
+        print("CLI liveness " + name + " " + json.dumps(facts, sort_keys=True), flush=True)
+        if evidence_dir is not None:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            (evidence_dir / (name + ".tty")).write_bytes(process.output[start:])
+            (evidence_dir / (name + ".json")).write_text(json.dumps(facts, indent=2) + "\n")
+
+    try:
+        process.until(b"LIVENESS_READY")
+        original_processes = json.loads(Path(state).read_text())
+        pump_for(0.3)
+        start = len(process.output)
+        before = set_profile({})
+        idle_started = time.monotonic()
+        pump_for(13)
+        after = set_profile({})
+        assert len(process.output) == start, ("healthy idle redrew the TTY", bytes(process.output[start:]))
+        save("idle", start, {"elapsed": time.monotonic() - idle_started, "tty_bytes": 0,
+                              "raw_udp_up": after["up"]["forwarded"] - before["up"]["forwarded"],
+                              "raw_udp_down": after["down"]["forwarded"] - before["down"]["forwarded"]})
+        for direction in ["up", "down"]:
+            traffic = Path(state + ".traffic")
+            if direction == "up":
+                traffic.touch()
+                process.until(b"LIVENESS_TRAFFIC_")
+            start = len(process.output)
+            profile = {"drop_" + direction: True}
+            before = set_profile(profile)
+            dropped_at = time.monotonic()
+            process.send(("pending-" + direction + "\r").encode())
+            process.until(b"Reply unconfirmed", timeout=9, start=start)
+            warning_after = time.monotonic() - dropped_at
+            assert 3.5 <= warning_after <= 7.5, (direction, warning_after, bytes(process.output[start:]))
+            process.until(b"accepted inputs waiting", timeout=4, start=start)
+            assert b"Application replies resumed" not in process.output[start:], "unconfirmed traffic declared application recovery"
+            if direction == "up":
+                ages = re.findall(rb"Reply unconfirmed (\d+)s; traffic (\d+)s ago", process.output[start:])
+                assert b"LIVENESS_TRAFFIC_" in process.output[start:] and any(int(traffic_age) < int(reply_age) for reply_age, traffic_age in ages), bytes(process.output[start:])
+                assert not Path(state + ".inputs").exists(), "uplink drop accepted the pending input remotely"
+                traffic.unlink()
+            else:
+                assert json.loads(Path(state + ".inputs").read_text()) == ["pending-up", "pending-down"], "downlink fixture did not receive exactly one copy"
+            after = set_profile(profile)
+            assert after[direction]["forwarded"] == before[direction]["forwarded"], (direction, before, after)
+            assert after[direction]["dropped"] > before[direction]["dropped"], (direction, before, after)
+            assert b"Connection interrupted" not in process.output[start:], "liveness warning waited for transport Lost"
+            recovery_start = len(process.output)
+            restored_at = time.monotonic()
+            set_profile({})
+            process.until(b"Application replies resumed", timeout=8, start=recovery_start)
+            process.until(("LIVENESS_PENDING_" + direction.upper() + "_ONCE").encode(), timeout=8, start=start)
+            save("drop-" + direction, start, {"warning_after": warning_after,
+                 "recovery_after": time.monotonic() - restored_at, "raw_udp_before": before,
+                 "raw_udp_after": after, "inputs": json.loads(Path(state + ".inputs").read_text())})
+            pump_for(2.3)
+        waiting_start = len(process.output)
+        set_profile({"drop_up": True})
+        process.send(b"\x1b[I")
+        process.until(b"accepted inputs waiting", timeout=9, start=waiting_start)
+        start = len(process.output)
+        os.kill(process.process.pid, signal.SIGSTOP)
+        time.sleep(2)
+        resumed_at = time.monotonic()
+        os.kill(process.process.pid, signal.SIGCONT)
+        pump_for(1)
+        assert b"Reply unconfirmed" not in process.output[start:], "SIGCONT reused the pre-suspend confirmation deadline"
+        assert b"accepted inputs waiting" not in process.output[start:], "SIGCONT redrew the pre-suspend pending warning"
+        process.until(b"Reply unconfirmed", timeout=7, start=start)
+        warning_after = time.monotonic() - resumed_at
+        assert 5.5 <= warning_after <= 7.5, warning_after
+        recovery_start = len(process.output)
+        before = json.loads(Path(state + ".stats").read_text())
+        restored_at = time.monotonic()
+        restored = set_profile({})
+        original_timeout, recovery_cap = 8, 30
+        facts = {"warning_after_resume": warning_after,
+                 "unconfirmed_and_waiting_before_suspend": True,
+                 "original_timeout": original_timeout, "recovery_cap": recovery_cap,
+                 "original_criteria_met": False, "original_recovery_after": None,
+                 "recovery_after": None, "profile_confirmed_after": time.monotonic() - restored_at,
+                 "raw_udp_before": before, "raw_udp_profile_confirmed": restored}
+        try:
+            try:
+                process.until(b"Application replies resumed",
+                              timeout=max(0, original_timeout - (time.monotonic() - restored_at)),
+                              start=recovery_start)
+                facts["original_criteria_met"] = True
+                facts["original_recovery_after"] = time.monotonic() - restored_at
+            except AssertionError as error:
+                timeout_message = "CLI timed out before b'Application replies resumed'"
+                if not str(error).startswith(timeout_message + ":"):
+                    raise
+                facts["original_timeout_after"] = time.monotonic() - restored_at
+                facts["original_timeout_error"] = str(error)
+                facts["raw_udp_at_original_timeout"] = json.loads(Path(state + ".stats").read_text())
+                if evidence_dir is not None:
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    error_path = evidence_dir / "sigcont-original-timeout.error.txt"
+                    error_path.write_text(str(error) + "\n")
+                    facts["original_timeout_error_path"] = str(error_path)
+                save("sigcont-original-timeout", recovery_start, facts)
+                process.until(b"Application replies resumed",
+                              timeout=max(0, recovery_cap - (time.monotonic() - restored_at)),
+                              start=recovery_start)
+            facts["recovery_after"] = time.monotonic() - restored_at
+        finally:
+            facts["observed_after"] = time.monotonic() - restored_at
+            facts["raw_udp_after"] = json.loads(Path(state + ".stats").read_text())
+            facts["pids"] = json.loads(Path(state).read_text())
+            facts["inputs"] = json.loads(Path(state + ".inputs").read_text())
+            facts["original_command"] = facts["pids"] == original_processes
+            save("sigcont", start, facts)
+        assert facts["original_command"], "liveness reconnected to a replacement command"
+        assert facts["inputs"] == ["pending-up", "pending-down"], "SIGCONT changed accepted input contents or counts"
+        process.send(b"finish\r")
+        process.until(b"LIVENESS_DONE")
+        process.finish(9)
+    finally:
+        if evidence_dir is not None:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            (evidence_dir / "complete.tty").write_bytes(process.output)
+        process.close()
+        cleanup(state)
+
+
 def read_diagnostics(paths):
     records = []
     for path in paths:
@@ -944,6 +1151,7 @@ else:
                 cleanup(state)
             print("CLI recovered through a UDP outage with queued input applied once and the original command still running", flush=True)
             verify_saturated_input(bin_dir, temporary)
+            verify_liveness(bin_dir, temporary, evidence_dir)
         if diagnostics:
             verify_diagnostics(client, server, script, temporary)
             check_diagnostics(evidence_dir)
@@ -1333,14 +1541,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
+    parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
+    parser.add_argument("--evidence-dir", type=Path, help="save liveness raw TTY and relay observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
-    parser.add_argument("--evidence-dir", type=Path, help="copy diagnostic JSONL files to this directory")
     arguments = parser.parse_args()
-    if arguments.saturated_input:
+    if arguments.liveness:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-liveness-") as temporary:
+            verify_liveness(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir)
+    elif arguments.saturated_input:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-saturated-") as temporary:
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
     else:
-        if arguments.evidence_dir is not None and not arguments.diagnostics:
-            parser.error("--evidence-dir requires --diagnostics")
         verify(arguments.bin_dir.resolve(), arguments.network, arguments.diagnostics, arguments.evidence_dir)
