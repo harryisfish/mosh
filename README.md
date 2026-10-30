@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/harryisfish/mosh/master/install.sh 
 ```
 
 The script selects the host's OS, CPU, and Linux libc, then verifies the release
-checksum before installing both binaries. Use `--version 0.1.2` to pin a release
+checksum before installing both binaries. Use `--version 0.1.3` to pin a release
 or `--install-dir DIRECTORY` to choose another directory. See the
 [usage guide](docs/rust-usage.md#install-a-release) to review the script before running it.
 
@@ -55,19 +55,19 @@ sha256sum --ignore-missing -c SHA256SUMS
 For Debian or Ubuntu on x86_64:
 
 ```sh
-sudo apt install ./mosh-rs_0.1.2-1_amd64.deb
+sudo apt install ./mosh-rs_0.1.3-1_amd64.deb
 ```
 
 For Fedora on x86_64:
 
 ```sh
-sudo dnf install ./mosh-rs-0.1.2-1.x86_64.rpm
+sudo dnf install ./mosh-rs-0.1.3-1.x86_64.rpm
 ```
 
 For openSUSE on x86_64:
 
 ```sh
-sudo zypper install --allow-unsigned-rpm ./mosh-rs-0.1.2-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./mosh-rs-0.1.3-1.x86_64.rpm
 ```
 
 On arm64, use the `arm64.deb` or `aarch64.rpm` asset instead.
@@ -93,13 +93,13 @@ Download `SHA256SUMS` beside the archive. Verify it before extracting:
 - macOS: `shasum -a 256 --ignore-missing -c SHA256SUMS`
 - Linux: `sha256sum --ignore-missing -c SHA256SUMS`
 
-For example, install version 0.1.2 on an Apple Silicon Mac:
+For example, install version 0.1.3 on an Apple Silicon Mac:
 
 ```sh
-tar -xzf mosh-rs-0.1.2-aarch64-apple-darwin.tar.gz
+tar -xzf mosh-rs-0.1.3-aarch64-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 755 mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs \
-	mosh-rs-0.1.2-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
+install -m 755 mosh-rs-0.1.3-aarch64-apple-darwin/bin/mosh-rs \
+	mosh-rs-0.1.3-aarch64-apple-darwin/bin/mosh-rs-server "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 

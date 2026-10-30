@@ -23,11 +23,11 @@ binaries.
 
 ## Publish the tag
 
-After merging the PR, tag its commit. For version 0.1.2:
+After merging the PR, tag its commit. For version 0.1.3:
 
 ```sh
-git tag rust-v0.1.2 <merged-commit>
-git push origin rust-v0.1.2
+git tag rust-v0.1.3 <merged-commit>
+git push origin rust-v0.1.3
 ```
 
 The tag must match the Cargo package version. The tag workflow builds and
@@ -41,9 +41,9 @@ Update the formula from the published release, on a new branch. Do not use
 checksums from a PR build or guess checksums before publication.
 
 ```sh
-gh release download rust-v0.1.2 --repo harryisfish/mosh \
-	--pattern SHA256SUMS --dir target/homebrew-0.1.2
-python3 scripts/update-homebrew-formula.py 0.1.2 target/homebrew-0.1.2/SHA256SUMS
+gh release download rust-v0.1.3 --repo harryisfish/mosh \
+	--pattern SHA256SUMS --dir target/homebrew-0.1.3
+python3 scripts/update-homebrew-formula.py 0.1.3 target/homebrew-0.1.3/SHA256SUMS
 ```
 
 The generator pins four archive URLs and their SHA-256 checksums. It uses musl
