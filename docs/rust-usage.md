@@ -205,6 +205,13 @@ Linux-console F1-F5 and xterm F21-F24 are sent as semantic keys and encoded for
 the remote application's current keyboard mode. Keypad Begin and Equal retain
 their normal, application-keypad, or Kitty meaning.
 
+Rxvt Shift and Ctrl arrows, plus Shift, Ctrl, and Shift+Ctrl navigation and
+F1-F20 suffix forms, use the same semantic input path. For example, rxvt
+`ESC [ 3 $` sends Shift-Delete. After a prefix timeout, a late `$` ends that
+key's discarded tail without consuming the next typed character. Standard
+terminal replies with `$` intermediates remain filtered. Higher rxvt function
+key codes outside this set are not inferred from terminfo capability numbers.
+
 Press Ctrl-^, then `.` to close the local client, or Ctrl-^, then `q` to end the
 remote command. Ctrl-^, then `^` sends a literal Ctrl-^. Ctrl-^, then `?` shows
 these commands. Press Ctrl-^, then Ctrl-Z to return to the local shell without
