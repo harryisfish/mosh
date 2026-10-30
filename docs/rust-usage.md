@@ -346,6 +346,11 @@ The terminal model enforces content and memory limits. A legal window size alone
 does not exempt oversized graphemes, hyperlinks, image objects, parser strings,
 or effects from those limits. The supported static profile and exact quotas are
 recorded in [the core maintenance notes](../rust/vendor/wezterm-term/MOSH_PATCHES.md).
+An orphan non-default-ignorable zero-width Mn/Me mark that can attach to NBSP
+receives a one-column U+00A0 carrier. It is included in cell text, snapshots and
+copied text; the original mark bytes are preserved. Format-only and default-ignorable marks
+do not receive a carrier. Mixed prefixes and flush boundaries retain the limits
+described in the maintenance notes.
 
 ## Run the verification tools
 
@@ -361,6 +366,7 @@ python3 scripts/verify-rust-cli.py --network
 python3 scripts/verify-rust-cli.py --saturated-input
 python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
 python3 scripts/verify-rust-cli.py --redraw --evidence-dir /tmp/mosh-rs-redraw
+python3 scripts/verify-rust-cli.py --combining --evidence-dir /tmp/mosh-rs-combining
 python3 scripts/verify-rust-cli.py --liveness --evidence-dir /tmp/mosh-rs-liveness
 ```
 
@@ -389,7 +395,13 @@ cached Kitty image while UDP is blocked, then checks Ctrl-L restores cells,
 styles, cursor, and image through the terminal core. It checks key identity and
 phase, group counts, resize, input refusal, closing, and the first-frame boundary.
 It compares exact remote bytes and confirms one-time effects are not repeated.
+`--network` also runs the combining cases. `--combining` checks leading marks,
+erase/newline boundaries, byte-split UTF-8, repeated marks, normal bases,
+format filtering and trailing selectors. It saves remote raw chunks, TTY
+transcripts and process IDs, then checks exact cell text, widths and cursor
+positions by replaying the CLI output through the terminal core.
 These transcript checks do not verify native terminal visuals or selection.
+They do not establish other-platform or comprehensive performance acceptance.
 
 To verify diagnostics, including a blocked local terminal and a healthy idle
 session, run:

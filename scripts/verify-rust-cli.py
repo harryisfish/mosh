@@ -84,6 +84,17 @@ LEGACY_INPUT_EXPECTED = [
                      b"\x1b[23;2:1~\x1b[124;1:1u\x1b[24;2:1~\x1b[124;1:1u"
                      b"\x1b[1;5:1P\x1b[124;1:1u\x1b[23;6:1~\x1b[124;1:1u"),
 ]
+COMBINING_CASES = [
+    ("leading", [b"\x1b[2J\x1b[H\xcc\x82X"]),
+    ("erase", [b"\x1b[2J\x1b[HA\r\x1b[2K\xcc\x82X"]),
+    ("newline", [b"\x1b[2J\x1b[He\r\n\xcc\x82X"]),
+    ("split-utf8", [b"\x1b[2J\x1b[H", b"\xcc", b"\x82", b"X"]),
+    ("repeated", [b"\x1b[2J\x1b[H\xcc\x82", b"\xcc\x81X"]),
+    ("normal-base", [b"\x1b[2J\x1b[He", b"\xcc\x82X"]),
+    ("filtered", [b"\x1b[2J\x1b[H" + "\u2068\u200c\u200d\u034f\ufe0fX".encode()]),
+    ("tail-di", [b"\x1b[2J\x1b[H\xcc\x82", "\ufe0fX".encode()]),
+    ("enclosing", [b"\x1b[2J\x1b[H" + "\u20ddX".encode()]),
+]
 
 
 def decode_grant(output):
@@ -111,8 +122,26 @@ def exact(data, timeout=5):
 
 
 def remote_fixture(mode, state):
-    tty.setraw(0, termios.TCSANOW if mode == "redraw" else termios.TCSAFLUSH)
+    tty.setraw(0, termios.TCSANOW if mode in ["redraw", "combining"] else termios.TCSAFLUSH)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "combining":
+        observed = []
+        received = Path(state + ".received")
+        received.write_bytes(b"")
+        Path(state + ".raw").write_bytes(b"")
+        for name, chunks in COMBINING_CASES:
+            title = b"\x1b]2;COMBINING_" + name.encode() + b"\x1b\\"
+            for chunk in [*chunks, title]:
+                assert os.write(1, chunk) == len(chunk)
+                observed.append({"case": name, "hex": chunk.hex()})
+                with Path(state + ".raw").open("ab") as output:
+                    output.write(chunk)
+                Path(state + ".chunks").write_text(json.dumps(observed))
+                time.sleep(0.04)
+            exact(b"next\r", timeout=15)
+            with received.open("ab") as output:
+                output.write(b"next\r")
+        return 9
     if mode == "redraw":
         received = Path(state + ".received")
         received.write_bytes(b"")
@@ -994,6 +1023,61 @@ def verify_legacy_input(bin_dir, temporary, evidence_dir=None):
         cleanup(state)
 
 
+def verify_combining(bin_dir, temporary, evidence_dir=None, core_example=None):
+    script = str(Path(__file__).resolve())
+    client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
+    replay = core_example or (bin_dir / "examples" / "verify_core")
+    assert replay.is_file(), "build the verify_core example before CLI combining verification"
+    run = evidence_dir / "combining" if evidence_dir is not None else Path(temporary) / "combining-evidence"
+    run.mkdir(parents=True, exist_ok=True)
+    state = str(Path(temporary) / "combining.json")
+    process = TerminalProcess([client, "--local", "--server", server, "--predict", "never", "--",
+                               sys.executable, script, "--remote", "combining", state])
+    facts = {"client": process.process.pid, "cases": [],
+             "limits": "Actual PTY and CLI transcript roundtrip; native font/terminal visuals unverified"}
+    try:
+        start = 0
+        for name, _ in COMBINING_CASES:
+            process.until(b"\x1b]2;COMBINING_" + name.encode() + b"\x1b\\", start=start)
+            deadline = time.monotonic() + 0.1
+            while time.monotonic() < deadline:
+                process.pump(0.01)
+            remote = json.loads(Path(state).read_text())
+            if "remote" not in facts:
+                facts["remote"] = remote
+            assert remote == facts["remote"], "combining replaced the remote command"
+            transcript = run / (name + ".tty")
+            transcript.write_bytes(process.output)
+            result = subprocess.run([str(replay), "--combining-transcript", str(transcript), name],
+                                    text=True, capture_output=True)
+            (run / (name + ".replay.log")).write_text(result.stdout + result.stderr)
+            assert result.returncode == 0, (name, result.stdout, result.stderr)
+            facts["cases"].append(json.loads(result.stdout))
+            start = len(process.output)
+            process.send(b"next\r")
+        process.finish(9)
+        expected = [{"case": name, "hex": chunk.hex()} for name, chunks in COMBINING_CASES
+                    for chunk in [*chunks, b"\x1b]2;COMBINING_" + name.encode() + b"\x1b\\"]]
+        assert json.loads(Path(state + ".chunks").read_text()) == expected
+        assert Path(state + ".raw").read_bytes() == b"".join(bytes.fromhex(chunk["hex"]) for chunk in expected)
+        assert Path(state + ".received").read_bytes() == b"next\r" * len(COMBINING_CASES)
+        facts["passed"] = True
+        print("CLI combining: nine exact cell/width/cursor roundtrips, raw UTF-8 chunks and stable remote PID passed; native visuals unverified", flush=True)
+    except Exception as error:
+        facts["error"] = str(error)
+        raise
+    finally:
+        (run / "complete.tty").write_bytes(process.output)
+        (run / "cases.json").write_text(json.dumps(facts, indent=2) + "\n")
+        for suffix, filename in [("", "pids.json"), (".raw", "remote.raw"), (".chunks", "remote-chunks.json"),
+                                 (".received", "received.bin")]:
+            path = Path(state + suffix)
+            if path.exists():
+                (run / filename).write_bytes(path.read_bytes())
+        process.close()
+        cleanup(state)
+
+
 def verify_redraw(bin_dir, temporary, evidence_dir=None, display_example=None):
     script = str(Path(__file__).resolve())
     client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
@@ -1444,7 +1528,7 @@ def check_diagnostics(evidence_dir):
     print(f"CLI diagnostics schema, privacy and file bounds passed for {len(DIAGNOSTIC_FILES)} files", flush=True)
 
 
-def verify(bin_dir, network, diagnostics=False, evidence_dir=None, display_example=None):
+def verify(bin_dir, network, diagnostics=False, evidence_dir=None, display_example=None, core_example=None):
     DIAGNOSTIC_FILES.clear()
     script = str(Path(__file__).resolve())
     client = str(bin_dir / "mosh-rs")
@@ -1546,6 +1630,7 @@ else:
         print("CLI running background clients exit on TERM/HUP without touching the terminal or ending the remote command", flush=True)
 
         if network:
+            verify_combining(bin_dir, temporary, evidence_dir, core_example)
             verify_legacy_input(bin_dir, temporary, evidence_dir)
             verify_redraw(bin_dir, temporary, evidence_dir, display_example)
             state = str(Path(temporary) / "network.json")
@@ -1987,15 +2072,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
     parser.add_argument("--display-example", type=Path, help="path to the verify_display example used by redraw verification")
+    parser.add_argument("--core-example", type=Path, help="path to the verify_core example used by combining verification")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
     parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
     parser.add_argument("--redraw", action="store_true", help="exercise cached Ctrl-L redraw, key identity, images, effects and rejected input")
+    parser.add_argument("--combining", action="store_true", help="exercise orphan combining marks with exact cell and cursor transcript roundtrips")
     parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
     arguments = parser.parse_args()
-    if arguments.redraw:
+    if arguments.combining:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-combining-") as temporary:
+            verify_combining(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
+                             arguments.core_example.resolve() if arguments.core_example else None)
+    elif arguments.redraw:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-redraw-") as temporary:
             verify_redraw(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
                           arguments.display_example.resolve() if arguments.display_example else None)
@@ -2010,4 +2101,5 @@ if __name__ == "__main__":
             verify_saturated_input(arguments.bin_dir.resolve(), temporary)
     else:
         verify(arguments.bin_dir.resolve(), arguments.network, arguments.diagnostics, arguments.evidence_dir,
-               arguments.display_example.resolve() if arguments.display_example else None)
+               arguments.display_example.resolve() if arguments.display_example else None,
+               arguments.core_example.resolve() if arguments.core_example else None)
