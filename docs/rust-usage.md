@@ -172,12 +172,37 @@ event numbers. The server completes accepted partial PTY writes before reporting
 an input commit. It skips obsolete screen updates rather than replaying a log of
 all remote output. See [the protocol reference](rust-protocol.md).
 
+When the pending input budget is full, the client keeps reading local commands
+and explicitly refuses new ordinary input. Refused input receives no event
+number, is not predicted, and is never sent after reconnection. Input resumes
+when the pending budget falls to half its limit; the status asks you to retype
+the refused content. A complete escape fallback group is accepted or refused
+together. Keyboard phases received in separate reads are admitted separately;
+a refused release may require you to press and release the key again.
+
+Bracketed paste is limited to 128 KiB. Oversized or invalid UTF-8 paste is
+refused. The client discards oversized paste through its closing marker,
+including any embedded local escape commands. An unfinished paste can still be
+interrupted with an operating system signal. Clipboard replies share the input
+budget; a refused reply is discarded and the remote query may time out.
+
 Press Ctrl-^, then `.` to close the local client, or Ctrl-^, then `q` to end the
 remote command. Ctrl-^, then `^` sends a literal Ctrl-^. Ctrl-^, then `?` shows
 these commands. Press Ctrl-^, then Ctrl-Z to return to the local shell without
 ending the remote command. Run `fg` to restore the session, including its cached
 text and images. Ordinary Ctrl-Z goes to the remote program. A client resumed
 with `bg` waits for `fg` before reading or drawing on the terminal.
+
+`Ctrl-^ q` stops accepting new remote input and requests closure after the server
+confirms the PTY writes for all previously accepted events. This does not
+confirm that the remote application has processed every event. The client keeps
+its connection until the remote exit and final display/effects are confirmed.
+During an outage the status
+remains unconfirmed. `Ctrl-^ .` or TERM, INT, or HUP leaves locally without
+waiting for the network. If closure is unconfirmed, the client restores the
+terminal and warns that the remote command may still be running. A client that
+has lost foreground ownership cannot leave this warning on another job's
+terminal.
 
 Reconnection credentials live in the running client process.
 Closing or crashing that process does not provide a resumable session file.
@@ -286,6 +311,7 @@ target/debug/examples/verify_transport
 target/debug/examples/verify_display
 target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
+python3 scripts/verify-rust-cli.py --saturated-input
 ```
 
 These tools drive real core, QUIC, renderer, and PTY paths. The CLI tool creates

@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
-use mosh_rs::input::{EscapeAction, EscapeSequence, InputDecoder, LocalEvent};
+use mosh_rs::input::{
+    EscapeAction, EscapeSequence, InputDecoder, InputRejection, LocalEvent, MAX_INPUT_CHUNK,
+    PasteAdmission,
+};
 use mosh_rs::model::*;
 use mosh_rs::{state, terminal::TerminalModel, transport};
 use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
@@ -112,10 +115,22 @@ fn printable(ch: char) -> InputEvent {
     })
 }
 
+fn feed(decoder: &mut InputDecoder, bytes: &[u8]) -> Result<Vec<LocalEvent>> {
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(MAX_INPUT_CHUNK) {
+        let batch = decoder.feed(chunk, PasteAdmission::Capture)?;
+        assert!(batch.len() <= MAX_INPUT_CHUNK + 1);
+        events.extend(batch);
+    }
+    Ok(events)
+}
+
 fn verify_input() -> Result<()> {
     let mut decoder = InputDecoder::new();
-    let events =
-        decoder.feed(b"\x1b[97:65:113;7:2;233:769u\x1b[97;1:3u\x1b[1;5A\x1b[200~hello\n")?;
+    let events = feed(
+        &mut decoder,
+        b"\x1b[97:65:113;7:2;233:769u\x1b[97;1:3u\x1b[1;5A\x1b[200~hello\n",
+    )?;
     assert_eq!(
         events[0],
         LocalEvent::Input(InputEvent::Key(Key {
@@ -146,17 +161,17 @@ fn verify_input() -> Result<()> {
         }))
     );
     assert_eq!(events.len(), 3);
-    assert!(decoder.feed(b"world\x1b[20")?.is_empty());
+    assert!(feed(&mut decoder, b"world\x1b[20")?.is_empty());
     assert_eq!(
-        decoder.feed(b"1~")?,
+        feed(&mut decoder, b"1~")?,
         vec![LocalEvent::Input(InputEvent::Paste("hello\nworld".into()))]
     );
-    assert!(decoder.feed(&[0xf0, 0x9f])?.is_empty());
+    assert!(feed(&mut decoder, &[0xf0, 0x9f])?.is_empty());
     assert_eq!(
-        decoder.feed(&[0x98, 0x83])?,
+        feed(&mut decoder, &[0x98, 0x83])?,
         vec![LocalEvent::Input(printable('😃'))]
     );
-    assert!(decoder.feed(b"\x1b")?.is_empty());
+    assert!(feed(&mut decoder, b"\x1b")?.is_empty());
     assert!(decoder.has_pending_escape());
     assert_eq!(
         decoder.flush_escape(),
@@ -169,7 +184,10 @@ fn verify_input() -> Result<()> {
             text: None
         }))]
     );
-    let events = decoder.feed(b"\x1b[<4;3;2M\x1b[<0;3;2m\x1b[I\x1b[O\x1b]52;c;aGVsbG8=\x1b\\")?;
+    let events = feed(
+        &mut decoder,
+        b"\x1b[<4;3;2M\x1b[<0;3;2m\x1b[I\x1b[O\x1b]52;c;aGVsbG8=\x1b\\",
+    )?;
     assert_eq!(
         events[0],
         LocalEvent::Input(InputEvent::Mouse(Mouse {
@@ -228,9 +246,9 @@ fn verify_input() -> Result<()> {
         })),
     ];
     let mut ghostty = InputDecoder::new();
-    assert!(ghostty.feed(b"\x1b[105;")?.is_empty());
-    let mut events = ghostty.feed(b";105u\x1b[105;1:")?;
-    events.extend(ghostty.feed(b"3u\x1b[27u\x1b[27;1:3u")?);
+    assert!(feed(&mut ghostty, b"\x1b[105;")?.is_empty());
+    let mut events = feed(&mut ghostty, b";105u\x1b[105;1:")?;
+    events.extend(feed(&mut ghostty, b"3u\x1b[27u\x1b[27;1:3u")?);
     assert_eq!(events, expected);
     let mut legacy = TerminalModel::new(Size::default(), false)?;
     let mut kitty = TerminalModel::new(Size::default(), false)?;
@@ -249,7 +267,7 @@ fn verify_input() -> Result<()> {
         kitty_bytes,
         b"\x1b[105;1:1;105u\x1b[105;1:3u\x1b[27;1:1u\x1b[27;1:3u"
     );
-    assert_eq!(InputDecoder::new().feed(&kitty_bytes)?, expected);
+    assert_eq!(feed(&mut InputDecoder::new(), &kitty_bytes)?, expected);
     for (sequence, name, modifiers, phase) in [
         ("\x1bOA", "Up", 0, KeyPhase::Press),
         ("\x1b[1;1:1A", "Up", 0, KeyPhase::Press),
@@ -263,9 +281,9 @@ fn verify_input() -> Result<()> {
     ] {
         let mut decoder = InputDecoder::new();
         let split = sequence.len() - 2;
-        assert!(decoder.feed(&sequence.as_bytes()[..split])?.is_empty());
+        assert!(feed(&mut decoder, &sequence.as_bytes()[..split])?.is_empty());
         assert_eq!(
-            decoder.feed(&sequence.as_bytes()[split..])?,
+            feed(&mut decoder, &sequence.as_bytes()[split..])?,
             vec![LocalEvent::Input(InputEvent::Key(Key {
                 code: KeyCode::Named(name.into()),
                 modifiers,
@@ -277,7 +295,7 @@ fn verify_input() -> Result<()> {
             "{sequence:?}"
         );
     }
-    assert!(InputDecoder::new().feed(b"\x1b[4;1$y")?.is_empty());
+    assert!(feed(&mut InputDecoder::new(), b"\x1b[4;1$y")?.is_empty());
     for invalid in [
         b"\x1b[97;0u".as_slice(),
         b"\x1b[97;257u".as_slice(),
@@ -285,10 +303,10 @@ fn verify_input() -> Result<()> {
         b"\x1b[1;257A".as_slice(),
         b"\x1b[1;1:4A".as_slice(),
     ] {
-        assert!(InputDecoder::new().feed(invalid).is_err());
+        assert!(feed(&mut InputDecoder::new(), invalid).is_err());
     }
     let mut functional = InputDecoder::new();
-    let events = functional.feed(b"\x1b[57399;1u\x1b[57428;1u\x1b[1;5R")?;
+    let events = feed(&mut functional, b"\x1b[57399;1u\x1b[57428;1u\x1b[1;5R")?;
     assert!(
         matches!(&events[0], LocalEvent::Input(InputEvent::Key(Key { code: KeyCode::Named(name), .. })) if name == "Keypad0")
     );
@@ -298,7 +316,10 @@ fn verify_input() -> Result<()> {
     assert!(
         matches!(&events[2], LocalEvent::Input(InputEvent::Key(Key { code: KeyCode::Named(name), modifiers: 4, .. })) if name == "F3")
     );
-    let events = functional.feed(b"\x1b[<66;2;1M\x1b[<67;2;1M\x1b[<35;2;1M\x1b[<128;2;1M")?;
+    let events = feed(
+        &mut functional,
+        b"\x1b[<66;2;1M\x1b[<67;2;1M\x1b[<35;2;1M\x1b[<128;2;1M",
+    )?;
     assert!(matches!(
         &events[0],
         LocalEvent::Input(InputEvent::Mouse(Mouse {
@@ -325,12 +346,78 @@ fn verify_input() -> Result<()> {
         3,
         "unsupported extra mouse buttons must not become left clicks"
     );
-    let mut bounded = InputDecoder::new();
-    assert!(bounded.feed(b"\x1b[200~")?.is_empty());
     assert!(
-        bounded
-            .feed(&vec![b'a'; MAX_PENDING_INPUT / 2 + 1])
+        InputDecoder::new()
+            .feed(&[b'a'; MAX_INPUT_CHUNK + 1], PasteAdmission::Capture)
             .is_err()
+    );
+    let mut maximal = InputDecoder::new();
+    assert!(feed(&mut maximal, b"\x1b[200~")?.is_empty());
+    assert!(feed(&mut maximal, &vec![b'a'; MAX_PENDING_INPUT / 2])?.is_empty());
+    let mut tail = b"\x1b[201~".to_vec();
+    tail.extend_from_slice(&[b'z'; MAX_INPUT_CHUNK - 6]);
+    let events = maximal.feed(&tail, PasteAdmission::Capture)?;
+    assert_eq!(events.len(), MAX_INPUT_CHUNK - 5);
+    assert_eq!(
+        events[0],
+        LocalEvent::Input(InputEvent::Paste("a".repeat(MAX_PENDING_INPUT / 2)))
+    );
+    assert_eq!(events[1], LocalEvent::Input(printable('z')));
+    for split in 0..=6 {
+        let mut bounded = InputDecoder::new();
+        assert!(feed(&mut bounded, b"\x1b[200~")?.is_empty());
+        assert_eq!(
+            feed(&mut bounded, &vec![b'a'; MAX_PENDING_INPUT / 2 + 1])?,
+            vec![LocalEvent::Rejected(InputRejection::PasteTooLarge)]
+        );
+        assert!(
+            feed(&mut bounded, b"\x1e.\x1eq\x1e?\x1e\x1a")?.is_empty(),
+            "discarded paste must not execute management keys"
+        );
+        assert!(feed(&mut bounded, &b"\x1b[201~"[..split])?.is_empty());
+        assert!(feed(&mut bounded, &b"\x1b[201~"[split..])?.is_empty());
+        let mut escape = EscapeSequence::new();
+        let mut local = Vec::new();
+        for event in feed(&mut bounded, b"\x1e?\x1e.")? {
+            if let LocalEvent::Input(event) = event {
+                local.push(escape.feed(event));
+            }
+        }
+        assert_eq!(
+            local,
+            vec![
+                EscapeAction::Send(Vec::new()),
+                EscapeAction::Help,
+                EscapeAction::Send(Vec::new()),
+                EscapeAction::Detach
+            ]
+        );
+    }
+    let mut interrupted = InputDecoder::new();
+    assert!(feed(&mut interrupted, b"\x1b[200~held")?.is_empty());
+    assert!(interrupted.discard_active_paste());
+    assert!(!interrupted.discard_active_paste());
+    assert!(feed(&mut interrupted, b"tail\x1e.\x1b[201~")?.is_empty());
+    assert!(
+        interrupted
+            .feed(b"\x1b[200~\x1eq\x1b[201~", PasteAdmission::Discard)?
+            .is_empty()
+    );
+    assert_eq!(
+        feed(&mut interrupted, b"\x1b[200~\xff\x1b[201~")?,
+        vec![LocalEvent::Rejected(InputRejection::InvalidPaste)]
+    );
+    assert_eq!(
+        feed(&mut interrupted, b"\x1b[200~\x1e.\x1b[201~")?,
+        vec![LocalEvent::Input(InputEvent::Paste("\x1e.".into()))]
+    );
+    let mut fragmented = InputDecoder::new();
+    assert!(feed(&mut fragmented, &[0xf0, 0x9f])?.is_empty());
+    let mut completing = vec![0x98, 0x83];
+    completing.extend_from_slice(&[b'a'; MAX_INPUT_CHUNK - 2]);
+    assert_eq!(
+        fragmented.feed(&completing, PasteAdmission::Capture)?.len(),
+        MAX_INPUT_CHUNK - 1
     );
     println!(
         "input: kitty phases/alternates/text, legacy keys, fragmented UTF-8/paste, mouse/focus, clipboard and bounds verified"
@@ -929,8 +1016,7 @@ fn verify_lifecycle() -> Result<()> {
 
 fn escape_actions(bytes: &[u8]) -> Result<(Vec<InputEvent>, Vec<EscapeAction>)> {
     let mut decoder = InputDecoder::new();
-    let events: Vec<_> = decoder
-        .feed(bytes)?
+    let events: Vec<_> = feed(&mut decoder, bytes)?
         .into_iter()
         .map(|event| {
             let LocalEvent::Input(event) = event else {
@@ -1075,7 +1161,7 @@ fn verify_legacy_roundtrip() -> Result<()> {
         model.advance(mode)?;
         let mut decoder = InputDecoder::new();
         let mut encoded = Vec::new();
-        for event in decoder.feed(b"\n\x08\x1b[M !!\x1b[M#!!")? {
+        for event in feed(&mut decoder, b"\n\x08\x1b[M !!\x1b[M#!!")? {
             if let LocalEvent::Input(event) = event {
                 encoded.extend(model.encode_input(&event)?);
             }

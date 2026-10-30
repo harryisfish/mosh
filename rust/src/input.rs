@@ -11,6 +11,21 @@ use crate::model::{InputEvent, Key, KeyCode, KeyPhase, MAX_PENDING_INPUT, Mouse,
 const ESC: u8 = 0x1b;
 const MAX_SEQUENCE: usize = 4096;
 const MAX_CLIPBOARD: usize = MAX_PENDING_INPUT / 2;
+pub const MAX_INPUT_CHUNK: usize = 256;
+const MAX_CAPTURED_EVENTS: usize = MAX_INPUT_CHUNK + 1;
+const MAX_CAPTURED_BYTES: usize = MAX_CLIPBOARD + MAX_SEQUENCE + 32 * MAX_INPUT_CHUNK;
+
+#[derive(Clone, Copy)]
+pub enum PasteAdmission {
+    Capture,
+    Discard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputRejection {
+    PasteTooLarge,
+    InvalidPaste,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalEvent {
@@ -19,6 +34,7 @@ pub enum LocalEvent {
         selection: String,
         data: Option<String>,
     },
+    Rejected(InputRejection),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,7 +199,12 @@ fn is_modifier_key(code: &KeyCode) -> bool {
 #[derive(Default)]
 pub struct InputDecoder {
     pending: Vec<u8>,
-    paste: Option<Vec<u8>>,
+    paste: Option<PasteState>,
+}
+
+enum PasteState {
+    Collecting(Vec<u8>),
+    Discarding,
 }
 
 impl InputDecoder {
@@ -191,17 +212,47 @@ impl InputDecoder {
         Self::default()
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<LocalEvent>> {
+    pub fn feed(&mut self, bytes: &[u8], admission: PasteAdmission) -> Result<Vec<LocalEvent>> {
+        ensure!(
+            bytes.len() <= MAX_INPUT_CHUNK,
+            "local input chunk exceeds limit"
+        );
+        ensure!(
+            self.pending.len() + bytes.len() <= MAX_PENDING_INPUT,
+            "local input buffer exceeds limit"
+        );
         let mut events = Vec::new();
-        for chunk in bytes.chunks(4096) {
-            ensure!(
-                self.pending.len() + chunk.len() <= MAX_PENDING_INPUT,
-                "local input buffer exceeds limit"
-            );
-            self.pending.extend_from_slice(chunk);
-            self.decode(&mut events)?;
-        }
+        self.pending.extend_from_slice(bytes);
+        self.decode(&mut events, admission)?;
+        assert!(events.len() <= MAX_CAPTURED_EVENTS);
+        let payload_bytes: usize = events
+            .iter()
+            .map(|event| match event {
+                LocalEvent::Input(InputEvent::Paste(text)) => text.len(),
+                LocalEvent::Input(InputEvent::Key(key)) => {
+                    key.text.as_ref().map_or(0, String::len)
+                        + match &key.code {
+                            KeyCode::Named(name) => name.len(),
+                            _ => 0,
+                        }
+                }
+                LocalEvent::Clipboard { selection, data } => {
+                    selection.len() + data.as_ref().map_or(0, String::len)
+                }
+                _ => 0,
+            })
+            .sum();
+        assert!(payload_bytes <= MAX_CAPTURED_BYTES);
         Ok(events)
+    }
+
+    pub fn discard_active_paste(&mut self) -> bool {
+        if matches!(self.paste, Some(PasteState::Collecting(_))) {
+            self.paste = Some(PasteState::Discarding);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn flush_escape(&mut self) -> Vec<LocalEvent> {
@@ -217,30 +268,33 @@ impl InputDecoder {
         self.paste.is_none() && self.pending == [ESC]
     }
 
-    fn decode(&mut self, events: &mut Vec<LocalEvent>) -> Result<()> {
+    fn decode(&mut self, events: &mut Vec<LocalEvent>, admission: PasteAdmission) -> Result<()> {
         loop {
             if let Some(paste) = self.paste.as_mut() {
-                if let Some(end) = find(&self.pending, b"\x1b[201~") {
-                    ensure!(
-                        paste.len() + end <= MAX_CLIPBOARD,
-                        "paste exceeds input limit"
-                    );
-                    paste.extend_from_slice(&self.pending[..end]);
-                    self.pending.drain(..end + 6);
-                    let paste = self.paste.take().unwrap();
-                    let text = String::from_utf8(paste).context("paste is not UTF-8")?;
-                    events.push(LocalEvent::Input(InputEvent::Paste(text)));
-                    continue;
+                let end = find(&self.pending, b"\x1b[201~");
+                let take = end.unwrap_or_else(|| {
+                    self.pending.len() - suffix_prefix_len(&self.pending, b"\x1b[201~")
+                });
+                if let PasteState::Collecting(payload) = paste {
+                    if payload.len() + take > MAX_CLIPBOARD {
+                        *paste = PasteState::Discarding;
+                        events.push(LocalEvent::Rejected(InputRejection::PasteTooLarge));
+                    } else {
+                        payload.extend_from_slice(&self.pending[..take]);
+                    }
                 }
-                let keep = suffix_prefix_len(&self.pending, b"\x1b[201~");
-                let take = self.pending.len() - keep;
-                ensure!(
-                    paste.len() + take <= MAX_CLIPBOARD,
-                    "paste exceeds input limit"
-                );
-                paste.extend_from_slice(&self.pending[..take]);
-                self.pending.drain(..take);
-                break;
+                self.pending
+                    .drain(..take + if end.is_some() { 6 } else { 0 });
+                if end.is_none() {
+                    break;
+                }
+                if let Some(PasteState::Collecting(payload)) = self.paste.take() {
+                    events.push(match String::from_utf8(payload) {
+                        Ok(text) => LocalEvent::Input(InputEvent::Paste(text)),
+                        Err(_) => LocalEvent::Rejected(InputRejection::InvalidPaste),
+                    });
+                }
+                continue;
             }
             let Some(&byte) = self.pending.first() else {
                 break;
@@ -297,7 +351,10 @@ impl InputDecoder {
                     let final_byte = self.pending[end];
                     if body == "200" && final_byte == b'~' {
                         self.pending.drain(..end + 1);
-                        self.paste = Some(Vec::new());
+                        self.paste = Some(match admission {
+                            PasteAdmission::Capture => PasteState::Collecting(Vec::new()),
+                            PasteAdmission::Discard => PasteState::Discarding,
+                        });
                         continue;
                     }
                     let event = decode_csi(body, final_byte)?;
@@ -904,6 +961,16 @@ impl LocalTerminal {
         };
         size.validate()?;
         Ok(size)
+    }
+
+    pub fn finish(mut self, notice: Option<&str>) -> Result<()> {
+        self.release()?;
+        if let Some(notice) = notice {
+            require_foreground()?;
+            self.tty.write_all(notice.as_bytes())?;
+            self.tty.flush()?;
+        }
+        Ok(())
     }
 }
 
