@@ -556,7 +556,7 @@ fn verify_terminal_boundaries() -> Result<()> {
             let original = screen.rows.clone();
             let mut displays = [Graphics::Kitty, Graphics::Sixel].map(|graphics| {
                 let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
-                display.set_epoch(1);
+                display.set_epoch(1).expect("set display epoch");
                 display
             });
             for display in &mut displays {
@@ -838,7 +838,7 @@ fn verify_projection_regressions() -> Result<()> {
         );
         let frame = state::frame(1, 1, 0, &screen, None)?;
         let mut display = Display::new(Vec::new(), Graphics::None, PredictionPolicy::Never);
-        display.set_epoch(1);
+        display.set_epoch(1)?;
         display.install(&frame, &screen.resources)?;
         Ok(screen)
     }
@@ -927,7 +927,7 @@ fn verify_projection_regressions() -> Result<()> {
     assert!(tiles.iter().all(|tile| tile.source == [0, 0, 1, 1]));
     for graphics in [Graphics::Kitty, Graphics::Sixel] {
         let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
-        display.set_epoch(1);
+        display.set_epoch(1)?;
         display.install(&state::frame(1, 1, 0, &screen, None)?, &screen.resources)?;
     }
 

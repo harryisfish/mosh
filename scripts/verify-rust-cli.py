@@ -41,6 +41,18 @@ def exact(data, timeout=5):
 def remote_fixture(mode, state):
     tty.setraw(0)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "prediction":
+        os.write(1, b"\x1b[2J\x1b[HPREDICTION_READY\x1b[3;1H")
+        for glyph in b"abc":
+            exact(bytes([glyph]))
+            os.write(1, bytes([glyph]))
+        exact(b"d")
+        exact(bytes.fromhex(sys.argv[4]))
+        exact(b"S")
+        Path(state + ".hidden").touch()
+        exact(b"\r")
+        os.write(1, b"\r\nPREDICTION_DONE")
+        return 0
     if mode == "wait":
         os.write(1, b"\x1b[2J\x1b[HWAIT_READY")
         while os.read(0, 1):
@@ -517,6 +529,7 @@ def verify(bin_dir, network, diagnostics=False, evidence_dir=None):
     server = str(bin_dir / "mosh-rs-server")
     diagnostic_args = ["--diagnostics"] if diagnostics else []
     with tempfile.TemporaryDirectory(prefix="mosh-rs-cli-") as temporary:
+        verify_prediction(bin_dir, temporary)
         state = str(Path(temporary) / "session.json")
         prefix = [client, *diagnostic_args, "--local", "--server", server, "--graphics", "kitty", "--clipboard-read", "--"]
         process = TerminalProcess(prefix + [sys.executable, script, "--remote", "modern", state,
@@ -635,6 +648,43 @@ def verify(bin_dir, network, diagnostics=False, evidence_dir=None):
         if diagnostics:
             verify_diagnostics(client, server, script, temporary)
             check_diagnostics(evidence_dir)
+
+
+def verify_prediction(bin_dir, temporary):
+    script = str(Path(__file__).resolve())
+    for control in [b"\r", b"\x1b", b"\x1b[A"]:
+        state = str(Path(temporary) / ("prediction-" + control.hex() + ".json"))
+        process = TerminalProcess([str(bin_dir / "mosh-rs"), "--local", "--server",
+                                   str(bin_dir / "mosh-rs-server"), "--predict", "adaptive", "--",
+                                   sys.executable, script, "--remote", "prediction", state, control.hex()])
+        try:
+            process.until(b"PREDICTION_READY")
+            for index, glyph in enumerate(b"abc", 2):
+                process.send(bytes([glyph]))
+                process.until(f"\x1b[3;{index}H".encode())
+            start = len(process.output)
+            process.send(b"d")
+            process.until(b"\x1b[0;4md", start=start)
+            start = len(process.output)
+            process.send(control)
+            if control == b"\x1b":
+                deadline = time.monotonic() + 0.2
+                while time.monotonic() < deadline:
+                    process.pump(0.01)
+            process.send(b"S")
+            deadline = time.monotonic() + 5
+            while not Path(state + ".hidden").exists():
+                process.pump(0.01)
+                assert time.monotonic() < deadline, "raw/noecho fixture did not receive hidden input"
+            assert b"\x1b[0;4mS" not in process.output[start:], "hidden input reused learned prediction confidence"
+            print(f"CLI raw/noecho control={control.hex()} hidden predictions=0 tty_bytes={len(process.output)}", flush=True)
+            process.send(b"\r")
+            process.until(b"PREDICTION_DONE")
+            process.finish(0)
+            assert b"\x1b[0;4mS" not in process.output[start:], "hidden prediction appeared in drained terminal output"
+        finally:
+            process.close()
+            cleanup(state)
 
 
 if __name__ == "__main__":

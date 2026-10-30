@@ -379,7 +379,7 @@ fn verify_render(graphics: Graphics) -> Result<()> {
     });
     first.rows[2].row.cells.push(tile);
     let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Adaptive);
-    display.set_epoch(1);
+    display.set_epoch(1)?;
     assert!(display.install(&first, &resources)?);
     assert_eq!(display.screen().unwrap().rows[0], first.rows[0].row);
     display.predict(1, &printable('X'))?;
@@ -532,7 +532,7 @@ impl Write for Capture {
 fn verify_prediction_modes() -> Result<()> {
     let capture = Capture::default();
     let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
-    display.set_epoch(1);
+    display.set_epoch(1)?;
     let mut current = frame(1, None, Vec::new());
     current.prediction.echo_enabled = false;
     current.prediction.alternate_screen = true;
@@ -597,6 +597,270 @@ fn verify_prediction_modes() -> Result<()> {
     Ok(())
 }
 
+fn learned_prediction() -> Result<(Display<Capture>, Capture, Frame)> {
+    let capture = Capture::default();
+    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
+    display.set_epoch(1)?;
+    let mut current = frame(1, None, Vec::new());
+    current.prediction.echo_enabled = false;
+    assert!(display.install(&current, &BTreeMap::new())?);
+    for (index, glyph) in ['a', 'b', 'c'].into_iter().enumerate() {
+        display.predict(index as u64 + 1, &printable(glyph))?;
+        current.base = Some(current.revision);
+        current.revision += 1;
+        current.echo_through = index as u64 + 1;
+        current.rows[1]
+            .row
+            .cells
+            .push(cell(8 + index as u16, &glyph.to_string(), 1));
+        current.cursor.x += 1;
+        assert!(display.install(&current, &BTreeMap::new())?);
+    }
+    let before = capture.0.lock().unwrap().len();
+    display.predict(4, &printable('d'))?;
+    assert!(
+        capture.0.lock().unwrap().len() > before,
+        "three real echoes must enable prediction"
+    );
+    Ok((display, capture, current))
+}
+
+fn verify_prediction_boundaries() -> Result<()> {
+    let capture = Capture::default();
+    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Adaptive);
+    display.set_epoch(1)?;
+    let mut current = frame(1, None, Vec::new());
+    current.prediction.echo_enabled = false;
+    current.rows[1].row.cells.push(cell(8, "a", 1));
+    assert!(display.install(&current, &BTreeMap::new())?);
+    for seq in 1..=4 {
+        let before = capture.0.lock().unwrap().len();
+        display.predict(seq, &printable('a'))?;
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            before,
+            "pre-existing glyphs must not teach echo"
+        );
+        current.base = Some(current.revision);
+        current.revision += 1;
+        current.echo_through = seq;
+        current.rows[1].row.cells[0].style.flags ^= 1;
+        assert!(display.install(&current, &BTreeMap::new())?);
+    }
+    display.predict(5, &printable('a'))?;
+    display.predict(6, &printable('b'))?;
+    current.base = Some(current.revision);
+    current.revision += 1;
+    current.echo_through = 6;
+    current.rows[1].row.cells.push(cell(9, "b", 1));
+    current.cursor.x = 10;
+    assert!(display.install(&current, &BTreeMap::new())?);
+    for (seq, glyph) in [(7, 'c'), (8, 'd')] {
+        let before = capture.0.lock().unwrap().len();
+        display.predict(seq, &printable(glyph))?;
+        assert_eq!(capture.0.lock().unwrap().len(), before);
+        current.base = Some(current.revision);
+        current.revision += 1;
+        current.echo_through = seq;
+        current.rows[1]
+            .row
+            .cells
+            .push(cell(current.cursor.x, &glyph.to_string(), 1));
+        current.cursor.x += 1;
+        assert!(display.install(&current, &BTreeMap::new())?);
+    }
+    let before = capture.0.lock().unwrap().len();
+    display.predict(9, &printable('e'))?;
+    assert!(
+        capture.0.lock().unwrap().len() > before,
+        "a pre-existing match must preserve later learnable tokens"
+    );
+
+    let mut ctrl = printable('x');
+    if let InputEvent::Key(key) = &mut ctrl {
+        key.modifiers = 4;
+    }
+    let controls = ["Enter", "Escape", "Up", "Down"].map(|name| {
+        InputEvent::Key(Key {
+            code: KeyCode::Named(name.into()),
+            modifiers: 0,
+            phase: KeyPhase::Press,
+            shifted: None,
+            base: None,
+            text: None,
+        })
+    });
+    for control in
+        controls
+            .into_iter()
+            .chain([ctrl, printable('\n'), InputEvent::Paste("secret".into())])
+    {
+        let (mut display, capture, _) = learned_prediction()?;
+        display.predict(5, &control)?;
+        let mut term = terminal();
+        term.advance_bytes(&*capture.0.lock().unwrap());
+        assert_eq!(
+            visible(&term)[1]
+                .visible_cells()
+                .find(|c| c.cell_index() == 11)
+                .unwrap()
+                .str(),
+            " ",
+            "control must remove visible overlay"
+        );
+        let before = capture.0.lock().unwrap().len();
+        display.predict(6, &printable('S'))?;
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            before,
+            "control must discard learned no-echo confidence: {control:?}"
+        );
+    }
+    let (mut display, capture, mut current) = learned_prediction()?;
+    display.set_epoch(2)?;
+    let mut term = terminal();
+    term.advance_bytes(&*capture.0.lock().unwrap());
+    assert_eq!(
+        visible(&term)[1]
+            .visible_cells()
+            .find(|c| c.cell_index() == 11)
+            .unwrap()
+            .str(),
+        " ",
+        "session epoch must roll back visible guesses immediately"
+    );
+    current.epoch = 2;
+    current.base = None;
+    current.revision += 1;
+    current.echo_through = 4;
+    assert!(display.install(&current, &BTreeMap::new())?);
+    let before = capture.0.lock().unwrap().len();
+    display.predict(5, &printable('S'))?;
+    assert_eq!(
+        capture.0.lock().unwrap().len(),
+        before,
+        "new session epoch cannot reuse old learning"
+    );
+
+    let capture = Capture::default();
+    let mut display = Display::new(capture.clone(), Graphics::None, PredictionPolicy::Never);
+    display.set_epoch(1)?;
+    assert!(display.install(&frame(1, None, Vec::new()), &BTreeMap::new())?);
+    let before = capture.0.lock().unwrap().len();
+    display.predict(1, &printable('S'))?;
+    assert_eq!(
+        capture.0.lock().unwrap().len(),
+        before,
+        "never policy must suppress even PTY echo predictions"
+    );
+    println!(
+        "prediction: pre-existing glyphs, real glyph transitions, control rollback, session epoch and never policy verified"
+    );
+    Ok(())
+}
+
+fn verify_prediction_epoch_context() -> Result<()> {
+    for policy in [PredictionPolicy::Adaptive, PredictionPolicy::Conservative] {
+        let capture = Capture::default();
+        let mut display = Display::new(capture.clone(), Graphics::None, policy);
+        display.set_epoch(1)?;
+        let mut current = frame(1, None, Vec::new());
+        assert!(display.install(&current, &BTreeMap::new())?);
+        display.predict(1, &printable('P'))?;
+        display.set_epoch(2)?;
+        let before = capture.0.lock().unwrap().len();
+        display.predict(2, &printable('S'))?;
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            before,
+            "cached ECHO must not expose input before the new epoch's first frame: {policy:?}"
+        );
+        current.epoch = 2;
+        current.revision += 1;
+        current.prediction.generation += 1;
+        current.echo_through = 2;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        let before = capture.0.lock().unwrap().len();
+        display.predict(3, &printable('N'))?;
+        assert!(
+            capture.0.lock().unwrap()[before..]
+                .windows(b"\x1b[0;4mN".len())
+                .any(|bytes| bytes == b"\x1b[0;4mN"),
+            "a confirmed ECHO frame must restore prediction: {policy:?}"
+        );
+
+        let capture = Capture::default();
+        let mut display = Display::new(capture.clone(), Graphics::None, policy);
+        display.set_epoch(1)?;
+        let mut current = frame(1, None, Vec::new());
+        current.prediction.echo_enabled = false;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        display.set_epoch(2)?;
+        for (seq, glyph) in [(1, 'a'), (2, 'b'), (3, 'c')] {
+            display.predict(seq, &printable(glyph))?;
+        }
+        current.epoch = 2;
+        current.revision += 1;
+        current.prediction.generation += 1;
+        current.echo_through = 3;
+        current.rows[1].row.cells = ['a', 'b', 'c']
+            .into_iter()
+            .enumerate()
+            .map(|(index, glyph)| cell(8 + index as u16, &glyph.to_string(), 1))
+            .collect();
+        current.cursor.x = 11;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        let before = capture.0.lock().unwrap().len();
+        display.predict(4, &printable('S'))?;
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            before,
+            "input before the first frame must not teach a new remote stamp: {policy:?}"
+        );
+        display.predict(5, &printable('\n'))?;
+        for (seq, glyph) in [(6, 'd'), (7, 'e'), (8, 'f')] {
+            display.predict(seq, &printable(glyph))?;
+            current.base = Some(current.revision);
+            current.revision += 1;
+            current.echo_through = seq;
+            current.rows[1]
+                .row
+                .cells
+                .push(cell(current.cursor.x, &glyph.to_string(), 1));
+            current.cursor.x += 1;
+            assert!(display.install(&current, &BTreeMap::new())?);
+        }
+        let before = capture.0.lock().unwrap().len();
+        display.predict(9, &printable('N'))?;
+        if policy == PredictionPolicy::Adaptive {
+            assert!(
+                capture.0.lock().unwrap()[before..]
+                    .windows(b"\x1b[0;4mN".len())
+                    .any(|bytes| bytes == b"\x1b[0;4mN"),
+                "the confirmed new epoch must still learn real noecho replies"
+            );
+        } else {
+            assert_eq!(capture.0.lock().unwrap().len(), before);
+        }
+        current.base = Some(current.revision);
+        current.revision += 1;
+        current.prediction.echo_enabled = true;
+        assert!(display.install(&current, &BTreeMap::new())?);
+        let before = capture.0.lock().unwrap().len();
+        display.predict(10, &printable('T'))?;
+        assert!(
+            capture.0.lock().unwrap()[before..]
+                .windows(b"\x1b[0;4mT".len())
+                .any(|bytes| bytes == b"\x1b[0;4mT"),
+            "prediction must resume after a confirmed ECHO transition: {policy:?}"
+        );
+    }
+    println!(
+        "prediction: attachment context gates cached ECHO and learning without disabling confirmed prediction"
+    );
+    Ok(())
+}
+
 fn verify_lifecycle() -> Result<()> {
     let rgba = vec![0, 0, 255, 255];
     let digest = resource_digest(1, 1, &rgba);
@@ -621,7 +885,7 @@ fn verify_lifecycle() -> Result<()> {
     });
     initial.rows[0].row.cells.push(tile);
     let mut display = Display::new(Vec::new(), Graphics::Kitty, PredictionPolicy::Never);
-    display.set_epoch(1);
+    display.set_epoch(1)?;
     assert!(display.install(&initial, &resources)?);
     display.write_status("reconnecting")?;
     display.write_status("")?;
@@ -641,7 +905,7 @@ fn verify_lifecycle() -> Result<()> {
     assert!(!display.install(&mismatch, &BTreeMap::new())?);
     assert!(display.needs_checkpoint());
     display.set_effect_floor(4);
-    display.set_epoch(2);
+    display.set_epoch(2)?;
     assert_eq!(display.effects_applied(), 4);
     assert_eq!(display.epoch(), 2);
     let mut checkpoint = frame(4, None, Vec::new());
@@ -792,6 +1056,8 @@ fn main() -> Result<()> {
     verify_render(Graphics::Kitty)?;
     verify_render(Graphics::Sixel)?;
     verify_prediction_modes()?;
+    verify_prediction_boundaries()?;
+    verify_prediction_epoch_context()?;
     verify_lifecycle()?;
     verify_escape_sequences()?;
     Ok(())
@@ -835,7 +1101,7 @@ fn verify_image_layers() -> Result<()> {
     transport::validate_frame(&frame)?;
     for graphics in [Graphics::None, Graphics::Kitty] {
         let mut display = Display::new(Vec::new(), graphics, PredictionPolicy::Never);
-        display.set_epoch(1);
+        display.set_epoch(1)?;
         assert!(display.install(&frame, &screen.resources)?);
         assert_eq!(
             display

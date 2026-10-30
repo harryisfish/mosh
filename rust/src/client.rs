@@ -513,7 +513,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                     pending.retain(|seq, (_, bytes)| {
                                         if *seq <= committed { pending_bytes -= *bytes; false } else { true }
                                     });
-                                    display.set_epoch(new_link.epoch);
+                                    display.set_epoch(new_link.epoch)?;
                                     display.set_effect_floor(new_link.effect_floor);
                                     effects.retain(|id, _| *id > new_link.effect_floor);
                                     let _ = new_link.start.send(true);
