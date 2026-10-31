@@ -1,12 +1,20 @@
-name: rust
+name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  quality:
     strategy:
       fail-fast: false
       matrix:
@@ -20,9 +28,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -p mosh-rs -- --check
       - run: cargo clippy -p mosh-rs --all-targets --locked -- -D warnings
+      - run: cargo test -p mosh-rs --locked
       - run: cargo build -p mosh-rs --bins --examples --locked
       - run: target/debug/examples/verify_core
       - run: target/debug/examples/verify_transport
       - run: target/debug/examples/verify_display
       - run: target/debug/examples/verify_session
       - run: python3 scripts/verify-rust-cli.py --network
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
