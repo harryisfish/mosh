@@ -11,6 +11,7 @@ from pathlib import Path
 import pty
 import random
 import re
+import resource
 import shlex
 import select
 import signal
@@ -22,6 +23,8 @@ import tempfile
 import termios
 import time
 import tty
+import platform
+import shutil
 
 
 RAW_NETWORK_INPUT = b"impaired-" + b"x" * 8192 + b"\r"
@@ -29,6 +32,7 @@ ATOMIC_SECOND_PASTE_BYTES = 128 * 1024 - 24 - 98
 DIAGNOSTIC_FILES = set()
 GRANT_BEGIN = b"\x1eMOSH-RS-GRANT\n"
 GRANT_END = b"\x1eMOSH-RS-GRANT-END\n"
+RELAY_SEED = 12345
 SSH_LITERAL_ARG = "literal ' quotes \" $HOME $(printf unsafe) ; &\nsecond line"
 LEGACY_SHIFT_KEYS = [
     ("LEFT", b"\x1b[1;2D|END!", b"\x1b[d|END!"),
@@ -298,6 +302,48 @@ def remote_fixture(mode, state):
         exact(b"resume-once\r", timeout=60)
         os.write(1, b"\r\nNETWORK_ONCE_OK\r\n")
         return 9
+    if mode == "baseline":
+        os.write(1, b"\x1b[2J\x1b[HBASELINE_READY\r\n")
+        received = bytearray()
+        while True:
+            if not select.select([0], [], [], 0.05)[0]:
+                continue
+            chunk = os.read(0, 4096)
+            assert chunk, "baseline fixture input ended early"
+            received.extend(chunk)
+            while b"\r" in received:
+                line, _, tail = received.partition(b"\r")
+                received[:] = tail
+                if line == b"baseline":
+                    os.write(1, b"BASELINE_BASELINE_OK\r\n")
+                elif line == b"frames":
+                    for index in range(8):
+                        frame = f"BASELINE_FRAME_{index:04d} ".encode() + b"F" * 256
+                        os.write(1, b"\x1b[4;1H" + frame + b"\r\n"
+                                 + b"\x1b]2;BASELINE_FRAME_" + f"{index:04d}".encode() + b"\x1b\\")
+                        Path(state + f".frame-{index}").touch()
+                        if index != 7:
+                            exact(b"next\r", timeout=15)
+                    os.write(1, b"BASELINE_FRAMES_DONE\r\n\x1b]2;BASELINE_FRAMES_DONE\x1b\\")
+                    Path(state + ".frames-done").touch()
+                    image = b"BASELINE_RESOURCE_CHUNK_" + b"R" * 512 + b"\r\n"
+                    Path(state + ".resource-start").write_text(f"{time.monotonic():.9f}")
+                    for index in range(2):
+                        os.write(1, b"\x1b[6;1HBASELINE_RESOURCE_" + str(index).encode() + b"\r\n")
+                        os.write(1, image)
+                        Path(state + f".resource-{index}").touch()
+                        time.sleep(0.05)
+                    os.write(1, b"BASELINE_RESOURCE_DONE\r\n\x1b]2;BASELINE_RESOURCE_DONE\x1b\\")
+                    Path(state + ".resource-done").write_text(f"{time.monotonic():.9f}")
+                elif line == b"one-way-up":
+                    os.write(1, b"BASELINE_ONE_WAY_UP_OK\r\n")
+                elif line == b"one-way-down":
+                    os.write(1, b"BASELINE_ONE_WAY_DOWN_OK\r\n")
+                elif line == b"mtu":
+                    os.write(1, b"BASELINE_MTU_OK\r\n")
+                elif line == b"finish":
+                    os.write(1, b"BASELINE_DONE\r\n")
+                    return 9
     if mode == "liveness":
         os.write(1, b"\x1b[2J\x1b[HLIVENESS_READY\r\n")
         received = bytearray()
@@ -415,17 +461,20 @@ def proxy_bootstrap(server, state):
         for fd in (0, 1, 2):
             os.dup2(null, fd)
         peer = None
-        rng = random.Random(12345)
+        rng = random.Random(RELAY_SEED)
         queue = []
         queued_bytes = 0
         queued_packets = [0, 0]
         directional_bytes = [0, 0]
+        next_send = [0.0, 0.0]
         serial = 0
         last_forwarded = [0, 0]
         profile = {}
         refresh = 0
         stats = {"received": 0, "dropped": 0, "duplicated": 0, "forwarded": 0,
-                 "reordered": 0, "overflow": 0}
+                 "reordered": 0, "overflow": 0, "received_bytes": 0,
+                 "dropped_bytes": 0, "forwarded_bytes": 0, "mtu_dropped": 0,
+                 "seed": RELAY_SEED}
         directional_stats = dict(stats, peak_queued=0, peak_bytes=0)
         stats["up"] = directional_stats.copy()
         stats["down"] = directional_stats.copy()
@@ -460,9 +509,13 @@ def proxy_bootstrap(server, state):
                 directional_bytes[direction] -= len(packet)
                 if dropping(to_front):
                     count("dropped", to_front)
+                    stats["dropped_bytes"] += len(packet)
+                    stats["down" if to_front else "up"]["dropped_bytes"] += len(packet)
                     continue
                 (front if to_front else back).sendto(packet, target)
                 count("forwarded", to_front)
+                stats["forwarded_bytes"] += len(packet)
+                stats["down" if to_front else "up"]["forwarded_bytes"] += len(packet)
                 count("reordered", to_front, int(order < last_forwarded[direction]))
                 last_forwarded[direction] = max(order, last_forwarded[direction])
             for source in select.select([front, back], [], [], 0.01)[0]:
@@ -470,13 +523,25 @@ def proxy_bootstrap(server, state):
                 to_front = source is back
                 direction = int(to_front)
                 count("received", to_front)
+                stats["received_bytes"] += len(packet)
+                stats["down" if to_front else "up"]["received_bytes"] += len(packet)
                 if source is front:
                     peer = address
                 target = peer if source is back else destination
                 if target is None:
                     continue
+                mtu = profile.get("mtu")
+                if mtu is not None and len(packet) > mtu:
+                    count("dropped", to_front)
+                    stats["mtu_dropped"] += 1
+                    stats["dropped_bytes"] += len(packet)
+                    stats["down" if to_front else "up"]["dropped_bytes"] += len(packet)
+                    stats["down" if to_front else "up"]["mtu_dropped"] += 1
+                    continue
                 if dropping(to_front) or rng.random() < profile.get("loss", 0):
                     count("dropped", to_front)
+                    stats["dropped_bytes"] += len(packet)
+                    stats["down" if to_front else "up"]["dropped_bytes"] += len(packet)
                     continue
                 delay = max(0, profile.get("delay_ms", 0)
                             + rng.uniform(-profile.get("jitter_ms", 0), profile.get("jitter_ms", 0))) / 1000
@@ -484,9 +549,16 @@ def proxy_bootstrap(server, state):
                 for copy in range(1 + int(duplicate)):
                     if len(queue) >= 4096 or queued_bytes + len(packet) > 8 * 1024 * 1024:
                         count("overflow", to_front)
+                        stats["dropped_bytes"] += len(packet)
+                        stats["down" if to_front else "up"]["dropped_bytes"] += len(packet)
                         continue
                     serial += 1
-                    heapq.heappush(queue, (now + delay + copy * 0.007, serial,
+                    bandwidth = profile.get("bandwidth_bps", 0)
+                    rate_delay = 0
+                    if bandwidth:
+                        rate_delay = max(0, next_send[direction] - now)
+                        next_send[direction] = max(now, next_send[direction]) + len(packet) * 8 / bandwidth
+                    heapq.heappush(queue, (now + delay + rate_delay + copy * 0.007, serial,
                                            to_front, packet, target))
                     queued_bytes += len(packet)
                     queued_packets[direction] += 1
@@ -506,8 +578,15 @@ class TerminalProcess:
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 800, 480))
         self.saved = termios.tcgetattr(self.slave)
         self.output = bytearray()
+        self.input_bytes = 0
+        self.tty_bytes = 0
+        self.started_at = time.monotonic()
+        self.rusage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self.process_metrics = None
         self.closing = False
         self.diagnostic_files = set()
+        self.diagnostic_snapshot_dir = tempfile.TemporaryDirectory(prefix="mosh-rs-diagnostic-snapshots-")
+        self.diagnostic_snapshots = {}
         environment = dict(os.environ, TERM="xterm-kitty", COLORTERM="truecolor")
         environment.update(extra_env or {})
 
@@ -519,6 +598,7 @@ class TerminalProcess:
                                         stderr=self.slave, env=environment, preexec_fn=session)
 
     def send(self, data):
+        self.input_bytes += len(data)
         pending = memoryview(data)
         deadline = time.monotonic() + 30
         os.set_blocking(self.master, False)
@@ -542,10 +622,16 @@ class TerminalProcess:
                 data = os.read(self.master, 65536)
             except OSError:
                 data = b""
+            self.tty_bytes += len(data)
             self.output.extend(data)
             for match in re.finditer(rb"mosh-rs(?:-server)?: diagnostics: ([^\r\n]+)[\r\n]", self.output[-8192:]):
                 self.diagnostic_files.add(Path(os.fsdecode(match[1])))
             DIAGNOSTIC_FILES.update(self.diagnostic_files)
+            for path in self.diagnostic_files:
+                if path.exists():
+                    snapshot = Path(self.diagnostic_snapshot_dir.name) / (path.parent.name + "-" + path.name)
+                    shutil.copyfile(path, snapshot)
+                    self.diagnostic_snapshots[path] = snapshot
         if self.closing:
             self.output = self.output[-4096:]
         else:
@@ -560,6 +646,11 @@ class TerminalProcess:
             if time.monotonic() > deadline:
                 raise AssertionError(f"CLI timed out before {marker!r}: {bytes(self.output[-4000:])!r}")
 
+    def until_timed(self, marker, timeout=15, start=0):
+        started = time.monotonic()
+        self.until(marker, timeout=timeout, start=start)
+        return round((time.monotonic() - started) * 1000, 3)
+
     def finish(self, code, timeout=10):
         deadline = time.monotonic() + timeout
         while self.process.poll() is None:
@@ -571,6 +662,22 @@ class TerminalProcess:
         assert self.process.returncode == code, (self.process.returncode, bytes(self.output[-4000:]))
         assert termios.tcgetattr(self.master) == self.saved, "local termios was not restored"
         assert b"\x1b[?1049l" in self.output, "alternate screen was not restored"
+        self.process_metrics = self.metrics()
+
+    def metrics(self):
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return {
+            "pid": self.process.pid,
+            "returncode": self.process.returncode,
+            "wall_ms": round((time.monotonic() - self.started_at) * 1000, 3),
+            "user_cpu_ms": round((after.ru_utime - self.rusage_before.ru_utime) * 1000, 3),
+            "system_cpu_ms": round((after.ru_stime - self.rusage_before.ru_stime) * 1000, 3),
+            "max_rss_delta": max(0, after.ru_maxrss - self.rusage_before.ru_maxrss),
+            "max_rss_unit": "bytes" if sys.platform == "darwin" else "kilobytes",
+            "input_bytes": self.input_bytes,
+            "tty_bytes": self.tty_bytes,
+            "window": {"rows": 24, "cols": 80},
+        }
 
     def close(self):
         self.closing = True
@@ -586,6 +693,7 @@ class TerminalProcess:
                     self.pump()
         os.close(self.master)
         os.close(self.slave)
+        self.diagnostic_snapshot_dir.cleanup()
 
 
 def cleanup(state):
@@ -1727,6 +1835,251 @@ def check_diagnostics(evidence_dir):
     print(f"CLI diagnostics schema, privacy and file bounds passed for {len(DIAGNOSTIC_FILES)} files", flush=True)
 
 
+def summarize_diagnostics(paths):
+    records = read_diagnostics(paths)
+    stages = {}
+    summaries = []
+    transitions = []
+    for record in records:
+        if record.get("event") == "summary":
+            summaries.append(record)
+            for stage in record.get("stages", []):
+                key = f"{record['role']}:{stage['stage']}"
+                current = stages.setdefault(key, {"count": 0, "total_us": 0, "max_us": 0, "bytes": 0})
+                current["count"] += stage.get("count", 0)
+                current["total_us"] += stage.get("total_us", 0)
+                current["max_us"] = max(current["max_us"], stage.get("max_us", 0))
+                current["bytes"] += stage.get("bytes", 0)
+        elif record.get("event") == "transition":
+            transitions.append(record)
+    return {
+        "records": len(records),
+        "stages": stages,
+        "summary_count": len(summaries),
+        "transitions": len(transitions),
+        "roles": sorted({record.get("role") for record in records}),
+    }
+
+
+def verify_baseline(bin_dir, evidence_dir=None):
+    """Run a deterministic impairment matrix and save raw, comparable metrics."""
+    script = str(Path(__file__).resolve())
+    client, server = str(bin_dir / "mosh-rs"), str(bin_dir / "mosh-rs-server")
+    root = Path(__file__).resolve().parents[1]
+    if evidence_dir is None:
+        evidence_dir = Path(tempfile.mkdtemp(prefix="mosh-rs-baseline-"))
+    evidence_dir = evidence_dir.resolve()
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="mosh-rs-baseline-run-") as temporary:
+        state = str(Path(temporary) / "baseline.json")
+        wrapper = Path(temporary) / "baseline-bootstrap-proxy"
+        wrapper.write_text(
+            f"#!{sys.executable}\nimport runpy,sys\n"
+            f"sys.argv={[script, '--proxy', server, state, '--diagnostics']!r}\n"
+            f"runpy.run_path({script!r},run_name='__main__')\n"
+        )
+        wrapper.chmod(0o700)
+        process = TerminalProcess([
+            client, "--diagnostics", "--local", "--server", str(wrapper), "--predict", "never", "--",
+            sys.executable, script, "--remote", "baseline", state,
+        ])
+        cases = []
+
+        def set_profile(profile):
+            updated = Path(state + ".profile.new")
+            updated.write_text(json.dumps(profile, sort_keys=True))
+            updated.replace(state + ".profile")
+            deadline = time.monotonic() + 5
+            while True:
+                process.pump(0.01)
+                if Path(state + ".stats").exists():
+                    stats = json.loads(Path(state + ".stats").read_text())
+                    if stats["profile"] == profile:
+                        return stats
+                assert process.process.poll() is None, bytes(process.output[-4000:])
+                assert time.monotonic() < deadline, "baseline relay did not install profile"
+
+        def pump_for(duration):
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline:
+                process.pump(min(0.05, max(0, deadline - time.monotonic())))
+                assert process.process.poll() is None, bytes(process.output[-4000:])
+
+        def wait_for_file(path, timeout=30):
+            started = time.monotonic()
+            deadline = started + timeout
+            while not Path(path).exists():
+                process.pump(0.02)
+                assert process.process.poll() is None, bytes(process.output[-4000:])
+                assert time.monotonic() < deadline, f"baseline fixture did not create {path}"
+            return round((time.monotonic() - started) * 1000, 3)
+
+        def record(name, profile, input_bytes, marker, timeout=15, start=0, extra=None):
+            before_input = process.input_bytes
+            before_tty = process.tty_bytes
+            started = time.monotonic()
+            set_profile(profile)
+            process.send(input_bytes)
+            latency = process.until_timed(marker, timeout=timeout, start=start)
+            facts = {
+                "name": name,
+                "profile": profile,
+                "input_bytes": process.input_bytes - before_input,
+                "tty_bytes": process.tty_bytes - before_tty,
+                "screen_age_ms": latency,
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+            }
+            if extra:
+                facts.update(extra)
+            cases.append(facts)
+            return facts
+
+        try:
+            process.until(b"BASELINE_READY")
+            set_profile({})
+            original_processes = json.loads(Path(state).read_text())
+            record("healthy", {}, b"baseline\r", b"BASELINE_BASELINE_OK")
+            before_input = process.input_bytes
+            before_tty = process.tty_bytes
+            profile = {"bandwidth_bps": 128_000, "delay_ms": 20}
+            set_profile(profile)
+            process.send(b"frames\r")
+            frame_started = time.monotonic()
+            for index in range(8):
+                wait_for_file(state + f".frame-{index}")
+                process.until(f"BASELINE_FRAME_{index:04d}".encode(), timeout=30)
+                if index != 7:
+                    process.send(b"next\r")
+            wait_for_file(state + ".frames-done")
+            process.until(b"BASELINE_FRAMES_DONE", timeout=30)
+            frame_latency = round((time.monotonic() - frame_started) * 1000, 3)
+            frame_tty_bytes = process.tty_bytes - before_tty
+            wait_for_file(state + ".resource-start")
+            wait_for_file(state + ".resource-done")
+            resource_started_at = float(Path(state + ".resource-start").read_text())
+            resource_fixture_duration = round(
+                (float(Path(state + ".resource-done").read_text())
+                 - resource_started_at) * 1000,
+                3,
+            )
+            process.until(b"BASELINE_RESOURCE_DONE", timeout=30)
+            resource_screen_age = round((time.monotonic() - resource_started_at) * 1000, 3)
+            cases.extend([
+                {
+                    "name": "bandwidth-similar-frames",
+                    "profile": profile,
+                    "input_bytes": process.input_bytes - before_input,
+                    "tty_bytes": frame_tty_bytes,
+                    "screen_age_ms": frame_latency,
+                },
+                {
+                    "name": "slow-resources",
+                    "profile": profile,
+                    "input_bytes": 0,
+                    "tty_bytes": process.tty_bytes - before_tty - frame_tty_bytes,
+                    "screen_age_ms": resource_screen_age,
+                    "fixture_duration_ms": resource_fixture_duration,
+                },
+            ])
+
+            start = len(process.output)
+            before = process.input_bytes
+            before_tty = process.tty_bytes
+            set_profile({"drop_up": True})
+            process.send(b"one-way-up\r")
+            pump_for(1.0)
+            assert b"BASELINE_ONE_WAY_UP_OK" not in process.output[start:]
+            restored = time.monotonic()
+            after = set_profile({})
+            recovery = process.until_timed(b"BASELINE_ONE_WAY_UP_OK", timeout=10, start=start)
+            cases.append({
+                "name": "one-way-up",
+                "profile": {"drop_up": True},
+                "input_bytes": process.input_bytes - before,
+                "tty_bytes": process.tty_bytes - before_tty,
+                "screen_age_ms": recovery,
+                "recovery_ms": round((time.monotonic() - restored) * 1000, 3),
+                "relay_after": after,
+            })
+
+            start = len(process.output)
+            before = process.input_bytes
+            before_tty = process.tty_bytes
+            set_profile({"drop_down": True})
+            process.send(b"one-way-down\r")
+            pump_for(1.0)
+            assert b"BASELINE_ONE_WAY_DOWN_OK" not in process.output[start:]
+            restored = time.monotonic()
+            after = set_profile({})
+            recovery = process.until_timed(b"BASELINE_ONE_WAY_DOWN_OK", timeout=10, start=start)
+            cases.append({
+                "name": "one-way-down",
+                "profile": {"drop_down": True},
+                "input_bytes": process.input_bytes - before,
+                "tty_bytes": process.tty_bytes - before_tty,
+                "screen_age_ms": recovery,
+                "recovery_ms": round((time.monotonic() - restored) * 1000, 3),
+                "relay_after": after,
+            })
+
+            start = len(process.output)
+            before = process.input_bytes
+            before_tty = process.tty_bytes
+            set_profile({"mtu": 1})
+            process.send(b"mtu\r")
+            pump_for(1.0)
+            assert b"BASELINE_MTU_OK" not in process.output[start:]
+            blocked = json.loads(Path(state + ".stats").read_text())
+            assert blocked["mtu_dropped"] > 0, blocked
+            restored = set_profile({})
+            process.send(b"mtu\r")
+            recovery = process.until_timed(b"BASELINE_MTU_OK", timeout=10, start=start)
+            cases.append({
+                "name": "mtu-blackhole",
+                "profile": {"mtu": 1},
+                "input_bytes": process.input_bytes - before,
+                "tty_bytes": process.tty_bytes - before_tty,
+                "screen_age_ms": recovery,
+                "blocked_relay": blocked,
+                "restored_relay": restored,
+            })
+
+            process.send(b"finish\r")
+            process.until(b"BASELINE_DONE")
+            process.finish(9)
+            relay = json.loads(Path(state + ".stats").read_text())
+            diagnostic_paths = list(process.diagnostic_snapshots.values())
+            diagnostics = summarize_diagnostics(diagnostic_paths)
+            assert set(diagnostics["roles"]) == {"client", "server"}, diagnostics
+            assert diagnostics["records"] > 0 and diagnostics["stages"], diagnostics
+            metadata = {
+                "schema": 1,
+                "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "network_path": "local IPv4 UDP relay between PTY endpoints",
+                "seed": RELAY_SEED,
+                "window": {"rows": 24, "cols": 80},
+                "profile_matrix": [case["name"] for case in cases],
+                "cases": cases,
+                "process": process.process_metrics or process.metrics(),
+                "relay": relay,
+                "diagnostics": diagnostics,
+                "original_processes": original_processes,
+                "evidence_complete": True,
+            }
+            (evidence_dir / "baseline.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+            (evidence_dir / "relay.json").write_text(json.dumps(relay, indent=2, sort_keys=True) + "\n")
+            (evidence_dir / "terminal.tty").write_bytes(process.output)
+            for path in diagnostic_paths:
+                target = evidence_dir / path.name
+                target.write_bytes(path.read_bytes())
+        finally:
+            process.close()
+            cleanup(state)
+    print(f"CLI deterministic baseline passed; evidence={evidence_dir}", flush=True)
+
+
 def verify(bin_dir, network, diagnostics=False, evidence_dir=None, display_example=None, core_example=None):
     DIAGNOSTIC_FILES.clear()
     script = str(Path(__file__).resolve())
@@ -2282,8 +2635,11 @@ if __name__ == "__main__":
     parser.add_argument("--evidence-dir", type=Path, help="save raw TTY and case observations")
     parser.add_argument("--saturated-input", action="store_true", help="exercise input rejection, local control and close during a UDP outage")
     parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
+    parser.add_argument("--baseline", action="store_true", help="run the deterministic impairment matrix and save comparable metrics")
     arguments = parser.parse_args()
-    if arguments.soft_wrap:
+    if arguments.baseline:
+        verify_baseline(arguments.bin_dir.resolve(), arguments.evidence_dir)
+    elif arguments.soft_wrap:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-soft-wrap-") as temporary:
             verify_soft_wrap(arguments.bin_dir.resolve(), temporary, arguments.evidence_dir,
                              arguments.display_example.resolve() if arguments.display_example else None)

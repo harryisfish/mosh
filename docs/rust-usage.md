@@ -363,6 +363,7 @@ target/debug/examples/verify_transport
 target/debug/examples/verify_display
 target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
+python3 scripts/verify-rust-cli.py --baseline --evidence-dir /tmp/mosh-rs-baseline
 python3 scripts/verify-rust-cli.py --saturated-input
 python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
 python3 scripts/verify-rust-cli.py --redraw --evidence-dir /tmp/mosh-rs-redraw
@@ -381,6 +382,18 @@ separate upstream and downstream loss, input confirmation, and SIGCONT cases.
 The relay checks `drop_up` and `drop_down` on both packet enqueue and dequeue.
 Its per-direction counters describe encrypted UDP traffic, not actor replies.
 `--evidence-dir` saves raw TTY output and relay observations for these cases.
+`--baseline` runs a deterministic impairment matrix with an 80x24 PTY and relay
+seed 12345. It records healthy traffic, 128 kbit/s delivery of similarly sized
+frames, delayed resources, independent upstream/downstream loss, and a synthetic
+1-byte MTU black hole followed by recovery. The relay records packet and byte counts,
+queue high water, dropped bytes, MTU drops, and the active profile. The evidence
+directory also contains `baseline.json`, raw `terminal.tty`, relay JSON, and
+endpoint diagnostic summaries. `screen_age_ms` is measured from fixture input
+or resource emission until its marker is observed in the PTY stream; it is a
+harness observation, not a user-perceived frame latency. The resource case also
+records `fixture_duration_ms` for fixture-side generation time. CPU and RSS values describe the child process accounting available on
+the host, with the host platform recorded beside them. Compare two runs only
+when commit, window, seed, binary, and network path match.
 The SIGCONT case checks a fresh six-second warning window. It retains the
 original eight-second recovery result and separately observes recovery for up
 to 30 seconds from restoring the relay. This cap only bounds the fixture

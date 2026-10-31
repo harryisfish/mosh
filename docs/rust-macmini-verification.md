@@ -1,5 +1,24 @@
 # Mac mini 实机验证
 
+## 可重复基线驱动
+
+R01 的基线入口在本机或 Mac mini 上使用固定 80×24 PTY、`seed=12345` 和本地
+IPv4 UDP relay 记录同一组输入与输出指标：健康路径、128 kbit/s 的相似大小连续帧、
+慢资源、上下行分别丢包，以及 relay 中模拟的 1 字节 MTU 黑洞后的恢复。命令如下：
+
+```sh
+cargo build -p mosh-rs --bins --examples --locked
+python3 scripts/verify-rust-cli.py --baseline --bin-dir target/debug \
+  --evidence-dir /tmp/mosh-rs-baseline
+```
+
+`baseline.json` 保存 commit、系统、窗口、seed、每个场景的输入字节、PTY 字节、
+PTY marker screen age、资源 fixture duration、恢复时间、relay 包/字节计数、
+队列高水位和端点诊断阶段统计。
+`terminal.tty` 与 relay/diagnostics JSON 是原始证据。CPU 和 RSS 取子进程在当前
+系统上的 `getrusage` 读数，Mac 与 Linux 的 RSS 单位可能不同，比较时必须保留
+平台和 commit。
+
 首轮记录对应提交 `2ce8e3d`。文末的协议 v2 复测记录后续修复及当前状态。
 
 2026-10-26 使用现有 `ssh macmini` 配置执行。客户端和服务端都是 Apple Silicon，远端为 macOS 27.0.1。本机终端为 cmux 0.65.2，底层为 Ghostty。程序放在独立临时目录。
