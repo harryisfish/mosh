@@ -30,6 +30,7 @@ const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;
 const CONNECTION_WINDOW: u32 = 4 * STREAM_WINDOW;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const GRANT_BEGIN: &[u8] = b"\x1eMOSH-RS-GRANT\n";
 const GRANT_END: &[u8] = b"\x1eMOSH-RS-GRANT-END\n";
@@ -462,10 +463,14 @@ fn server_sockets(bind: Option<IpAddr>, port: u16) -> io::Result<(UdpSocket, Opt
 pub async fn connect(endpoints: &ClientEndpoints, grant: &Grant) -> Result<Connection> {
     validate_grant(grant)?;
     let resolve = diagnostics::operation(Stage::Resolve, DiagnosticContext::default());
-    let addresses: Vec<_> = tokio::net::lookup_host((grant.address.as_str(), grant.port))
-        .await
-        .context("cannot resolve server UDP address")?
-        .collect();
+    let addresses: Vec<_> = tokio::time::timeout(
+        RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((grant.address.as_str(), grant.port)),
+    )
+    .await
+    .context("resolving server UDP address timed out")?
+    .context("cannot resolve server UDP address")?
+    .collect();
     drop(resolve);
     ensure!(
         !addresses.is_empty(),
