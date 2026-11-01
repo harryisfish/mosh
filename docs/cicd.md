@@ -26,7 +26,7 @@ Homebrew formula PR（手工更新并验证）
 ## 分支和合并规则
 
 - `master` 是唯一集成分支；功能、修复和版本准备均从 `master` 建分支。
-- `master` 开启分支保护：禁止直接 push，要求 PR、至少一名 reviewer、`CI / quality` 和 `CI / dependency-review` 通过，并要求分支已更新。
+- `master` 开启分支保护：禁止直接 push，要求 PR、至少一名 reviewer、`CI / quality` 通过，并要求分支已更新。
 - 发布 tag 必须指向已经合并且 CI 通过的 `master` 提交。tag 名必须与 `rust/Cargo.toml` 版本一致，例如版本 `0.1.3` 使用 `rust-v0.1.3`。
 - 版本 PR 同时更新 `rust/Cargo.toml`、`Cargo.lock`、`docs/releases/rust-v<VERSION>.md`、README 安装示例和相关文档。
 
@@ -45,7 +45,7 @@ Homebrew formula PR（手工更新并验证）
 
 ### PR 阶段
 
-`.github/workflows/rust.yml` 在 Ubuntu 和 macOS 上运行格式检查、Clippy、单元测试、examples、真实 PTY/网络 CLI 验证；依赖变更还由 dependency review 阻止 high 及以上漏洞。
+`.github/workflows/rust.yml` 在 Ubuntu 和 macOS 上运行格式检查、Clippy、单元测试、examples、真实 PTY/网络 CLI 验证。`.github/workflows/security.yml` 使用 `cargo audit --locked` 检查依赖漏洞；仓库管理员启用 GitHub Dependency graph 后，可再将 dependency review 作为 required check。
 
 ### 合并后阶段
 
