@@ -71,6 +71,9 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const CONFIRMATION_LIMIT: Duration = Duration::from_secs(6);
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_NOTICE: Duration = Duration::from_secs(2);
+const RETRY_BASE: Duration = Duration::from_millis(500);
+const RETRY_MAX: Duration = Duration::from_secs(5);
+const STABLE_CONNECTION: Duration = Duration::from_secs(10);
 
 struct PendingProbe {
     nonce: u64,
@@ -123,10 +126,12 @@ impl ProbeMonitor {
         self.observing_since = now;
         self.last_contact = None;
         self.last_reply = None;
+        // A probe sent before suspension belongs to the old observation window.
+        // Its delayed reply must not keep the new window blocked forever.
+        self.pending = None;
         self.recovered_until = None;
         self.next_attempt_at = now;
         self.next_status_at = now;
-        self.pause();
     }
 
     fn pause(&mut self) {
@@ -867,6 +872,29 @@ fn connection_notice(prefix: &str, reason: &str) -> String {
     format!("Ctrl-^ . to detach. {prefix} {reason}")
 }
 
+fn retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(4);
+    let millis = RETRY_BASE
+        .as_millis()
+        .saturating_mul(1_u128 << shift)
+        .min(RETRY_MAX.as_millis());
+    Duration::from_millis(millis as u64)
+}
+
+fn schedule_retry(
+    retry_at: &mut Instant,
+    failures: &mut u32,
+    connected_at: &mut Option<Instant>,
+    now: Instant,
+) {
+    if connected_at.is_some_and(|started| now.duration_since(started) >= STABLE_CONNECTION) {
+        *failures = 0;
+    }
+    *failures = failures.saturating_add(1);
+    *retry_at = now + retry_delay(*failures);
+    *connected_at = None;
+}
+
 fn requests_local_redraw(event: &InputEvent) -> bool {
     matches!(
         event,
@@ -932,6 +960,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut attempt = 0;
     let mut retry_at = Instant::now();
     let mut failures = 0u32;
+    let mut connected_at = None;
     let mut committed = 0;
     let mut probe_nonce = 0;
     let mut recovery_needed = false;
@@ -1068,14 +1097,17 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                                     let _ = new_link.start.send(true);
                                     link = Some(new_link);
                                     resync_pending = false;
-                                    failures = 0;
+                                    connected_at = Some(Instant::now());
                                     connection_status.clear();
                                 }
                                 Err(OpenFailure { error, fatal }) => {
                                     if fatal { return Err(error).context("server rejected session attachment"); }
-                                    failures = failures.saturating_add(1);
-                                    let delay = Duration::from_millis((250u64 << failures.min(4)).min(5000));
-                                    retry_at = Instant::now() + delay;
+                                    schedule_retry(
+                                        &mut retry_at,
+                                        &mut failures,
+                                        &mut connected_at,
+                                        Instant::now(),
+                                    );
                                     connection_status = connection_notice("Connection unavailable, retrying.", &format!("{error:#}"));
                                 }
                             }
@@ -1142,7 +1174,12 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             recovery_needed = true;
                             pending_frame = None;
                             resources.clear();
-                            retry_at = Instant::now();
+                            schedule_retry(
+                                &mut retry_at,
+                                &mut failures,
+                                &mut connected_at,
+                                Instant::now(),
+                            );
                             connection_status = connection_notice("Connection interrupted, reconnecting.", &reason);
                         }
                         _ => (),
@@ -1450,4 +1487,30 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     drop(connecting);
     endpoint.close(0u32.into(), b"client detached");
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restarting_probe_drops_stale_pending_probe() {
+        let now = Instant::now();
+        let (output, _received) = mpsc::channel(2);
+        let mut monitor = ProbeMonitor::new(now);
+        let mut nonce = 0;
+
+        monitor.tick(now, 1, &output, &mut nonce).unwrap();
+        assert!(monitor.pending.is_some());
+
+        monitor.pause();
+        monitor.restart(now + Duration::from_secs(1));
+        assert!(monitor.pending.is_none());
+
+        monitor
+            .tick(now + Duration::from_secs(1), 1, &output, &mut nonce)
+            .unwrap();
+        assert_eq!(nonce, 2);
+        assert!(monitor.pending.is_some());
+    }
 }
