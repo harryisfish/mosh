@@ -45,11 +45,11 @@ Homebrew formula PR（手工更新并验证）
 
 ### PR 阶段
 
-`.github/workflows/rust.yml` 在 Ubuntu 和 macOS 上运行格式检查、Clippy、单元测试、examples、真实 PTY/网络 CLI 验证。`.github/workflows/security.yml` 使用 `cargo audit --locked` 检查依赖漏洞；仓库管理员启用 GitHub Dependency graph 后，可再将 dependency review 作为 required check。
+`.github/workflows/rust.yml` 在 Ubuntu 和 macOS 上运行格式检查、Clippy、单元测试、examples、真实 PTY/网络 CLI 验证。`.github/workflows/security.yml` 使用 `cargo audit` 检查依赖漏洞；仓库管理员启用 GitHub Dependency graph 后，可再将 dependency review 作为 required check。
 
 ### 合并后阶段
 
-合并到 `master` 会重新运行同一套 CI，确保 PR 合并队列没有改变验证结果。`.github/workflows/security.yml` 每周和依赖相关变更运行 `cargo audit --locked`。
+合并到 `master` 会重新运行同一套 CI，确保 PR 合并队列没有改变验证结果。`.github/workflows/security.yml` 每周和依赖相关变更运行 `cargo audit`。
 
 ### 发布阶段
 
