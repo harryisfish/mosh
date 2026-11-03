@@ -265,9 +265,11 @@ mosh-rs --diagnostics user@host
 ```
 
 Before the terminal opens, the client prints a local JSONL path and the server
-prints its remote JSONL path. Each file is in a private directory and has
-owner-only permissions. Both endpoints need a version that supports
-`--diagnostics`. The flag does not change the terminal wire protocol.
+prints its remote JSONL path. Files are stored in the endpoint's persistent
+state directory, normally `~/.local/state/mosh-rs/diagnostics/`; `XDG_STATE_HOME`
+overrides the root. Each file has owner-only permissions and a unique session
+name. Both endpoints need a version that supports `--diagnostics`. The flag
+does not change the terminal wire protocol.
 
 Save both files after a stall. Copy the remote file using its printed path:
 
@@ -299,8 +301,9 @@ success. Normal idle reads do not count as stalled operations.
 Diagnostics are off by default. The files contain counters, durations, and
 fixed event names. They exclude input text, screen contents, remote command
 arguments, addresses, credentials, and dynamic error messages. Capture stops
-at a 16 MiB limit per file. Start another session to collect a new capture.
-Remove the files when they are no longer needed. No data is uploaded.
+at a 16 MiB limit per file. The endpoint retains the latest 32 diagnostic files
+per role and removes older files when a new capture starts. The server also
+keeps a same-session `*.stderr.log` beside its JSONL file. No data is uploaded.
 
 An in-process monitor cannot run while its process is stopped or the host is
 asleep. A disk stall can also delay diagnostic output. Neither condition proves
