@@ -17,7 +17,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::diagnostics::{self, Context as DiagnosticContext, Stage};
+use crate::diagnostics::{self, Context as DiagnosticContext, Role, Stage};
 use crate::model::{
     BootstrapRequest, Frame, Grant, MAX_CELL_IMAGES, MAX_CONTROL, MAX_FRAME, MAX_IMAGE_TILES,
     MAX_RESOURCE, MAX_RESOURCES, PROTOCOL_VERSION, Resource, ResourceMeta,
@@ -747,7 +747,13 @@ pub async fn spawn_worker(diagnostics_enabled: bool) -> Result<()> {
     let directory = std::env::temp_dir().join(format!("mosh-rs-{}-{stamp}", std::process::id()));
     std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
     let mut cleanup = WorkerTempDirGuard::new(directory.clone());
-    let log_path = directory.join("server.log");
+    let diagnostic_path = diagnostics_enabled
+        .then(|| diagnostics::create_path(Role::Server))
+        .transpose()?;
+    let log_path = diagnostic_path
+        .as_ref()
+        .map(|path| path.with_extension("stderr.log"))
+        .unwrap_or_else(|| directory.join("server.log"));
     let log = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -762,9 +768,8 @@ pub async fn spawn_worker(diagnostics_enabled: bool) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(log);
-    let diagnostic_path = directory.join("diagnostics.jsonl");
-    if diagnostics_enabled {
-        command.arg("--diagnostics").arg(&diagnostic_path);
+    if let Some(path) = &diagnostic_path {
+        command.arg("--diagnostics").arg(path);
     }
     unsafe {
         command.pre_exec(|| {
@@ -795,8 +800,8 @@ pub async fn spawn_worker(diagnostics_enabled: bool) -> Result<()> {
     .await;
     match grant {
         Ok(Ok(grant)) => {
-            if diagnostics_enabled {
-                eprintln!("mosh-rs-server: diagnostics: {}", diagnostic_path.display());
+            if let Some(path) = &diagnostic_path {
+                eprintln!("mosh-rs-server: diagnostics: {}", path.display());
             }
             let delivered = write_grant(std::io::stdout().lock(), &grant);
             if delivered.is_err() {

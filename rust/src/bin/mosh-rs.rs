@@ -58,7 +58,7 @@ struct Args {
     /// Allow remote programs to request the local clipboard.
     #[arg(long)]
     clipboard_read: bool,
-    /// Record bounded diagnostics on both endpoints without terminal contents.
+    /// Record bounded persistent diagnostics on both endpoints without terminal contents.
     #[arg(long)]
     diagnostics: bool,
     /// Program and literal arguments. Omit to start a login shell.

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -15,6 +16,7 @@ const STAGES: usize = ALL_STAGES.len();
 const STALL_MS: u64 = 1000;
 const REPEAT_MS: u64 = 5000;
 const LOG_LIMIT: usize = 16 * 1024 * 1024;
+const RETAINED_LOGS: usize = 32;
 static GLOBAL: OnceLock<Arc<State>> = OnceLock::new();
 
 #[derive(Clone, Copy, Serialize)]
@@ -247,10 +249,60 @@ pub fn create_path(role: Role) -> Result<PathBuf> {
         Role::Server => "server",
     };
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let directory =
-        std::env::temp_dir().join(format!("mosh-rs-{label}-{}-{stamp}", std::process::id()));
-    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-    Ok(directory.join("diagnostics.jsonl"))
+    let directory = persistent_directory()?;
+    match std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&directory)
+    {
+        Ok(()) => {}
+        Err(_error) if directory.is_dir() => {}
+        Err(error) => return Err(error.into()),
+    }
+    retain_logs(&directory, label)?;
+    Ok(directory.join(format!("{label}-{}-{stamp}.jsonl", std::process::id())))
+}
+
+fn persistent_directory() -> Result<PathBuf> {
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(".local").join("state"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    Ok(root.join("mosh-rs").join("diagnostics"))
+}
+
+fn retain_logs(directory: &Path, label: &str) -> Result<()> {
+    let prefix = format!("{label}-");
+    let mut sessions = BTreeSet::new();
+    for path in std::fs::read_dir(directory)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+    {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(base) = name
+            .strip_suffix(".jsonl")
+            .or_else(|| name.strip_suffix(".stderr.log"))
+        else {
+            continue;
+        };
+        if base.starts_with(&prefix) {
+            sessions.insert(base.to_owned());
+        }
+    }
+    let remove = sessions.len().saturating_sub(RETAINED_LOGS - 1);
+    for base in sessions.into_iter().take(remove) {
+        let _ = std::fs::remove_file(directory.join(format!("{base}.jsonl")));
+        let _ = std::fs::remove_file(directory.join(format!("{base}.stderr.log")));
+    }
+    Ok(())
 }
 
 impl State {
@@ -764,10 +816,8 @@ mod tests {
                 assert_eq!(std::fs::metadata(&unused).unwrap().len(), 0);
                 std::fs::remove_file(&unused).unwrap();
             }
-            std::fs::remove_dir(unused.parent().unwrap()).unwrap();
         }
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -828,6 +878,30 @@ mod tests {
         run_monitor(&state, receiver, FailedWriter);
         assert!(!state.running.load(Ordering::Relaxed));
         assert!(!state.stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn retention_removes_old_session_pairs() {
+        let directory = std::env::temp_dir().join(format!(
+            "mosh-rs-retention-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for index in 0..=RETAINED_LOGS {
+            let base = format!("client-{index:02}");
+            std::fs::write(directory.join(format!("{base}.jsonl")), b"json\n").unwrap();
+            std::fs::write(directory.join(format!("{base}.stderr.log")), b"stderr\n").unwrap();
+        }
+        retain_logs(&directory, "client").unwrap();
+        assert!(!directory.join("client-00.jsonl").exists());
+        assert!(!directory.join("client-00.stderr.log").exists());
+        assert!(directory.join("client-02.jsonl").exists());
+        assert!(directory.join("client-32.stderr.log").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
