@@ -27,7 +27,7 @@ Homebrew formula PR（手工更新并验证）
 
 - `master` 是唯一集成分支；功能、修复和版本准备均从 `master` 建分支。
 - `master` 开启分支保护：禁止直接 push，要求 PR、至少一名 reviewer、`CI / quality` 通过，并要求分支已更新。
-- 发布 tag 必须指向已经合并且 CI 通过的 `master` 提交。tag 名必须与 `rust/Cargo.toml` 版本一致，例如版本 `0.1.5` 使用 `rust-v0.1.5`。
+- 发布 tag 必须指向已经合并且 CI 通过的 `master` 提交。tag 名必须与 `rust/Cargo.toml` 版本一致，例如版本 `0.1.6` 使用 `rust-v0.1.6`。
 - 版本 PR 同时更新 `rust/Cargo.toml`、`Cargo.lock`、`docs/releases/rust-v<VERSION>.md`、README 安装示例和相关文档。
 
 ## GitHub 设置
@@ -57,15 +57,15 @@ Homebrew formula PR（手工更新并验证）
 
 ### 回滚
 
-发布错误时先在 GitHub Release 页面撤下错误资产并标记为 draft，不删除已被用户下载的 tag。修复后提升补丁版本（例如 `0.1.4` → `0.1.5`），重新走版本 PR 和新 tag；客户端和服务端始终使用同一版本。若需停止自动发布，取消 `production` 审批或禁用 workflow，不要删除历史 Release。
+发布错误时先在 GitHub Release 页面撤下错误资产并标记为 draft，不删除已被用户下载的 tag。修复后提升补丁版本（例如 `0.1.5` → `0.1.6`），重新走版本 PR 和新 tag；客户端和服务端始终使用同一版本。若需停止自动发布，取消 `production` 审批或禁用 workflow，不要删除历史 Release。
 
 ## 日常操作
 
 ```sh
-# 发布 0.1.5（必须是已合并的 master 提交）
+# 发布 0.1.6（必须是已合并的 master 提交）
 git switch master && git pull --ff-only
-git tag rust-v0.1.5
-git push origin rust-v0.1.5
+git tag rust-v0.1.6
+git push origin rust-v0.1.6
 ```
 
 发布完成后，按 `docs/rust-release.md` 下载 Release 的 `SHA256SUMS`，运行 `scripts/update-homebrew-formula.py`，在独立分支提交 Homebrew formula PR。不要使用 PR 构建产生的 checksum。
