@@ -841,6 +841,16 @@ def verify_image_paste(bin_dir, temporary, network=True, evidence_dir=None):
     simple.write_bytes(data)
     first.write_bytes(data)
     second.write_bytes(other)
+    literal_directory = Path(temporary) / "literal-paths"
+    literal_directory.mkdir()
+    literal_sources = []
+    for filename, alias in [("rock'n'roll.png", "rocknroll.png"), ('say"hello".png', "sayhello.png"),
+                            ("slash\\name.png", "slashname.png"), ("cost$5(1)&semi;.png", None)]:
+        source = literal_directory / filename
+        source.write_bytes(data)
+        if alias is not None:
+            (literal_directory / alias).write_bytes(other)
+        literal_sources.append(source)
     facts = {"cases": [], "rejections": [], "native_clipboard": "not exercised by this automated PTY matrix"}
 
     def session(name, proxy=False, options=None, extra_env=None, kitty=False):
@@ -928,9 +938,13 @@ def verify_image_paste(bin_dir, temporary, network=True, evidence_dir=None):
         assert uploaded(process, state, escaped, [(first, data, [2, 2])]) == uploaded_simple
         assert uploaded(process, state, first.as_uri(), [(first, data, [2, 2])]) == uploaded_simple
         assert uploaded(process, state, str(first), [(first, data, [2, 2])]) == uploaded_simple
+        for source in literal_sources:
+            assert uploaded(process, state, str(source), [(source, data, [2, 2])]) == uploaded_simple
+            assert uploaded(process, state, shlex.quote(str(source)), [(source, data, [2, 2])]) == uploaded_simple
         ordinary = fixtures / "notes.txt"
         ordinary.write_text("ordinary file")
-        for text in ["ordinary text with /tmp/example.png inside", str(ordinary), "/not-a-local-file/document.txt"]:
+        for text in ["ordinary text with /tmp/example.png inside", str(ordinary), "/not-a-local-file/document.txt",
+                     str(simple) + " && " + str(second)]:
             before = received(state)
             index = len(observed(state)) + 1
             process.send(paste(text) + b"\r")

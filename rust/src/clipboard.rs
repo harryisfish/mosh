@@ -46,7 +46,7 @@ pub async fn prepare(events: Vec<InputEvent>) -> Result<PreparedInput> {
     };
     let images = match &events[index] {
         InputEvent::Paste(text) => {
-            Some(load_images(image_paths(text).context("invalid image paths")?).await?)
+            load_images(image_paths(text), raw_image_path(text).map(str::to_owned)).await?
         }
         _ => clipboard_images().await?,
     };
@@ -62,24 +62,19 @@ pub async fn prepare(events: Vec<InputEvent>) -> Result<PreparedInput> {
 }
 
 fn event_candidate(event: &InputEvent) -> bool {
-    is_paste_key(event) || matches!(event, InputEvent::Paste(text) if image_paths(text).is_some())
+    is_paste_key(event)
+        || matches!(event, InputEvent::Paste(text)
+            if raw_image_path(text).is_some() || image_paths(text).is_some())
 }
 
 fn image_paths(text: &str) -> Option<Vec<String>> {
-    if let Some(paths) = shell_words(text)
-        && !paths.is_empty()
-        && paths.iter().all(|path| image_path(path))
-    {
-        return Some(paths);
-    }
+    let paths = shell_words(text)?;
+    (!paths.is_empty() && paths.iter().all(|path| image_path(path))).then_some(paths)
+}
+
+fn raw_image_path(text: &str) -> Option<&str> {
     let path = text.trim();
-    if path
-        .chars()
-        .any(|ch| ch.is_control() || ";&|<>`$()\\".contains(ch))
-    {
-        return None;
-    }
-    image_path(path).then(|| vec![path.to_owned()])
+    (!path.chars().any(char::is_control) && image_path(path)).then_some(path)
 }
 
 fn image_path(path: &str) -> bool {
@@ -185,20 +180,46 @@ fn file_uri(uri: &str) -> Option<String> {
     (!path.contains('\0')).then_some(path)
 }
 
-async fn load_images(paths: Vec<String>) -> Result<Vec<ImageBlob>> {
-    ensure!(paths.len() <= MAX_IMAGES, "too many pasted images");
+fn local_path(path: &str) -> Result<PathBuf> {
+    Ok(if path.starts_with("file://") {
+        PathBuf::from(file_uri(path).context("invalid pasted image URI")?)
+    } else if let Some(relative) = path.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME").context("home directory is unavailable")?)
+            .join(relative)
+    } else {
+        PathBuf::from(path)
+    })
+}
+
+async fn load_images(
+    paths: Option<Vec<String>>,
+    raw: Option<String>,
+) -> Result<Option<Vec<ImageBlob>>> {
     tokio::task::spawn_blocking(move || {
+        let paths = if let Some(raw) = raw {
+            match std::fs::symlink_metadata(local_path(&raw)?) {
+                Ok(_) => Some(vec![raw]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    paths
+                }
+                Err(error) => return Err(error).context("cannot inspect pasted image"),
+            }
+        } else {
+            paths
+        };
+        let Some(paths) = paths else {
+            return Ok(None);
+        };
+        ensure!(paths.len() <= MAX_IMAGES, "too many pasted images");
         let mut images = Vec::with_capacity(paths.len());
         let mut total = 0;
         for path in paths {
-            let path = if path.starts_with("file://") {
-                PathBuf::from(file_uri(&path).context("invalid pasted image URI")?)
-            } else if let Some(relative) = path.strip_prefix("~/") {
-                PathBuf::from(std::env::var_os("HOME").context("home directory is unavailable")?)
-                    .join(relative)
-            } else {
-                PathBuf::from(path)
-            };
+            let path = local_path(&path)?;
             let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -229,7 +250,7 @@ async fn load_images(paths: Vec<String>) -> Result<Vec<ImageBlob>> {
             total += image.bytes().len();
             images.push(image);
         }
-        Ok(images)
+        Ok(Some(images))
     })
     .await
     .context("image reader stopped")?
@@ -349,7 +370,7 @@ ObjC.import('AppKit');
             if paths.is_empty() || !paths.iter().all(|path| image_path(path)) {
                 return Ok(None);
             }
-            Ok(Some(load_images(paths).await?))
+            load_images(Some(paths), None).await
         }
         Reply::Image { data } => Ok(Some(vec![ImageBlob::new(
             STANDARD
@@ -423,7 +444,7 @@ async fn clipboard_images() -> Result<Option<Vec<ImageBlob>>> {
         if paths.is_empty() || !paths.iter().all(|path| image_path(path)) {
             return Ok(None);
         }
-        Ok(Some(load_images(paths).await?))
+        load_images(Some(paths), None).await
     } else {
         Ok(Some(vec![ImageBlob::new(output.bytes)?]))
     }
