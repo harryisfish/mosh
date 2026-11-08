@@ -16,8 +16,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::clipboard::{self, PreparedInput};
 use crate::diagnostics::{self, Context as DiagnosticContext, ProgressSnapshot, Stage};
 use crate::display::{Display, Graphics, PredictionPolicy};
+use crate::image_paste::{self, ImageBlob, UploadReply};
 use crate::input::{
     EscapeAction, EscapeSequence, InputDecoder, InputRejection, LocalEvent, LocalTerminal,
     MAX_INPUT_CHUNK, PasteAdmission, TtyOutput, foreground_lost,
@@ -498,6 +500,7 @@ pub struct ClientOptions {
     pub graphics: Graphics,
     pub prediction: PredictionPolicy,
     pub clipboard_read: bool,
+    pub image_paste: bool,
 }
 
 fn input_terminal() -> Result<AsyncFd<File>> {
@@ -720,6 +723,7 @@ struct PendingInput {
     notice: Option<InputNotice>,
     notice_presented: bool,
     clipboard_not_sent: bool,
+    image_status: String,
     close: CloseState,
 }
 
@@ -853,6 +857,9 @@ impl PendingInput {
         if self.clipboard_not_sent {
             parts.push("Clipboard reply not sent; remote query may time out.");
         }
+        if !self.image_status.is_empty() {
+            parts.push(&self.image_status);
+        }
         if !connection.is_empty() {
             parts.push(connection);
         }
@@ -860,6 +867,305 @@ impl PendingInput {
             parts.push(application);
         }
         parts.join(" ")
+    }
+}
+
+struct PasteTask<T>(JoinHandle<T>);
+
+impl<T> Drop for PasteTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ImageBatch {
+    events: Vec<InputEvent>,
+    index: usize,
+    images: Vec<ImageBlob>,
+}
+
+#[derive(Default)]
+enum ImageState {
+    #[default]
+    Idle,
+    Preparing(PasteTask<Result<PreparedInput>>),
+    Waiting(ImageBatch),
+    Uploading {
+        batch: ImageBatch,
+        attempt: u64,
+        task: PasteTask<Result<UploadReply>>,
+    },
+    Ready {
+        events: Vec<InputEvent>,
+        user: bool,
+    },
+    Rejected(String),
+}
+
+struct DeferredInput {
+    events: Vec<InputEvent>,
+    user: bool,
+    bytes: usize,
+}
+
+struct ImageInput {
+    enabled: bool,
+    state: ImageState,
+    deferred: VecDeque<DeferredInput>,
+    bytes: usize,
+    suppress_paste_key: bool,
+    suppress_escape_key: bool,
+}
+
+fn input_cost(events: &[InputEvent]) -> Result<usize> {
+    events.iter().try_fold(0, |total, event| {
+        Ok(total + serde_json::to_vec(event)?.len())
+    })
+}
+
+impl ImageInput {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: ImageState::Idle,
+            deferred: VecDeque::new(),
+            bytes: 0,
+            suppress_paste_key: false,
+            suppress_escape_key: false,
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.state = ImageState::Idle;
+        self.deferred.clear();
+        self.bytes = 0;
+    }
+
+    fn reject(&mut self, reason: &str, pending: &mut PendingInput) {
+        if self.deferred.iter().any(|batch| !batch.user) {
+            pending.clipboard_not_sent = true;
+        }
+        self.cancel();
+        self.state = ImageState::Rejected(connection_notice(
+            "Image paste failed. Esc resumes; queued typing was not sent.",
+            reason,
+        ));
+    }
+
+    fn filter_key_phases(&mut self, events: &mut Vec<InputEvent>) {
+        events.retain(|event| {
+            let InputEvent::Key(key) = event else {
+                return true;
+            };
+            let identity = key
+                .base
+                .map(KeyCode::Char)
+                .unwrap_or_else(|| key.code.clone());
+            let suppressed = match identity {
+                KeyCode::Char('v' | 'V') => &mut self.suppress_paste_key,
+                KeyCode::Named(name) if name == "Escape" => &mut self.suppress_escape_key,
+                _ => return true,
+            };
+            let suppress = *suppressed && key.phase != KeyPhase::Press;
+            if key.phase != KeyPhase::Repeat {
+                *suppressed = false;
+            }
+            !suppress
+        });
+    }
+
+    fn accept(
+        &mut self,
+        mut events: Vec<InputEvent>,
+        user: bool,
+        pending: &mut PendingInput,
+        display: &mut Display<TtyOutput>,
+    ) -> Result<bool> {
+        if !self.enabled {
+            return pending.admit(events, user, display);
+        }
+        if pending.is_closing() || events.is_empty() {
+            return Ok(false);
+        }
+        if matches!(self.state, ImageState::Rejected(_)) {
+            if user && events.iter().any(|event| matches!(event,
+                InputEvent::Key(Key { code: KeyCode::Named(name), phase: KeyPhase::Press, modifiers, .. }) if name == "Escape" && modifiers & !(64 | 128) == 0)) {
+                self.state = ImageState::Idle;
+                self.suppress_escape_key = true;
+            } else if !user {
+                pending.clipboard_not_sent = true;
+            }
+            return Ok(false);
+        }
+        if user && pending.paused {
+            return Ok(false);
+        }
+        if matches!(self.state, ImageState::Idle) && self.deferred.is_empty() {
+            self.filter_key_phases(&mut events);
+            if !user || !clipboard::candidate(&events) {
+                return pending.admit(events, user, display);
+            }
+        }
+        let bytes = input_cost(&events)?;
+        if pending.bytes + self.bytes + bytes > MAX_PENDING_INPUT {
+            self.reject("pending input is full", pending);
+            return Ok(false);
+        }
+        self.bytes += bytes;
+        self.deferred.push_back(DeferredInput {
+            events,
+            user,
+            bytes,
+        });
+        Ok(true)
+    }
+
+    async fn advance(
+        &mut self,
+        link: Option<&Link>,
+        pending: &mut PendingInput,
+        display: &mut Display<TtyOutput>,
+    ) -> Result<bool> {
+        let mut reconnect = false;
+        for _ in 0..8 {
+            let state = std::mem::take(&mut self.state);
+            self.state = match state {
+                ImageState::Idle => {
+                    let Some(mut batch) = self.deferred.pop_front() else {
+                        break;
+                    };
+                    self.bytes -= batch.bytes;
+                    self.filter_key_phases(&mut batch.events);
+                    if batch.user && clipboard::candidate(&batch.events) {
+                        self.suppress_paste_key = batch.events.iter().any(clipboard::is_paste_key);
+                        ImageState::Preparing(PasteTask(tokio::spawn(clipboard::prepare(
+                            batch.events,
+                        ))))
+                    } else {
+                        ImageState::Ready {
+                            events: batch.events,
+                            user: batch.user,
+                        }
+                    }
+                }
+                ImageState::Preparing(mut task) if task.0.is_finished() => {
+                    match (&mut task.0)
+                        .await
+                        .context("image preparation task ended")
+                        .and_then(|result| result)
+                    {
+                        Ok(PreparedInput::Plain(events)) => {
+                            self.suppress_paste_key = false;
+                            ImageState::Ready { events, user: true }
+                        }
+                        Ok(PreparedInput::Images {
+                            events,
+                            index,
+                            images,
+                        }) => {
+                            self.suppress_paste_key = events.iter().any(clipboard::is_paste_key);
+                            ImageState::Waiting(ImageBatch {
+                                events,
+                                index,
+                                images,
+                            })
+                        }
+                        Err(error) => {
+                            self.reject(&format!("{error:#}"), pending);
+                            break;
+                        }
+                    }
+                }
+                ImageState::Waiting(batch) if link.is_some() => {
+                    let active = link.expect("connected image upload");
+                    let connection = active.connection.clone();
+                    let epoch = active.epoch;
+                    let images = batch.images.clone();
+                    ImageState::Uploading {
+                        batch,
+                        attempt: active.epoch,
+                        task: PasteTask(tokio::spawn(async move {
+                            image_paste::upload(&connection, epoch, &images).await
+                        })),
+                    }
+                }
+                ImageState::Uploading {
+                    batch,
+                    attempt,
+                    task,
+                } if link.is_none_or(|active| active.epoch != attempt) => {
+                    drop(task);
+                    ImageState::Waiting(batch)
+                }
+                ImageState::Uploading {
+                    batch,
+                    attempt: _,
+                    mut task,
+                } if task.0.is_finished() => {
+                    match (&mut task.0)
+                        .await
+                        .context("image upload task ended")
+                        .and_then(|result| result)
+                    {
+                        Ok(UploadReply::Ready(paths)) => {
+                            if paths.len() != batch.images.len()
+                                || paths.iter().any(|path| {
+                                    !path.starts_with('/')
+                                        || path.len() > 4096
+                                        || path.chars().any(char::is_control)
+                                })
+                            {
+                                self.reject("server returned invalid image paths", pending);
+                                break;
+                            }
+                            let text = paths
+                                .iter()
+                                .map(|path| format!("'{}'", path.replace('\'', "'\\''")))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let mut events = batch.events;
+                            events[batch.index] = InputEvent::Paste(text);
+                            ImageState::Ready { events, user: true }
+                        }
+                        Ok(UploadReply::Rejected(reason)) => {
+                            self.reject(&reason, pending);
+                            break;
+                        }
+                        Err(_) => {
+                            reconnect = true;
+                            self.state = ImageState::Waiting(batch);
+                            break;
+                        }
+                    }
+                }
+                ImageState::Ready { events, user } => {
+                    let cost = input_cost(&events)?;
+                    if cost > MAX_PENDING_INPUT {
+                        self.reject("image paths exceed the input limit", pending);
+                        break;
+                    }
+                    if pending.paused || pending.bytes + cost > MAX_PENDING_INPUT {
+                        self.state = ImageState::Ready { events, user };
+                        break;
+                    }
+                    pending.admit(events, user, display)?;
+                    ImageState::Idle
+                }
+                waiting => {
+                    self.state = waiting;
+                    break;
+                }
+            };
+        }
+        pending.image_status = match &self.state {
+            ImageState::Idle => "".into(),
+            ImageState::Preparing(_) => "Preparing image paste; typing waits.".into(),
+            ImageState::Waiting(_) => "Image paste waiting for connection; typing waits.".into(),
+            ImageState::Uploading { .. } => "Uploading image paste; typing waits.".into(),
+            ImageState::Ready { .. } => "Image paste waiting for pending input.".into(),
+            ImageState::Rejected(message) => message.clone(),
+        };
+        Ok(reconnect)
     }
 }
 
@@ -965,6 +1271,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
     let mut probe_nonce = 0;
     let mut recovery_needed = false;
     let mut pending = PendingInput::default();
+    let mut image_input = ImageInput::new(options.image_paste);
     let mut captured = VecDeque::<LocalEvent>::new();
     let mut escape = EscapeSequence::new();
     let mut help_visible = false;
@@ -1211,7 +1518,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                     LocalEvent::Input(event) => match escape.feed(event) {
                         EscapeAction::Send(events) => {
                             let redraw = events.iter().any(requests_local_redraw);
-                            if pending.admit(events, true, display)? {
+                            if image_input.accept(events, true, &mut pending, display)? {
                                 help_visible = false;
                             }
                             if pending.paused || pending.is_closing() { decoder.discard_active_paste(); }
@@ -1225,6 +1532,8 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                         EscapeAction::Detach => return Ok(SessionAction::Detach),
                         EscapeAction::Suspend => return Ok(SessionAction::Suspend),
                         EscapeAction::Close => {
+                            image_input.cancel();
+                            pending.image_status.clear();
                             if !pending.is_closing() {
                                 pending.close = CloseState::Requested { after_sequence: pending.sequence, queued_epoch: None };
                             }
@@ -1241,7 +1550,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                             .and_then(|index| clipboard_queries.remove(index))
                             .map(|(query, _, _)| InputEvent::QueryResult { query, data });
                         if let Some(response) = response {
-                            pending.admit(vec![response], false, display)?;
+                            image_input.accept(vec![response], false, &mut pending, display)?;
                         }
                     }
                     LocalEvent::Rejected(reason) => {
@@ -1278,7 +1587,7 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
             for effect in ready_effects {
                 let response = display.apply_effect(&effect, options.clipboard_read)?;
                 if let Some(event) = response {
-                    pending.admit(vec![event], false, display)?;
+                    image_input.accept(vec![event], false, &mut pending, display)?;
                 } else if let EffectKind::ClipboardRead { query, selection } = &effect.kind {
                     if !pending.is_closing() && clipboard_queries.len() < MAX_EFFECTS {
                         clipboard_queries.push_back((*query, selection.clone(), Instant::now()));
@@ -1295,16 +1604,24 @@ pub async fn run(endpoint: ClientEndpoints, grant: Grant, options: ClientOptions
                 let (query, _, _) = clipboard_queries
                     .pop_front()
                     .expect("expired clipboard query");
-                pending.admit(vec![InputEvent::QueryResult {
+                image_input.accept(vec![InputEvent::QueryResult {
                     query,
                     data: None,
-                }], false, display)?;
+                }], false, &mut pending, display)?;
             }
             if let Some((code, revision, effects)) = remote_exit
                 && display.revision() >= revision
                 && display.effects_applied() >= effects
             {
                 return Ok(SessionAction::Exit(code));
+            }
+            if image_input.advance(link.as_ref(), &mut pending, display).await? {
+                link.take();
+                pending_frame = None;
+                resources.clear();
+                recovery_needed = true;
+                schedule_retry(&mut retry_at, &mut failures, &mut connected_at, Instant::now());
+                connection_status = "Image transfer interrupted; reconnecting.".into();
             }
             resumed |= continue_flag.restart_observation(&mut link);
             if resumed {

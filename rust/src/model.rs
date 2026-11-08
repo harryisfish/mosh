@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_CONTROL: usize = 512 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CELL_IMAGES: usize = 4096;

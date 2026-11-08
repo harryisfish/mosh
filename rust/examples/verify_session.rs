@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use mosh_rs::display::{Display, Graphics, PredictionPolicy};
+use mosh_rs::image_paste::{self, ImageBlob, UploadReply};
 use mosh_rs::model::*;
 use mosh_rs::session::SessionActor;
 use mosh_rs::transport::{self, ClientEndpoints, ClientIdentity, Incoming, ServerListeners};
@@ -476,6 +477,8 @@ async fn main() -> Result<()> {
                     verify_locale().await
                 } else if mode.as_deref() == Some("--verify-liveness") {
                     verify_liveness().await
+                } else if mode.as_deref() == Some("--verify-images") {
+                    verify_images().await
                 } else {
                     verify().await
                 }
@@ -490,6 +493,7 @@ async fn verify() -> Result<()> {
     verify_prepared().await?;
     verify_locale().await?;
     verify_liveness().await?;
+    verify_images().await?;
     let identity = ClientIdentity::generate()?;
     let request = BootstrapRequest {
         version: PROTOCOL_VERSION,
@@ -962,6 +966,188 @@ async fn verify() -> Result<()> {
     println!(
         "session verification passed: {} installed frames; raw PTY input modes, partial writes, reconnect deduplication, fencing, resize, graphics, late resources, effects, queries, flood convergence, final exit barriers, explicit close and child reaping",
         view.frames
+    );
+    Ok(())
+}
+
+async fn rejected_image_stream(connection: &Connection, bytes: &[u8]) -> Result<()> {
+    let (mut output, mut input) = connection.open_bi().await?;
+    output.write_all(bytes).await?;
+    output.finish()?;
+    let mut kind = [0];
+    input.read_exact(&mut kind).await?;
+    ensure!(kind == [1], "malformed image upload was accepted");
+    let mut length = [0; 2];
+    input.read_exact(&mut length).await?;
+    let length = u16::from_be_bytes(length) as usize;
+    ensure!(length > 0 && length <= 256, "unbounded image rejection");
+    let mut reason = vec![0; length];
+    input.read_exact(&mut reason).await?;
+    ensure!(
+        input.read(&mut [0]).await?.is_none(),
+        "trailing image rejection"
+    );
+    Ok(())
+}
+
+async fn verify_images() -> Result<()> {
+    let identity = ClientIdentity::generate()?;
+    let request = BootstrapRequest {
+        version: PROTOCOL_VERSION,
+        client_cert: identity.certificate(),
+        size: size(80, 12),
+        command: vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            "--close-fixture".into(),
+        ],
+        bind: Some("127.0.0.1".into()),
+        port: None,
+        idle_seconds: 60,
+        clipboard_read: false,
+        locale_candidates: Vec::new(),
+    };
+    let (endpoint, grant) = transport::listen(&request)?;
+    let actor = SessionActor::new(&request, grant.session.clone())?;
+    let mut running = Running {
+        task: Some(tokio::task::spawn_local(actor.run(endpoint.clone()))),
+        endpoint,
+    };
+    let client = identity.endpoint(&grant)?;
+    let mut view = View::new(request.size);
+    let mut peer = Peer::attach(&client, &grant, &mut view, 1, None, 3).await?;
+    view.wait_text(&mut peer, "CLOSE_READY").await?;
+    let pid = extract_pid(&view.text())?;
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&[12, 34, 56, 255])?;
+    }
+    let image = ImageBlob::new(bytes.clone())?;
+    let UploadReply::Ready(paths) =
+        image_paste::upload(&peer.connection, peer.epoch, std::slice::from_ref(&image)).await?
+    else {
+        bail!("valid image upload was rejected");
+    };
+    ensure!(paths.len() == 1, "image upload omitted its remote path");
+    let path = std::path::PathBuf::from(&paths[0]);
+    let directory = path.parent().context("image directory missing")?.to_owned();
+    ensure!(
+        std::fs::read(&path)? == bytes,
+        "uploaded image bytes changed"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    ensure!(
+        std::fs::metadata(&directory)?.permissions().mode() & 0o777 == 0o700
+            && std::fs::metadata(&path)?.permissions().mode() & 0o777 == 0o600,
+        "image files or directory are not private"
+    );
+    let decoded = png::Decoder::new(std::io::Cursor::new(std::fs::read(&path)?)).read_info()?;
+    ensure!(
+        decoded.info().width == 1 && decoded.info().height == 1,
+        "uploaded image cannot be decoded"
+    );
+    let mut header = b"MIMG\x01".to_vec();
+    header.extend_from_slice(&peer.epoch.to_be_bytes());
+    let mut count = header.clone();
+    count.push(9);
+    rejected_image_stream(&peer.connection, &count).await?;
+    let mut oversized = header.clone();
+    oversized.push(1);
+    oversized.extend_from_slice(&((image_paste::MAX_IMAGE_BYTES + 1) as u32).to_be_bytes());
+    oversized.extend_from_slice(&[0; 32]);
+    rejected_image_stream(&peer.connection, &oversized).await?;
+    let mut body = header;
+    body.push(1);
+    body.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    body.extend_from_slice(blake3::hash(&bytes).as_bytes());
+    let mut truncated = body.clone();
+    truncated.extend_from_slice(&bytes[..bytes.len() - 1]);
+    rejected_image_stream(&peer.connection, &truncated).await?;
+    let mut corrupt = body.clone();
+    corrupt[18] ^= 1;
+    corrupt.extend_from_slice(&bytes);
+    rejected_image_stream(&peer.connection, &corrupt).await?;
+    let mut trailing = body;
+    trailing.extend_from_slice(&bytes);
+    trailing.push(0);
+    rejected_image_stream(&peer.connection, &trailing).await?;
+    let old_epoch = peer.epoch;
+    drop(peer);
+    let mut peer = Peer::attach(&client, &grant, &mut view, 2, None, 3).await?;
+    ensure!(peer.epoch > old_epoch, "image fixture did not reconnect");
+    let UploadReply::Ready(retried) =
+        image_paste::upload(&peer.connection, peer.epoch, std::slice::from_ref(&image)).await?
+    else {
+        bail!("image retry after reconnect was rejected");
+    };
+    ensure!(
+        retried == paths,
+        "image retry created a different remote path"
+    );
+    ensure!(
+        matches!(
+            image_paste::upload(&peer.connection, old_epoch, std::slice::from_ref(&image)).await?,
+            UploadReply::Rejected(_)
+        ),
+        "stale image upload epoch was accepted"
+    );
+    ensure!(
+        extract_pid(&view.text())? == pid,
+        "image upload restarted the PTY"
+    );
+    ensure!(
+        std::fs::read_dir(&directory)?.count() == 1,
+        "rejected image uploads left partial files"
+    );
+    for index in 1..64 {
+        let mut unique = bytes.clone();
+        unique.push(index);
+        ensure!(
+            matches!(
+                image_paste::upload(&peer.connection, peer.epoch, &[ImageBlob::new(unique)?])
+                    .await?,
+                UploadReply::Ready(_)
+            ),
+            "session image quota was applied too early"
+        );
+    }
+    let mut extra = bytes;
+    extra.push(64);
+    ensure!(
+        matches!(
+            image_paste::upload(&peer.connection, peer.epoch, &[ImageBlob::new(extra)?]).await?,
+            UploadReply::Rejected(_)
+        ),
+        "session image quota was not enforced"
+    );
+    ensure!(
+        matches!(
+            image_paste::upload(&peer.connection, peer.epoch, &[image]).await?,
+            UploadReply::Ready(_)
+        ),
+        "duplicate image failed at the session quota"
+    );
+    peer.send(ClientMessage::Close { epoch: peer.epoch })
+        .await?;
+    while view.exit.is_none() {
+        let event = peer.receive().await?;
+        view.process(&mut peer, event).await?;
+    }
+    peer.send(ClientMessage::ExitAck { epoch: peer.epoch })
+        .await?;
+    tokio::time::timeout(
+        WAIT,
+        running.task.take().context("image actor task missing")?,
+    )
+    .await???;
+    ensure!(
+        !directory.exists(),
+        "session image directory was not cleaned up"
+    );
+    println!(
+        "verified image bytes and PNG decoding, private permissions, malformed upload rejection, reconnect deduplication, stale epochs, session quotas and cleanup"
     );
     Ok(())
 }
