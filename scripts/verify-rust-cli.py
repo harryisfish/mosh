@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import heapq
+import hashlib
 import json
 import locale
 import os
@@ -24,6 +25,7 @@ import termios
 import time
 import tty
 import platform
+import zlib
 import shutil
 
 
@@ -125,9 +127,124 @@ def exact(data, timeout=5):
     assert bytes(received) == data, (bytes(received), data)
 
 
+def image_png(width=2, height=2, seed=1):
+    pixels = random.Random(seed).randbytes(width * height * 4)
+    rows = b"".join(b"\0" + pixels[start:start + width * 4]
+                    for start in range(0, len(pixels), width * 4))
+
+    def chunk(kind, body):
+        return (struct.pack("!I", len(body)) + kind + body
+                + struct.pack("!I", zlib.crc32(kind + body)))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack("!2I5B", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def image_png_dimensions(data):
+    assert data.startswith(b"\x89PNG\r\n\x1a\n"), "image is not PNG"
+    offset = 8
+    compressed = bytearray()
+    dimensions = None
+    ended = False
+    while offset < len(data):
+        length = struct.unpack("!I", data[offset:offset + 4])[0]
+        kind = data[offset + 4:offset + 8]
+        body = data[offset + 8:offset + 8 + length]
+        checksum = data[offset + 8 + length:offset + 12 + length]
+        assert len(body) == length and len(checksum) == 4, "truncated PNG chunk"
+        assert zlib.crc32(kind + body) == struct.unpack("!I", checksum)[0], "PNG checksum mismatch"
+        offset += 12 + length
+        if kind == b"IHDR":
+            dimensions = struct.unpack("!2I5B", body)
+        elif kind == b"IDAT":
+            compressed.extend(body)
+        elif kind == b"IEND":
+            ended = True
+            break
+    assert dimensions and ended and offset == len(data), "incomplete PNG"
+    width, height, depth, color, compression, filtering, interlace = dimensions
+    assert width and height and compression == filtering == 0
+    pixels = zlib.decompress(compressed)
+    if interlace == 0:
+        channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+        row_bytes = (width * channels * depth + 7) // 8
+        assert len(pixels) == height * (row_bytes + 1), "PNG pixel data length mismatch"
+        assert all(pixels[start] <= 4 for start in range(0, len(pixels), row_bytes + 1))
+    return [width, height]
+
+
 def remote_fixture(mode, state):
     tty.setraw(0, termios.TCSANOW if mode in ["redraw", "combining", "soft-wrap"] else termios.TCSAFLUSH)
     Path(state).write_text(json.dumps({"command": os.getpid(), "worker": os.getppid()}))
+    if mode == "image-paste":
+        received = Path(state + ".received")
+        received.write_bytes(b"")
+        observed = []
+        Path(state + ".observed").write_text("[]")
+        pending = bytearray()
+        line = bytearray()
+        kitty_enabled = False
+        last_input = time.monotonic()
+        os.write(1, b"\x1b[?2004h\x1b[2J\x1b[HIMAGE_PASTE_READY\r\n")
+        while True:
+            kitty_wanted = Path(state + ".kitty").exists()
+            if kitty_wanted != kitty_enabled:
+                os.write(1, b"\x1b[>31uIMAGE_PASTE_KITTY_READY\r\n" if kitty_wanted
+                         else b"\x1b[<uIMAGE_PASTE_LEGACY_READY\r\n")
+                kitty_enabled = kitty_wanted
+            if not select.select([0], [], [], 0.02)[0]:
+                assert time.monotonic() - last_input < 90, "image fixture input timed out"
+                continue
+            last_input = time.monotonic()
+            chunk = os.read(0, 4096)
+            assert chunk, "image fixture input ended early"
+            with received.open("ab") as output:
+                output.write(chunk)
+            pending.extend(chunk)
+            while pending:
+                if b"\x1b[200~".startswith(pending):
+                    break
+                if pending.startswith(b"\x1b[200~"):
+                    end = pending.find(b"\x1b[201~", 6)
+                    if end < 0:
+                        break
+                    text = bytes(pending[6:end]).decode()
+                    del pending[:end + 6]
+                    record = {"text": text, "files": []}
+                    try:
+                        paths = shlex.split(text)
+                    except ValueError:
+                        paths = []
+                    if paths and all(Path(path).is_absolute() for path in paths):
+                        for path in paths:
+                            item = {"path": path}
+                            try:
+                                with Path(path).open("rb") as image:
+                                    data = image.read(16 * 1024 * 1024 + 1)
+                                assert len(data) <= 16 * 1024 * 1024, "image fixture read limit exceeded"
+                                item.update(sha256=hashlib.sha256(data).hexdigest(), bytes=len(data),
+                                            mode=Path(path).stat().st_mode & 0o777,
+                                            directory_mode=Path(path).parent.stat().st_mode & 0o777)
+                                if data.startswith(b"\x89PNG"):
+                                    item["dimensions"] = image_png_dimensions(data)
+                            except (OSError, AssertionError) as error:
+                                item["error"] = str(error)
+                            record["files"].append(item)
+                    observed.append(record)
+                    updated = Path(state + ".observed.new")
+                    updated.write_text(json.dumps(observed))
+                    updated.replace(state + ".observed")
+                    os.write(1, f"\r\nIMAGE_PASTE_{len(observed)}_OK\r\n".encode())
+                    continue
+                byte = pending.pop(0)
+                if byte == 13:
+                    if line == b"finish":
+                        os.write(1, b"\r\nIMAGE_PASTE_DONE\r\n")
+                        return 9
+                    line.clear()
+                else:
+                    line.append(byte)
     if mode == "soft-wrap":
         observed = []
         received = Path(state + ".received")
@@ -708,6 +825,350 @@ def cleanup(state):
             os.kill(int(Path(state + ".proxy").read_text()), signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+
+def verify_image_paste(bin_dir, temporary, network=True, evidence_dir=None):
+    script = str(Path(__file__).resolve())
+    client = str(bin_dir / "mosh-rs")
+    server = str(bin_dir / "mosh-rs-server")
+    fixtures = Path(temporary) / "image sources"
+    fixtures.mkdir()
+    simple = Path(temporary) / "single.png"
+    first = fixtures / "中文 单'图.png"
+    second = fixtures / "second image.png"
+    data = image_png(seed=74)
+    other = image_png(3, 2, seed=75)
+    simple.write_bytes(data)
+    first.write_bytes(data)
+    second.write_bytes(other)
+    literal_directory = Path(temporary) / "literal-paths"
+    literal_directory.mkdir()
+    literal_sources = []
+    for filename, alias in [("rock'n'roll.png", "rocknroll.png"), ('say"hello".png', "sayhello.png"),
+                            ("slash\\name.png", "slashname.png"), ("cost$5(1)&semi;.png", None)]:
+        source = literal_directory / filename
+        source.write_bytes(data)
+        if alias is not None:
+            (literal_directory / alias).write_bytes(other)
+        literal_sources.append(source)
+    long_expected = []
+    for index in range(8):
+        directory = Path(temporary) / "long-paths" / str(index)
+        filename = f"image-{index}.png"
+        padding = 750 - len(os.fsencode(directory)) - len(filename) - 5
+        lengths = [padding // 4 + int(part < padding % 4) for part in range(4)]
+        assert all(2 <= length < 255 for length in lengths), "temporary directory is too long for the path fixture"
+        for part, length in enumerate(lengths):
+            directory /= str(part) + "-" + "d" * (length - 2)
+        directory.mkdir(parents=True)
+        source = directory / filename
+        assert len(os.fsencode(source)) == 750
+        content = image_png(index + 2, 2, seed=index + 120)
+        source.write_bytes(content)
+        long_expected.append((source, content, [index + 2, 2]))
+    long_expression = " ".join(str(source) for source, _, _ in long_expected)
+    assert len(os.fsencode(long_expression)) > 4096
+    long_command = " && ".join(str(source) for source, _, _ in long_expected)
+    facts = {"cases": [], "rejections": [], "native_clipboard": "not exercised by this automated PTY matrix"}
+
+    def session(name, proxy=False, options=None, extra_env=None, kitty=False):
+        state = str(Path(temporary) / ("image-" + name + ".json"))
+        if kitty:
+            Path(state + ".kitty").touch()
+        target = server
+        if proxy:
+            wrapper = Path(temporary) / ("image-proxy-" + name)
+            wrapper.write_text(f"#!{sys.executable}\nimport runpy,sys\nsys.argv={[script, '--proxy', server, state]!r}\nrunpy.run_path({script!r},run_name='__main__')\n")
+            wrapper.chmod(0o700)
+            target = str(wrapper)
+        process = TerminalProcess([client, "--local", "--server", target, "--predict", "never",
+                                   *(options or []), "--", sys.executable, script, "--remote", "image-paste", state],
+                                  extra_env)
+        try:
+            process.until(b"IMAGE_PASTE_READY")
+            if kitty:
+                process.until(b"IMAGE_PASTE_KITTY_READY")
+        except BaseException:
+            process.close()
+            cleanup(state)
+            raise
+        return process, state
+
+    def paste(text):
+        return b"\x1b[200~" + text.encode() + b"\x1b[201~"
+
+    def received(state):
+        return Path(state + ".received").read_bytes()
+
+    def observed(state):
+        return json.loads(Path(state + ".observed").read_text())
+
+    def wait_received(process, state, expected, timeout=15):
+        deadline = time.monotonic() + timeout
+        while received(state) != expected:
+            actual = received(state)
+            assert expected.startswith(actual), ("image input order/content changed", actual[-1500:], expected[-1500:])
+            process.pump(0.02)
+            assert process.process.poll() is None, bytes(process.output[-4000:])
+            assert time.monotonic() < deadline, ("image input did not arrive", actual[-1500:], expected[-1500:])
+
+    def uploaded(process, state, expression, expected, tail=b"\r", timeout=20):
+        before = received(state)
+        index = len(observed(state)) + 1
+        process.send(paste(expression) + tail)
+        process.until(f"IMAGE_PASTE_{index}_OK".encode(), timeout=timeout)
+        record = observed(state)[-1]
+        assert record["text"] != expression, ("local image paste reached the server without uploading", record)
+        paths = shlex.split(record["text"])
+        assert len(record["files"]) == len(expected), record
+        for item, (source, content, dimensions) in zip(record["files"], expected):
+            assert item["path"] != str(source), ("local image path reached the server without uploading", item)
+            assert item["path"] not in [str(simple), str(first), str(second)], item
+            assert "error" not in item, item
+            assert item["sha256"] == hashlib.sha256(content).hexdigest(), item
+            assert item["bytes"] == len(content) and item["dimensions"] == dimensions, item
+            assert item["mode"] & 0o077 == 0 and item["directory_mode"] & 0o077 == 0, item
+            assert Path(item["path"]).is_file(), item
+        assert paths == [item["path"] for item in record["files"]], record
+        wait_received(process, state, before + paste(record["text"]) + tail, timeout=timeout)
+        facts["cases"].append({"case": expression, "remote": record})
+        return paths
+
+    def finish(process, state, paths):
+        process.send(b"finish\r")
+        process.until(b"IMAGE_PASTE_DONE")
+        process.finish(9)
+        deadline = time.monotonic() + 5
+        while any(Path(path).exists() for path in paths):
+            process.pump(0.02)
+            assert time.monotonic() < deadline, ("session exit kept uploaded images", paths)
+
+    process, state = session("paths")
+    paths = set()
+    try:
+        uploaded_simple = uploaded(process, state, str(simple), [(simple, data, [2, 2])], tail=b"\rafter-image\r")
+        paths.update(uploaded_simple)
+        multiple = uploaded(process, state, shlex.quote(str(first)) + " " + shlex.quote(str(second)),
+                            [(first, data, [2, 2]), (second, other, [3, 2])])
+        assert multiple[0] == uploaded_simple[0], "identical image bytes created a second remote path"
+        paths.update(multiple)
+        escaped = "".join("\\" + char if char in " \t\\'\"" else char for char in str(first))
+        assert uploaded(process, state, escaped, [(first, data, [2, 2])]) == uploaded_simple
+        assert uploaded(process, state, first.as_uri(), [(first, data, [2, 2])]) == uploaded_simple
+        assert uploaded(process, state, str(first), [(first, data, [2, 2])]) == uploaded_simple
+        for source in literal_sources:
+            assert uploaded(process, state, str(source), [(source, data, [2, 2])]) == uploaded_simple
+            assert uploaded(process, state, shlex.quote(str(source)), [(source, data, [2, 2])]) == uploaded_simple
+        paths.update(uploaded(process, state, long_expression, long_expected))
+        ordinary = fixtures / "notes.txt"
+        ordinary.write_text("ordinary file")
+        for text in ["ordinary text with /tmp/example.png inside", str(ordinary), "/not-a-local-file/document.txt",
+                     str(simple) + " && " + str(second), long_command]:
+            before = received(state)
+            index = len(observed(state)) + 1
+            process.send(paste(text) + b"\r")
+            process.until(f"IMAGE_PASTE_{index}_OK".encode())
+            assert observed(state)[-1]["text"] == text, "ordinary paste was rewritten"
+            wait_received(process, state, before + paste(text) + b"\r")
+        missing = fixtures / "missing.png"
+        damaged = fixtures / "damaged.png"
+        damaged.write_bytes(b"not a PNG image")
+        oversized = fixtures / "oversized.png"
+        with oversized.open("wb") as output:
+            output.write(data)
+            output.seek(16 * 1024 * 1024)
+            output.write(b"x")
+        directory = fixtures / "directory.png"
+        directory.mkdir()
+        symlink = fixtures / "symlink.png"
+        symlink.symlink_to(simple)
+        rejected_expressions = [shlex.quote(str(path)) for path in [missing, damaged, oversized, directory, symlink]]
+        rejected_expressions.extend([str(fixtures / "missing'quote.png"), str(fixtures / 'missing"quote.png')])
+        rejected_expressions.append(" ".join([shlex.quote(str(simple))] * 9))
+        for expression in rejected_expressions:
+            before = received(state)
+            count = len(observed(state))
+            start = len(process.output)
+            process.send(paste(expression) + b"\r")
+            process.until(b"Image paste failed", start=start)
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                process.pump(0.02)
+            assert received(state) == before and len(observed(state)) == count, "failed image leaked input or Enter"
+            process.send(b"\x1b")
+            deadline = time.monotonic() + 0.15
+            while time.monotonic() < deadline:
+                process.pump(0.02)
+            process.send(b"after-failure\r")
+            wait_received(process, state, before + b"after-failure\r")
+            facts["rejections"].append(expression)
+        finish(process, state, paths)
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI image paths: single/multiple PNG, Chinese/spaces/quotes, escaped path, file URI, exact pixels/hash, ordered Enter, digest reuse, text passthrough, failure recovery and session cleanup passed", flush=True)
+
+    process, state = session("disabled", options=["--no-image-paste"])
+    try:
+        expression = shlex.quote(str(first))
+        process.send(paste(expression) + b"\r")
+        process.until(b"IMAGE_PASTE_1_OK")
+        assert observed(state)[0]["text"] == expression
+        wait_received(process, state, paste(expression) + b"\r")
+        finish(process, state, [])
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI --no-image-paste preserved the original local path bytes", flush=True)
+
+    process, state = session("kitty-recovery", kitty=True)
+    try:
+        x_press = b"\x1b[88;1:1u"
+        for modifiers in [1, 65, 129, 193]:
+            before = received(state)
+            start = len(process.output)
+            process.send(paste(shlex.quote(str(missing))) + b"\r")
+            process.until(b"Image paste failed", start=start)
+            assert received(state) == before, "failed image leaked input with Kitty enabled"
+            recovery = b"".join(f"\x1b[27;{modifiers}:{phase}u".encode() for phase in [1, 2, 3])
+            process.send(recovery + x_press)
+            wait_received(process, state, before + x_press)
+        Path(state + ".kitty").unlink()
+        process.until(b"IMAGE_PASTE_LEGACY_READY")
+        process.send(b"\r")
+        finish(process, state, [])
+        facts["kitty_recovery"] = {"escape_modifiers": [1, 65, 129, 193], "remote_press": x_press.hex()}
+    finally:
+        process.close()
+        cleanup(state)
+    print("CLI Kitty image failure recovery consumed Escape press/repeat/release with Caps Lock and Num Lock; only the following X press reached the PTY", flush=True)
+
+    if sys.platform.startswith("linux"):
+        shim_dir = Path(temporary) / "image-clipboard-shim"
+        shim_dir.mkdir()
+        clipboard = shim_dir / "clipboard.json"
+        shim = shim_dir / "wl-paste"
+        shim.write_text(f"""#!{sys.executable}
+import json,sys
+from pathlib import Path
+item=json.loads(Path({str(clipboard)!r}).read_text())
+types={{'png':'image/png','files':'text/uri-list','text':'text/plain'}}
+if '--list-types' in sys.argv:
+    print(types[item['kind']])
+elif item['kind']=='png':
+    sys.stdout.buffer.write(Path(item['path']).read_bytes())
+elif item['kind']=='files':
+    print(Path(item['path']).as_uri())
+else:
+    print('ordinary clipboard text')
+""")
+        shim.chmod(0o700)
+        clipboard.write_text(json.dumps({"kind": "png", "path": str(simple)}))
+        process, state = session("clipboard-shim", extra_env={"PATH": str(shim_dir) + os.pathsep + os.environ["PATH"],
+                                                            "WAYLAND_DISPLAY": "mosh-image-test"})
+        local_paths = set()
+        try:
+            for kind, source, content, dimensions in [("png", simple, data, [2, 2]), ("files", second, other, [3, 2])]:
+                clipboard.write_text(json.dumps({"kind": kind, "path": str(source)}))
+                before = received(state)
+                index = len(observed(state)) + 1
+                process.send(b"\x16\r")
+                process.until(f"IMAGE_PASTE_{index}_OK".encode())
+                record = observed(state)[-1]
+                assert len(record["files"]) == 1, record
+                item = record["files"][0]
+                assert item["path"] != str(source) and "error" not in item, item
+                assert item["sha256"] == hashlib.sha256(content).hexdigest() and item["dimensions"] == dimensions, item
+                wait_received(process, state, before + paste(record["text"]) + b"\r")
+                local_paths.add(item["path"])
+            clipboard.write_text(json.dumps({"kind": "text"}))
+            before = received(state)
+            process.send(b"\x16text-clipboard\r")
+            wait_received(process, state, before + b"\x16text-clipboard\r")
+            finish(process, state, local_paths)
+        finally:
+            process.close()
+            cleanup(state)
+        facts["clipboard_simulation"] = "wl-paste PATH shim, not native clipboard"
+        print("CLI simulated Wayland clipboard: PNG, file URI and non-image Ctrl-V passthrough passed; native clipboard not tested here", flush=True)
+
+    if network:
+        def relay_profile(state, profile):
+            updated = Path(state + ".profile.new")
+            updated.write_text(json.dumps(profile))
+            updated.replace(state + ".profile")
+
+        large = Path(temporary) / "reconnect.png"
+        large_data = image_png(512, 512, seed=91)
+        large.write_bytes(large_data)
+        process, state = session("reconnect", proxy=True)
+        try:
+            original_processes = json.loads(Path(state).read_text())
+            profile = {"bandwidth_bps": 512_000, "delay_ms": 10}
+            relay_profile(state, profile)
+            deadline = time.monotonic() + 5
+            while True:
+                process.pump(0.02)
+                stats = json.loads(Path(state + ".stats").read_text()) if Path(state + ".stats").exists() else {}
+                if stats.get("profile") == profile:
+                    break
+                assert time.monotonic() < deadline, "image relay did not install bandwidth limit"
+            sent_before = stats["up"]["forwarded_bytes"]
+            process.send(paste(str(large)) + b"\r")
+            deadline = time.monotonic() + 10
+            while True:
+                process.pump(0.02)
+                stats = json.loads(Path(state + ".stats").read_text())
+                if stats["up"]["forwarded_bytes"] - sent_before >= 64 * 1024:
+                    break
+                assert process.process.poll() is None, bytes(process.output[-4000:])
+                assert time.monotonic() < deadline, "image upload did not start through the relay"
+            assert received(state) == b"", "image was committed before the mid-upload outage"
+            Path(state + ".drop").touch()
+            large.write_bytes(other)
+            relay_profile(state, {})
+            deadline = time.monotonic() + 22
+            while time.monotonic() < deadline:
+                process.pump(0.05)
+                assert process.process.poll() is None, bytes(process.output[-4000:])
+                assert received(state) == b"", "image input crossed a UDP blackout"
+            Path(state + ".drop").unlink()
+            process.until(b"IMAGE_PASTE_1_OK", timeout=45)
+            record = observed(state)[0]
+            item, = record["files"]
+            assert item["path"] != str(large) and "error" not in item, item
+            assert item["sha256"] == hashlib.sha256(large_data).hexdigest() and item["dimensions"] == [512, 512], item
+            wait_received(process, state, paste(record["text"]) + b"\r", timeout=30)
+            assert json.loads(Path(state).read_text()) == original_processes, "image reconnect replaced the remote command"
+            assert len(observed(state)) == 1, "image paste repeated after reconnect"
+            large.write_bytes(large_data)
+            assert uploaded(process, state, str(large), [(large, large_data, [512, 512])], timeout=30) == [item["path"]]
+            finish(process, state, [item["path"]])
+            facts["reconnect"] = {"original_processes": original_processes, "remote": record,
+                                  "forwarded_before_blackout": stats["up"]["forwarded_bytes"] - sent_before,
+                                  "source_changed_during_blackout": True}
+        finally:
+            process.close()
+            cleanup(state)
+        print("CLI mid-upload UDP blackout recovered with original command/image bytes, one ordered paste and stable digest path", flush=True)
+
+        process, state = session("cancel", proxy=True)
+        try:
+            Path(state + ".drop").touch()
+            process.send(paste(str(simple)) + b"\r")
+            process.send(b"\x1e.")
+            process.finish(0)
+            assert received(state) == b"", "detached image upload sent a path or Enter"
+            os.kill(json.loads(Path(state).read_text())["command"], 0)
+        finally:
+            process.close()
+            cleanup(state)
+        print("CLI local detach remained available while image upload was blocked", flush=True)
+
+    if evidence_dir:
+        evidence = Path(evidence_dir)
+        evidence.mkdir(parents=True, exist_ok=True)
+        (evidence / "image-paste.json").write_text(json.dumps(facts, indent=2, ensure_ascii=False) + "\n")
 
 
 def verify_saturated_input(bin_dir, temporary):
@@ -2182,6 +2643,7 @@ else:
         print("CLI running background clients exit on TERM/HUP without touching the terminal or ending the remote command", flush=True)
 
         if network:
+            verify_image_paste(bin_dir, temporary, evidence_dir=evidence_dir)
             verify_soft_wrap(bin_dir, temporary, evidence_dir, display_example)
             verify_combining(bin_dir, temporary, evidence_dir, core_example)
             verify_legacy_input(bin_dir, temporary, evidence_dir)
@@ -2626,6 +3088,7 @@ if __name__ == "__main__":
     parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parents[1] / "target" / "debug")
     parser.add_argument("--display-example", type=Path, help="path to the verify_display example used by redraw verification")
     parser.add_argument("--core-example", type=Path, help="path to the verify_core example used by combining verification")
+    parser.add_argument("--image-paste", action="store_true", help="exercise image uploads, path rewriting, failure recovery and UDP reconnect through real PTYs")
     parser.add_argument("--network", action="store_true", help="also exercise raw input over impaired UDP and automatic reconnect")
     parser.add_argument("--liveness", action="store_true", help="exercise idle, one-way UDP loss, pending input and SIGCONT confirmation")
     parser.add_argument("--legacy-input", action="store_true", help="exercise legacy key deadlines, exact PTY bytes and management recovery")
@@ -2637,7 +3100,10 @@ if __name__ == "__main__":
     parser.add_argument("--diagnostics", action="store_true", help="verify both endpoint logs, blocked terminal output and healthy idle")
     parser.add_argument("--baseline", action="store_true", help="run the deterministic impairment matrix and save comparable metrics")
     arguments = parser.parse_args()
-    if arguments.baseline:
+    if arguments.image_paste:
+        with tempfile.TemporaryDirectory(prefix="mosh-rs-images-") as temporary:
+            verify_image_paste(arguments.bin_dir.resolve(), temporary, evidence_dir=arguments.evidence_dir)
+    elif arguments.baseline:
         verify_baseline(arguments.bin_dir.resolve(), arguments.evidence_dir)
     elif arguments.soft_wrap:
         with tempfile.TemporaryDirectory(prefix="mosh-rs-soft-wrap-") as temporary:

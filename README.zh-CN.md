@@ -10,7 +10,7 @@
 本项目是 [Mosh](https://github.com/mobile-shell/mosh) 的 Rust 重写版本。
 客户端和服务端分别为 `mosh-rs` 与 `mosh-rs-server`。
 
-当前源码使用协议 v7，与原版 Mosh 协议和较早的 Rust 协议均不兼容。
+当前源码使用协议 v8，与原版 Mosh 协议和较早的 Rust 协议均不兼容。
 客户端和服务端请安装同一版本。
 
 ## 安装
@@ -155,12 +155,14 @@ mosh-rs --server /home/user/.local/bin/mosh-rs-server user@host
   选择 Kitty 或 SIXEL 输出，其他终端使用文本输出。可用 `--graphics kitty`、
   `--graphics sixel` 或 `--graphics none` 覆盖自动选择。
 - 支持 OSC 52 剪贴板写入。读取剪贴板需要启用 `--clipboard-read`。
+- 粘贴本地 PNG、JPEG、GIF、WebP 文件时，先上传图片，再把远端路径交给应用。
+  macOS 和 Linux 也支持用 `Ctrl-V` 粘贴剪贴板图片，详见[图片粘贴](docs/rust-usage.md#paste-images)。
 - 对符合条件的可打印 ASCII 输入进行自适应预测。在观察到远程输出前，以带下划线的文字
   显示预测。使用 `--predict never` 关闭预测。
 
 不支持动画图片或任意终端扩展透传。客户端显示当前屏幕，不提供独立的终端历史搜索界面。
 输入预测使用启发式判断，在远程终端模式切换时可能短暂显示输入内容。
-本客户端不提供文件传输、端口转发或 X11 转发。
+本客户端不提供通用文件传输、端口转发或 X11 转发。
 
 终端要求、图片限制、预测行为和资源上限详见[使用指南](docs/rust-usage.md)。
 

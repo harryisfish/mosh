@@ -58,6 +58,9 @@ struct Args {
     /// Allow remote programs to request the local clipboard.
     #[arg(long)]
     clipboard_read: bool,
+    /// Disable image uploads and forward pasted paths and Ctrl-V unchanged.
+    #[arg(long = "no-image-paste", action = clap::ArgAction::SetFalse)]
+    image_paste: bool,
     /// Record bounded persistent diagnostics on both endpoints without terminal contents.
     #[arg(long)]
     diagnostics: bool,
@@ -145,6 +148,7 @@ async fn run() -> Result<i32> {
             graphics,
             prediction,
             clipboard_read: args.clipboard_read,
+            image_paste: args.image_paste,
         },
     )
     .await
