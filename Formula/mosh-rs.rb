@@ -1,17 +1,17 @@
 class MoshRs < Formula
   desc "Resumable remote terminal with local input prediction"
   homepage "https://github.com/harryisfish/mosh"
-  version "0.1.3"
+  version "0.1.6"
   license "GPL-3.0-or-later"
 
   on_macos do
     on_arm do
-      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.3/mosh-rs-0.1.3-aarch64-apple-darwin.tar.gz"
-      sha256 "6663fc0a2bb5e7c93d8c4265307f61f84d38871abc21680d7039d957185f11c8"
+      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.6/mosh-rs-0.1.6-aarch64-apple-darwin.tar.gz"
+      sha256 "cec1f4efbf2a22db788b77eaa0db0cad8b96aabc5c97485c9f98e2da96a2b89a"
     end
     on_intel do
-      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.3/mosh-rs-0.1.3-x86_64-apple-darwin.tar.gz"
-      sha256 "eab47132f5e0744ee6bf5ac746312c0479275940520a4decb798a4278ed5b11e"
+      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.6/mosh-rs-0.1.6-x86_64-apple-darwin.tar.gz"
+      sha256 "e5e74fc4bebf7ab40133bcc5f0a80139d20176fd15a1298ba2a6ee07d7b06f5f"
     end
   end
 
@@ -19,12 +19,12 @@ class MoshRs < Formula
     depends_on "openssh"
 
     on_arm do
-      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.3/mosh-rs-0.1.3-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "2fcf338329f064f36fb5e87ebeed9e445b6b8b4a0b8aa79b89744599f8ccce44"
+      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.6/mosh-rs-0.1.6-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "a0c26b1dc666beb5b9ece16429f714874ce46d5036ac761cf91e8b7819c9daab"
     end
     on_intel do
-      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.3/mosh-rs-0.1.3-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "72634cc92b110d74d94a027ee9e0b45d276a56a38ece662936bb4d8914d2f4dd"
+      url "https://github.com/harryisfish/mosh/releases/download/rust-v0.1.6/mosh-rs-0.1.6-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "dff64855a1178e0ad934910d89449a881d536c68ca73ae9d0fdfbc810ce921d1"
     end
   end
 
