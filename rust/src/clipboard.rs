@@ -21,6 +21,17 @@ pub enum PreparedInput {
     },
 }
 
+enum ShellSyntax {
+    Command,
+    Invalid,
+}
+
+enum ImagePaths {
+    Files(Vec<String>),
+    Text,
+    Invalid,
+}
+
 pub fn is_paste_key(event: &InputEvent) -> bool {
     matches!(event, InputEvent::Key(Key {
         code: KeyCode::Char('v' | 'V'),
@@ -64,17 +75,29 @@ pub async fn prepare(events: Vec<InputEvent>) -> Result<PreparedInput> {
 fn event_candidate(event: &InputEvent) -> bool {
     is_paste_key(event)
         || matches!(event, InputEvent::Paste(text)
-            if raw_image_path(text).is_some() || image_paths(text).is_some())
+            if raw_image_path(text).is_some() || !matches!(image_paths(text), ImagePaths::Text))
 }
 
-fn image_paths(text: &str) -> Option<Vec<String>> {
-    let paths = shell_words(text)?;
-    (!paths.is_empty() && paths.iter().all(|path| image_path(path))).then_some(paths)
+fn image_paths(text: &str) -> ImagePaths {
+    match shell_words(text) {
+        Ok(paths) if !paths.is_empty() && paths.iter().all(|path| image_path(path)) => {
+            ImagePaths::Files(paths)
+        }
+        Ok(_) | Err(ShellSyntax::Command) => ImagePaths::Text,
+        Err(ShellSyntax::Invalid) => {
+            if raw_image_path(text.trim().trim_start_matches(['\'', '"'])).is_some() {
+                ImagePaths::Invalid
+            } else {
+                ImagePaths::Text
+            }
+        }
+    }
 }
 
 fn raw_image_path(text: &str) -> Option<&str> {
     let path = text.trim();
-    (!path.chars().any(char::is_control) && image_path(path)).then_some(path)
+    (!path.chars().any(char::is_control) && image_path(path.trim_end_matches(['\'', '"', '\\'])))
+        .then_some(path)
 }
 
 fn image_path(path: &str) -> bool {
@@ -95,7 +118,7 @@ fn image_path(path: &str) -> bool {
         })
 }
 
-fn shell_words(text: &str) -> Option<Vec<String>> {
+fn shell_words(text: &str) -> Result<Vec<String>, ShellSyntax> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut chars = text.chars().peekable();
@@ -103,13 +126,13 @@ fn shell_words(text: &str) -> Option<Vec<String>> {
     let mut started = false;
     while let Some(ch) = chars.next() {
         if ch.is_control() && !ch.is_whitespace() {
-            return None;
+            return Err(ShellSyntax::Invalid);
         }
         match (quote, ch) {
             (Some('\''), '\'') | (Some('"'), '"') => quote = None,
             (Some('\''), _) => word.push(ch),
             (Some('"'), '\\') => {
-                let next = *chars.peek()?;
+                let next = *chars.peek().ok_or(ShellSyntax::Invalid)?;
                 if matches!(next, '$' | '`' | '"' | '\\' | '\n') {
                     chars.next();
                     if next != '\n' {
@@ -125,7 +148,7 @@ fn shell_words(text: &str) -> Option<Vec<String>> {
                 started = true;
             }
             (None, '\\') => {
-                let next = chars.next()?;
+                let next = chars.next().ok_or(ShellSyntax::Invalid)?;
                 if next != '\n' {
                     word.push(next);
                     started = true;
@@ -137,7 +160,9 @@ fn shell_words(text: &str) -> Option<Vec<String>> {
                     started = false;
                 }
             }
-            (None, ';' | '&' | '|' | '<' | '>' | '`' | '$' | '(' | ')') => return None,
+            (None, ';' | '&' | '|' | '<' | '>' | '`' | '$' | '(' | ')') => {
+                return Err(ShellSyntax::Command);
+            }
             (None, _) => {
                 word.push(ch);
                 started = true;
@@ -146,12 +171,12 @@ fn shell_words(text: &str) -> Option<Vec<String>> {
         }
     }
     if quote.is_some() {
-        return None;
+        return Err(ShellSyntax::Invalid);
     }
     if started {
         words.push(word);
     }
-    Some(words)
+    Ok(words)
 }
 
 fn file_uri(uri: &str) -> Option<String> {
@@ -191,19 +216,16 @@ fn local_path(path: &str) -> Result<PathBuf> {
     })
 }
 
-async fn load_images(
-    paths: Option<Vec<String>>,
-    raw: Option<String>,
-) -> Result<Option<Vec<ImageBlob>>> {
+async fn load_images(paths: ImagePaths, raw: Option<String>) -> Result<Option<Vec<ImageBlob>>> {
     tokio::task::spawn_blocking(move || {
         let paths = if let Some(raw) = raw {
             match std::fs::symlink_metadata(local_path(&raw)?) {
-                Ok(_) => Some(vec![raw]),
+                Ok(_) => ImagePaths::Files(vec![raw]),
                 Err(error)
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
+                    ) || error.raw_os_error() == Some(libc::ENAMETOOLONG) =>
                 {
                     paths
                 }
@@ -212,8 +234,10 @@ async fn load_images(
         } else {
             paths
         };
-        let Some(paths) = paths else {
-            return Ok(None);
+        let paths = match paths {
+            ImagePaths::Files(paths) => paths,
+            ImagePaths::Text => return Ok(None),
+            ImagePaths::Invalid => anyhow::bail!("invalid image path quoting or escape"),
         };
         ensure!(paths.len() <= MAX_IMAGES, "too many pasted images");
         let mut images = Vec::with_capacity(paths.len());
@@ -370,7 +394,7 @@ ObjC.import('AppKit');
             if paths.is_empty() || !paths.iter().all(|path| image_path(path)) {
                 return Ok(None);
             }
-            load_images(Some(paths), None).await
+            load_images(ImagePaths::Files(paths), None).await
         }
         Reply::Image { data } => Ok(Some(vec![ImageBlob::new(
             STANDARD
@@ -444,7 +468,7 @@ async fn clipboard_images() -> Result<Option<Vec<ImageBlob>>> {
         if paths.is_empty() || !paths.iter().all(|path| image_path(path)) {
             return Ok(None);
         }
-        load_images(Some(paths), None).await
+        load_images(ImagePaths::Files(paths), None).await
     } else {
         Ok(Some(vec![ImageBlob::new(output.bytes)?]))
     }

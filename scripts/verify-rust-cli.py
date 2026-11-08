@@ -851,6 +851,24 @@ def verify_image_paste(bin_dir, temporary, network=True, evidence_dir=None):
         if alias is not None:
             (literal_directory / alias).write_bytes(other)
         literal_sources.append(source)
+    long_expected = []
+    for index in range(8):
+        directory = Path(temporary) / "long-paths" / str(index)
+        filename = f"image-{index}.png"
+        padding = 750 - len(os.fsencode(directory)) - len(filename) - 5
+        lengths = [padding // 4 + int(part < padding % 4) for part in range(4)]
+        assert all(2 <= length < 255 for length in lengths), "temporary directory is too long for the path fixture"
+        for part, length in enumerate(lengths):
+            directory /= str(part) + "-" + "d" * (length - 2)
+        directory.mkdir(parents=True)
+        source = directory / filename
+        assert len(os.fsencode(source)) == 750
+        content = image_png(index + 2, 2, seed=index + 120)
+        source.write_bytes(content)
+        long_expected.append((source, content, [index + 2, 2]))
+    long_expression = " ".join(str(source) for source, _, _ in long_expected)
+    assert len(os.fsencode(long_expression)) > 4096
+    long_command = " && ".join(str(source) for source, _, _ in long_expected)
     facts = {"cases": [], "rejections": [], "native_clipboard": "not exercised by this automated PTY matrix"}
 
     def session(name, proxy=False, options=None, extra_env=None, kitty=False):
@@ -941,10 +959,11 @@ def verify_image_paste(bin_dir, temporary, network=True, evidence_dir=None):
         for source in literal_sources:
             assert uploaded(process, state, str(source), [(source, data, [2, 2])]) == uploaded_simple
             assert uploaded(process, state, shlex.quote(str(source)), [(source, data, [2, 2])]) == uploaded_simple
+        paths.update(uploaded(process, state, long_expression, long_expected))
         ordinary = fixtures / "notes.txt"
         ordinary.write_text("ordinary file")
         for text in ["ordinary text with /tmp/example.png inside", str(ordinary), "/not-a-local-file/document.txt",
-                     str(simple) + " && " + str(second)]:
+                     str(simple) + " && " + str(second), long_command]:
             before = received(state)
             index = len(observed(state)) + 1
             process.send(paste(text) + b"\r")
@@ -964,6 +983,7 @@ def verify_image_paste(bin_dir, temporary, network=True, evidence_dir=None):
         symlink = fixtures / "symlink.png"
         symlink.symlink_to(simple)
         rejected_expressions = [shlex.quote(str(path)) for path in [missing, damaged, oversized, directory, symlink]]
+        rejected_expressions.extend([str(fixtures / "missing'quote.png"), str(fixtures / 'missing"quote.png')])
         rejected_expressions.append(" ".join([shlex.quote(str(simple))] * 9))
         for expression in rejected_expressions:
             before = received(state)

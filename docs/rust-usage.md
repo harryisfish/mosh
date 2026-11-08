@@ -265,6 +265,8 @@ quoted remote path after the server confirms it. Absolute paths, `~/` paths,
 local `file://` URIs, and shell-quoted or escaped lists of image paths are
 supported. Ordinary text and non-image paths keep their existing behavior.
 Only a whole image path or a list of image paths triggers an upload.
+If an unquoted path with spaces is missing, the client treats it as ordinary
+text. Quote such paths to make image-path intent explicit.
 
 For screenshots and images copied to the system clipboard, press `Ctrl-V`.
 On macOS the client reads PNG or converts TIFF to PNG, and uses the original
