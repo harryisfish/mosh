@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::diagnostics::{self, Context as DiagnosticContext, ProgressSnapshot, Stage};
+use crate::image_paste::{self, ImageDirectory, ImageStore, StagedBatch, UploadReply};
 use crate::model::*;
 use crate::pty::Pty;
 use crate::state;
@@ -28,6 +29,15 @@ enum Event {
     },
     Disconnected {
         epoch: u64,
+    },
+    ImageDirectory {
+        epoch: u64,
+        reply: oneshot::Sender<std::result::Result<Arc<ImageDirectory>, String>>,
+    },
+    ImageStaged {
+        epoch: u64,
+        batch: StagedBatch,
+        reply: oneshot::Sender<UploadReply>,
     },
     DisplaySent {
         epoch: u64,
@@ -205,6 +215,7 @@ struct RunningSession {
     resource_sequence: u64,
     exit_acknowledged: bool,
     display_cancellations: u64,
+    images: ImageStore,
 }
 
 impl SessionActor {
@@ -390,6 +401,7 @@ impl PreparedSession {
             resource_sequence: 0,
             exit_acknowledged: false,
             display_cancellations: 0,
+            images: ImageStore::default(),
         };
         running.send(ServerMessage::Attached {
             epoch: 1,
@@ -509,6 +521,31 @@ impl RunningSession {
                 }
             }
             Event::Disconnected { epoch } if self.active(epoch) => self.disconnect(),
+            Event::ImageDirectory { epoch, reply } => {
+                let directory = if self.active(epoch) && self.exit.is_none() {
+                    self.images
+                        .directory(&self.session)
+                        .map_err(|error| error.to_string())
+                } else {
+                    Err("image upload attachment ended".into())
+                };
+                let _ = reply.send(directory);
+            }
+            Event::ImageStaged {
+                epoch,
+                batch,
+                reply,
+            } => {
+                let result = if self.active(epoch) && self.exit.is_none() {
+                    match self.images.publish(batch) {
+                        Ok(paths) => UploadReply::Ready(paths),
+                        Err(error) => UploadReply::Rejected(error.to_string()),
+                    }
+                } else {
+                    UploadReply::Rejected("image upload attachment ended".into())
+                };
+                let _ = reply.send(result);
+            }
             Event::DisplaySent {
                 epoch,
                 revision,
@@ -1237,6 +1274,35 @@ async fn serve_connection(connection: Connection, sender: mpsc::Sender<Event>) -
             return Ok(());
         }
     };
+    let uploading_connection = connection.clone();
+    let uploading_sender = sender.clone();
+    let uploads = AcceptTask(tokio::spawn(async move {
+        while let Ok((mut output, mut input)) = uploading_connection.accept_bi().await {
+            let result = async {
+                let (reply, directory) = oneshot::channel();
+                uploading_sender
+                    .send(Event::ImageDirectory { epoch, reply })
+                    .await?;
+                let directory = directory.await?.map_err(anyhow::Error::msg)?;
+                let batch = image_paste::receive(&mut input, epoch, directory).await?;
+                let (reply, received) = oneshot::channel();
+                uploading_sender
+                    .send(Event::ImageStaged {
+                        epoch,
+                        batch,
+                        reply,
+                    })
+                    .await?;
+                Result::<UploadReply>::Ok(received.await?)
+            };
+            let reply = match tokio::time::timeout(Duration::from_secs(125), result).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(error)) => UploadReply::Rejected(error.to_string()),
+                Err(_) => UploadReply::Rejected("image upload timed out".into()),
+            };
+            let _ = image_paste::send_reply(&mut output, &reply).await;
+        }
+    }));
     let writer_connection = connection.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = receive.recv().await {
@@ -1274,6 +1340,7 @@ async fn serve_connection(connection: Connection, sender: mpsc::Sender<Event>) -
         Result::<()>::Ok(())
     }
     .await;
+    drop(uploads);
     writer.abort();
     let _ = sender.send(Event::Disconnected { epoch }).await;
     connection.close(0u32.into(), b"control reader ended");

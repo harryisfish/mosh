@@ -24,7 +24,7 @@ use crate::model::{
     validate_locale_candidates,
 };
 
-const ALPN: &[u8] = b"mosh-rs/7";
+const ALPN: &[u8] = b"mosh-rs/8";
 const FRAME_STREAM: u8 = 1;
 const RESOURCE_STREAM: u8 = 2;
 const STREAM_WINDOW: u32 = 1024 * 1024;
@@ -233,7 +233,7 @@ fn private_key(bytes: &[u8]) -> PrivateKeyDer<'static> {
 fn transport_config() -> TransportConfig {
     let mut config = TransportConfig::default();
     config
-        .max_concurrent_bidi_streams(1_u32.into())
+        .max_concurrent_bidi_streams(2_u32.into())
         .max_concurrent_uni_streams(3_u32.into())
         .stream_receive_window(STREAM_WINDOW.into())
         .receive_window(CONNECTION_WINDOW.into())

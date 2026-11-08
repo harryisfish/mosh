@@ -380,7 +380,7 @@ async fn main() -> Result<()> {
     }
     tokio::time::timeout(Duration::from_secs(40), verify()).await??;
     println!(
-        "transport verification passed: mutual TLS, protocol v7, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
+        "transport verification passed: mutual TLS, protocol v8, bounded bootstrap envelopes, compact bounded control, framing, cancellation, control capacity, image hashing, bounded decompression, detached bootstrap"
     );
     Ok(())
 }
@@ -849,7 +849,7 @@ async fn verify() -> Result<()> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .map_err(|_| anyhow::anyhow!("unexpected TLS handshake data"))?;
     ensure!(
-        handshake.protocol.as_deref() == Some(&b"mosh-rs/7"[..]),
+        handshake.protocol.as_deref() == Some(&b"mosh-rs/8"[..]),
         "QUIC negotiated an unexpected protocol"
     );
     println!("hostname candidates reach an IPv4-only server without waiting for IPv6 timeout");

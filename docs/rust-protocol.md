@@ -3,9 +3,9 @@
 This is the implementation contract for the Rust client and server. The protocol
 is not compatible with the original Mosh wire protocol.
 
-The current Rust protocol is version 7, with ALPN `mosh-rs/7`. Both endpoints
-must use this version. Earlier Rust workers cannot resume with a version 7 client.
-Version 6 and older peers are rejected by bootstrap, grant, Attach, and ALPN validation.
+The current Rust protocol is version 8, with ALPN `mosh-rs/8`. Both endpoints
+must use this version. Earlier Rust workers cannot resume with a version 8 client.
+Version 7 and older peers are rejected by bootstrap, grant, Attach, and ALPN validation.
 
 ## Ownership and authentication
 
@@ -116,6 +116,43 @@ Frames use bounded postcard encoding and zstd compression. Image keys hash their
 dimensions followed by their RGBA bytes. A cache miss explicitly requests the
 missing resources. A base mismatch requests a checkpoint. Application exit has its own final acknowledgement.
 
+## Image paste uploads
+
+The first bidirectional stream carries Attach and control messages. After
+attachment, one additional low-priority bidirectional stream uploads a paste.
+The transport permits two simultaneous bidirectional streams per connection.
+The server receives upload streams serially and never writes their bytes to
+the PTY.
+
+The request starts with five bytes `MIMG\x01`, a big-endian u64 epoch, and a
+u8 image count. Each image follows as a big-endian u32 byte length, a 32-byte
+BLAKE3 digest of the original file bytes, and exactly that many bytes. The
+sender finishes the stream. The receiver requires EOF, verifies the epoch,
+lengths, digests, and PNG, JPEG, GIF, or WebP signatures, and rejects trailing
+bytes. No local filename or remote destination path appears in the request.
+
+A success response contains byte 0, a u8 count, and one UTF-8 absolute path per
+image, each prefixed by a big-endian u16 byte length. A refusal contains byte 1
+and one length-prefixed UTF-8 reason. Paths are limited to 4096 bytes and reasons
+to 256 bytes. Both responses end with FIN and the client requires EOF. Uploads
+have a 120-second deadline and responses have a 10-second deadline.
+
+Uploads are limited to eight images, 16 MiB per image, and 32 MiB per paste.
+The session owns a 0700 temporary directory and 0600 files. A receiving task
+stages complete, verified content. The actor checks the active epoch again
+before publishing files under their digests and format extensions. Only the
+actor changes the session index or authorizes paths. Distinct stored content
+is limited to 64 files and 128 MiB. Interrupted staging is removed; completed
+files survive reattachment and are removed when the server session ends.
+
+The client keeps image preparation and upload ahead of its normal input
+queue. Later typing and clipboard query results wait in a bounded deferred
+queue while local escape commands remain active. Only confirmed remote paths
+become ordinary Paste events with normal input sequence numbers. Reconnection
+retries the prepared bytes and digest names keep paths stable. A refused paste
+discards deferred input and blocks ordinary typing until an explicit Escape,
+so a late Enter cannot submit a message with a missing image.
+
 ## Local key-prefix decoding
 
 Keyboard prefixes have an absolute 30 ms deadline beginning with their first
@@ -130,7 +167,7 @@ The deadline does not apply inside paste, OSC/DCS/APC strings, or an identified
 X10 mouse event's three payload bytes. These bodies cannot execute local escape
 commands. The captured input tail is processed before a clock-only expiry.
 Suspension does not refresh keyboard deadlines. Refusals allocate no input seq
-and cannot be replayed later. The wire uses version 7; Linux F1-F5,
+and cannot be replayed later. The wire uses version 8; Linux F1-F5,
 xterm F21-F24, Keypad Begin, and Keypad Equal use existing semantic keys.
 
 Empty-parameter rxvt `CSI a` through `CSI d` encode Shift arrows, and `SS3 a`
@@ -244,7 +281,8 @@ Each row carries a `RowWrap` value: `Hard`, `Soft`, or `WidePadding`.
 when a wide grapheme did not fit. The core records that provenance at the print
 operation and preserves it through scroll and reflow. A real space typed at the
 same position remains `Soft`. Deltas compare the entire row, including its wrap
-kind. Version 7 requires this representation and rejects version 6 peers.
+kind. Since version 7, the protocol requires this representation and rejects
+version 6 peers.
 
 The display retains the canonical rows and the last observed local viewport.
 It redraws complete connected groups across old and new boundaries. Ordinary

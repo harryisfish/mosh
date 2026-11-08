@@ -256,6 +256,45 @@ no recurring status redraw.
 Suspension and SIGCONT begin a new observation window, so the suspended interval
 does not immediately trigger a warning. Queued old replies cannot confirm
 recovery. Local close and input-refusal notices keep their priority.
+
+## Paste images
+
+Paste a local PNG, JPEG, GIF, or WebP file path into the remote application.
+The client uploads the file over the authenticated connection and inserts a
+quoted remote path after the server confirms it. Absolute paths, `~/` paths,
+local `file://` URIs, and shell-quoted or escaped lists of image paths are
+supported. Ordinary text and non-image paths keep their existing behavior.
+Only a whole image path or a list of image paths triggers an upload.
+If an unquoted path with spaces is missing, the client treats it as ordinary
+text. Quote such paths to make image-path intent explicit.
+
+For screenshots and images copied to the system clipboard, press `Ctrl-V`.
+On macOS the client reads PNG or converts TIFF to PNG, and uses the original
+files when Finder supplies file URLs. On Linux it uses `wl-paste` for Wayland
+or `xclip` for X11, if the corresponding tool is installed and the local display
+is available. If the clipboard contains no supported image, `Ctrl-V` reaches
+the remote program as before. This explicit local action does not require
+`--clipboard-read`, which controls remote requests for clipboard text.
+
+Some terminals handle `Cmd-V` themselves. When they send image paths, those
+paths use the same upload path. When they send no input for clipboard images,
+use `Ctrl-V`. The client cannot detect a shortcut consumed by the terminal.
+Use `--no-image-paste` to disable local image handling and retain the original
+path and key input behavior.
+
+Each image is limited to 16 MiB. One paste accepts at most eight images totaling
+32 MiB. A session retains at most 64 distinct images totaling 128 MiB in a
+private temporary directory. Image signatures, byte counts, and content hashes
+are checked before the paths are returned. Files remain available across
+reconnects and are removed when the live server session ends. Keep a separate
+copy if the remote application needs an image after that session ends.
+
+Typing after an image paste waits until the remote files are ready. After a
+network interruption, the client retries the same image bytes. If preparation
+or upload is refused, the status shows `Image paste failed`. The failed paste
+and queued typing are not sent. Press `Esc` to resume input, then retry the
+paste. Local escape commands remain available while an upload waits or fails.
+
 ## Diagnose a stalled session
 
 Start a session with diagnostics enabled on both endpoints:
@@ -319,6 +358,7 @@ a terminal protocol failure.
 | Shell integration | OSC 7 directory and OSC 133 prompt/input/output/end markers |
 | Synchronized output | Server publication and local frame installation respect synchronization, with a bounded server timeout |
 | Clipboard | OSC 52 UTF-8 writes; reads require `--clipboard-read` and can be refused or time out |
+| Image paste | Local PNG, JPEG, GIF, and WebP files upload before remote paths are inserted; `Ctrl-V` reads supported local clipboard images |
 | Images | Static Kitty direct RGB/RGBA/PNG, SIXEL, and iTerm inline PNG/JPEG become bounded image resources |
 
 `--graphics auto` selects Kitty for recognized Kitty, WezTerm, and Ghostty
@@ -366,6 +406,7 @@ target/debug/examples/verify_transport
 target/debug/examples/verify_display
 target/debug/examples/verify_session
 python3 scripts/verify-rust-cli.py --network
+python3 scripts/verify-rust-cli.py --image-paste --evidence-dir /tmp/mosh-rs-image-paste
 python3 scripts/verify-rust-cli.py --baseline --evidence-dir /tmp/mosh-rs-baseline
 python3 scripts/verify-rust-cli.py --saturated-input
 python3 scripts/verify-rust-cli.py --legacy-input --evidence-dir /tmp/mosh-rs-legacy-input
@@ -440,7 +481,7 @@ absence of fixture input and screen text.
 The [Mac mini acceptance report](rust-macmini-verification.md) records real SSH,
 debug/release, weak-network, Vim, tmux, and cmux checks, including their limits.
 
-Both Rust endpoints must use protocol version 7. Earlier Rust workers
+Both Rust endpoints must use protocol version 8. Earlier Rust workers
 cannot resume with the new client. No compatibility with the old Mosh wire
 protocol is provided. Worker crashes do
 not cause the command to restart. Effects are deduplicated within the live client

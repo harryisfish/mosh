@@ -1,6 +1,8 @@
 pub mod client;
+pub mod clipboard;
 pub mod diagnostics;
 pub mod display;
+pub mod image_paste;
 pub mod input;
 pub mod model;
 pub mod pty;

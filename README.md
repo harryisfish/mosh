@@ -12,7 +12,7 @@ state travels over QUIC.
 This project is a Rust rewrite of [Mosh](https://github.com/mobile-shell/mosh).
 The client and server are `mosh-rs` and `mosh-rs-server`.
 
-The current source uses protocol v7 and is not compatible with the original Mosh
+The current source uses protocol v8 and is not compatible with the original Mosh
 wire protocol or earlier Rust protocols. Install both endpoints from the same release.
 
 ## Install
@@ -165,13 +165,16 @@ Ordinary `Ctrl-Z` goes to the remote program.
   selects Kitty or SIXEL output for recognized terminals and text otherwise.
   Override with `--graphics kitty`, `--graphics sixel`, or `--graphics none`.
 - OSC 52 clipboard writes. Clipboard reads require `--clipboard-read`.
+- Pasted local PNG, JPEG, GIF, and WebP files are uploaded before their remote
+  paths reach the application. `Ctrl-V` also reads clipboard images on macOS
+  and Linux. See [image paste](docs/rust-usage.md#paste-images).
 - Adaptive prediction of eligible printable ASCII input. Predictions are
   underlined until remote output is observed. Use `--predict never` to disable it.
 
 Animated images and arbitrary terminal extension passthrough are unsupported.
 The client shows the active screen and has no separate searchable scrollback
 browser. Prediction is a heuristic and can briefly expose input during a remote
-mode transition. File transfer, port forwarding, and X11 forwarding are not provided.
+mode transition. General file transfer, port forwarding, and X11 forwarding are not provided.
 
 See the [usage guide](docs/rust-usage.md) for terminal requirements, graphics
 limitations, prediction behavior, and resource limits.
